@@ -1,5 +1,5 @@
 use crate::combat::{weapon_desirability, TargetCandidate};
-use crate::geom::{dist2d, is_ground_level, unit2d};
+use crate::geom::{angle_diff, dist2d, is_ground_level, unit2d};
 use crate::map::Map;
 use crate::nav::{NavGrid, NavScratch};
 use crate::protocol::{stat, Config, DropObs, Observation, Offer, SelfObs, WeaponKind};
@@ -36,6 +36,7 @@ pub(crate) enum CombatTactic {
     AggressivePush,
     OpenStrafe,
     CoverAmbush,
+    PackKite,
 }
 
 impl CombatTactic {
@@ -47,6 +48,7 @@ impl CombatTactic {
             CombatTactic::AggressivePush => "PUSH",
             CombatTactic::OpenStrafe => "STRF",
             CombatTactic::CoverAmbush => "AMB",
+            CombatTactic::PackKite => "KITE",
         }
     }
 }
@@ -207,11 +209,11 @@ impl StrategyState {
         }
 
         let has_gun_upgrades = me.upgrades.iter().any(|u| u.starts_with("gun_"));
-        let holds_lightning = me
+        let holds_s_tier = me
             .weapons
             .iter()
             .flatten()
-            .any(|w| w.kind == WeaponKind::Lightning);
+            .any(|w| matches!(w.kind, WeaponKind::Laser | WeaponKind::Lightning));
 
         let mut worst: Option<(u8, usize, WeaponKind)> = None;
         for (slot, wopt) in me.weapons.iter().enumerate().take(2) {
@@ -229,8 +231,9 @@ impl StrategyState {
                     if has_gun_upgrades {
                         return (None, None);
                     }
-                    let allow_gun_swap =
-                        obs.alive <= 10 || (holds_lightning && pk_kind == WeaponKind::Laser);
+                    let allow_gun_swap = obs.alive <= 13
+                        || (holds_s_tier
+                            && matches!(pk_kind, WeaponKind::Laser | WeaponKind::Lightning));
                     if !allow_gun_swap {
                         return (None, None);
                     }
@@ -340,7 +343,7 @@ impl StrategyState {
             return;
         }
 
-        if self.find_best_supply_drop(world, obs, los_count).is_some() {
+        if self.find_best_supply_drop(world, obs, los_mechs).is_some() {
             self.posture = Posture::SupplyDrop;
             return;
         }
@@ -414,7 +417,7 @@ impl StrategyState {
                 return (unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]), nc);
             }
             Posture::SupplyDrop => {
-                if let Some(drop) = self.find_best_supply_drop(world, obs, los_mech_count) {
+                if let Some(drop) = self.find_best_supply_drop(world, obs, los_mechs) {
                     let d = dist2d(me.pos[0], me.pos[1], drop.pos[0], drop.pos[1]);
                     if drop.lands_in > 5.0 && d < 28.0 {
                         let threats: Vec<[f64; 3]> = mech_cands
@@ -526,11 +529,139 @@ impl StrategyState {
 
                 let near_cover_14 = nav.has_near_cover_within(me.pos, 14.0);
 
-                // 1. CoverDuck: outnumbered (2+ LOS), dry/reloading, or enemy charging laser
-                if (los_mech_count >= 2 && !immediate_kill_avail)
-                    || (no_weapon_can_shoot_now && !immediate_kill_avail)
-                    || enemy_laser_duck
+                // A. Mid-Combat Power Cube Magnet: free +4% max HP heal & +4% dmg mid-fight
+                if !enemy_laser_duck
+                    && los_mech_count <= 1
+                    && !(no_weapon_can_shoot_now && los_mech_count >= 1)
                 {
+                    let cube_pull_r = if los_mech_count == 0 { 24.0 } else { 16.0 };
+                    let have_lt_ready = me
+                        .weapons
+                        .iter()
+                        .flatten()
+                        .any(|w| w.kind == WeaponKind::Lightning)
+                        && me.energy > 25.0;
+                    if let Some(cube) = obs
+                        .cubes
+                        .iter()
+                        .filter(|c| {
+                            is_ground_level(map, c.pos)
+                                && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= cube_pull_r
+                                && dist2d(c.pos[0], c.pos[1], nc[0], nc[1])
+                                    <= obs.zone.next_radius - 5.0
+                                && !(los_mech_count == 1
+                                    && !have_lt_ready
+                                    && los_mechs[0].hp > 480.0
+                                    && dist2d(
+                                        c.pos[0],
+                                        c.pos[1],
+                                        los_mechs[0].pos[0],
+                                        los_mechs[0].pos[1],
+                                    ) < 22.0)
+                        })
+                        .min_by(|a, b| {
+                            dist2d(me.pos[0], me.pos[1], a.pos[0], a.pos[1])
+                                .partial_cmp(&dist2d(me.pos[0], me.pos[1], b.pos[0], b.pos[1]))
+                                .unwrap()
+                        })
+                    {
+                        self.tactic = CombatTactic::OpenStrafe;
+                        let goal = [cube.pos[0], cube.pos[1]];
+                        let wp = self.follow_astar(nav, scratch, me_xy, goal, obs.t);
+                        return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), goal);
+                    }
+                }
+
+                // B. 1v2+ Pack-Centroid Backpedal Kite & Anti-Crossfire Escape
+                if los_mech_count >= 2 {
+                    let (mut sum_x, mut sum_y) = (0.0, 0.0);
+                    for m in los_mechs {
+                        let u = unit2d(m.pos[0] - me.pos[0], m.pos[1] - me.pos[1]);
+                        let w = 1.0 / m.dist.max(15.0);
+                        sum_x += u[0] * w;
+                        sum_y += u[1] * w;
+                    }
+                    let avg_threat = unit2d(sum_x, sum_y);
+                    let primary_dir = if avg_threat[0].hypot(avg_threat[1]) > 0.1 {
+                        avg_threat
+                    } else {
+                        unit2d(
+                            los_mechs[0].pos[0] - me.pos[0],
+                            los_mechs[0].pos[1] - me.pos[1],
+                        )
+                    };
+                    let centroid_ang = primary_dir[1].atan2(primary_dir[0]);
+                    let max_spread = los_mechs
+                        .iter()
+                        .map(|m| {
+                            let b = (m.pos[1] - me.pos[1]).atan2(m.pos[0] - me.pos[0]);
+                            angle_diff(centroid_ang, b).abs()
+                        })
+                        .fold(0.0_f64, f64::max)
+                        * 2.0;
+
+                    if !immediate_kill_avail
+                        && (no_weapon_can_shoot_now
+                            || enemy_laser_duck
+                            || (me.hp < 0.62 * me.max_hp && max_spread > 2.0))
+                    {
+                        let threats: Vec<[f64; 3]> = los_mechs
+                            .iter()
+                            .map(|m| [m.pos[0], m.pos[1], m.pos[2] + 7.5])
+                            .collect();
+                        if let Some(cp) = nav.find_cover_point_within(
+                            map,
+                            me.pos,
+                            eye_h,
+                            &threats,
+                            obs.zone.center,
+                            obs.zone.radius,
+                            obs.zone.next_center,
+                            obs.zone.next_radius,
+                            42.0,
+                            None,
+                        ) {
+                            self.combat_cover_target = Some(cp);
+                            self.combat_cover_t = obs.t;
+                            self.tactic = CombatTactic::CoverDuck;
+                            let wp = self.follow_astar(nav, scratch, me_xy, cp, obs.t);
+                            return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), cp);
+                        }
+                    }
+
+                    // Active PackKite: backpedal away from threat centroid, dragging pack into single cone
+                    self.tactic = CombatTactic::PackKite;
+                    let away = [-primary_dir[0], -primary_dir[1]];
+                    let perp = [-away[1] * world.strafe_sign, away[0] * world.strafe_sign];
+                    let mut gx = away[0] * 0.90 + perp[0] * 0.45;
+                    let mut gy = away[1] * 0.90 + perp[1] * 0.45;
+                    if dist_next > safe_r * 0.85 {
+                        let zdir = unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]);
+                        gx += zdir[0] * 0.55;
+                        gy += zdir[1] * 0.55;
+                    }
+                    if let Some(corner) = nav.find_cover_anchor(
+                        me.pos,
+                        obs.zone.center,
+                        obs.zone.radius,
+                        nc,
+                        obs.zone.next_radius,
+                        None,
+                        28.0,
+                    ) {
+                        let cdir = unit2d(corner[0] - me.pos[0], corner[1] - me.pos[1]);
+                        if cdir[0] * primary_dir[0] + cdir[1] * primary_dir[1] < 0.25 {
+                            gx += cdir[0] * 0.25;
+                            gy += cdir[1] * 0.25;
+                        }
+                    }
+                    let dir = unit2d(gx, gy);
+                    let goal_pt = [me.pos[0] + dir[0] * 20.0, me.pos[1] + dir[1] * 20.0];
+                    return (dir, goal_pt);
+                }
+
+                // 1. CoverDuck (0/1 LOS): dry/reloading or enemy charging laser
+                if (no_weapon_can_shoot_now && !immediate_kill_avail) || enemy_laser_duck {
                     if los_mech_count == 0
                         && (near_cover_14
                             || self.combat_cover_target.is_some_and(|cp| {
@@ -902,14 +1033,15 @@ impl StrategyState {
         &self,
         world: &WorldState,
         obs: &'a Observation,
-        los_mechs: usize,
+        los_mechs: &[&TargetCandidate],
     ) -> Option<&'a DropObs> {
         let me = &obs.self_obs;
-        let max_pull = if me.hp < 0.65 * me.max_hp {
-            320.0
+        let max_pull = if me.hp < 0.70 * me.max_hp {
+            340.0
         } else {
             220.0
         };
+        let in_close_duel = los_mechs.iter().any(|m| m.dist < 60.0);
         let mut best: Option<(f64, &'a DropObs)> = None;
         for d in &obs.drops {
             if dist2d(d.pos[0], d.pos[1], obs.zone.center[0], obs.zone.center[1])
@@ -926,9 +1058,13 @@ impl StrategyState {
                 continue;
             }
             let dist = dist2d(me.pos[0], me.pos[1], d.pos[0], d.pos[1]);
-            if d.lands_in <= 18.0
+            let eta = dist / 14.0;
+            let arrival_ok = d.lands_in <= (eta + 4.5).max(8.0);
+            let duel_ok = !in_close_duel || (d.lands_in <= 3.0 && dist <= 28.0);
+            if arrival_ok
+                && duel_ok
                 && dist <= max_pull
-                && (los_mechs <= 1 || dist <= d.radius + 15.0)
+                && (los_mechs.len() <= 1 || dist <= d.radius + 15.0)
                 && best.is_none_or(|(bd, _)| dist < bd)
             {
                 best = Some((dist, d));
@@ -947,11 +1083,11 @@ impl StrategyState {
         let me = &obs.self_obs;
         let slot1_empty = me.weapons.get(1).and_then(|w| w.as_ref()).is_none();
         let has_gun_upgrades = me.upgrades.iter().any(|u| u.starts_with("gun_"));
-        let holds_lightning = me
+        let holds_s_tier = me
             .weapons
             .iter()
             .flatten()
-            .any(|w| w.kind == WeaponKind::Lightning);
+            .any(|w| matches!(w.kind, WeaponKind::Laser | WeaponKind::Lightning));
 
         let worst_held = me
             .weapons
@@ -1002,8 +1138,9 @@ impl StrategyState {
                     if has_gun_upgrades {
                         continue;
                     }
-                    let allow_gun_swap =
-                        obs.alive <= 10 || (holds_lightning && kind == WeaponKind::Laser);
+                    let allow_gun_swap = obs.alive <= 13
+                        || (holds_s_tier
+                            && matches!(kind, WeaponKind::Laser | WeaponKind::Lightning));
                     if !allow_gun_swap {
                         continue;
                     }

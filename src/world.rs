@@ -62,6 +62,7 @@ pub(crate) struct WorldState {
     pub last_damage_bearing: Option<f64>,
     pub last_damage_t: f64,
     pub last_damage_by: Option<u64>,
+    pub last_target_id: Option<u64>,
     pub last_sound_bearing: Option<f64>,
     pub last_sound_t: f64,
     pub last_sound_priority: f64,
@@ -92,6 +93,7 @@ impl WorldState {
             last_damage_bearing: None,
             last_damage_t: -100.0,
             last_damage_by: None,
+            last_target_id: None,
             last_sound_bearing: None,
             last_sound_t: -100.0,
             last_sound_priority: 0.0,
@@ -159,6 +161,9 @@ impl WorldState {
                 }
                 GameEvent::Kill { target } => {
                     self.tracked_enemies.remove(target);
+                    if self.last_target_id == Some(*target) {
+                        self.last_target_id = None;
+                    }
                 }
                 _ => {}
             }
@@ -219,6 +224,11 @@ impl WorldState {
             );
         }
         self.tracked_enemies.retain(|_, e| t - e.last_seen_t <= 4.5);
+        if let Some(tid) = self.last_target_id {
+            if !self.tracked_enemies.contains_key(&tid) {
+                self.last_target_id = None;
+            }
+        }
 
         // Track observed enemy laser beams to pinpoint exact 1.65 s laser cooldown windows
         for b in &obs.beams {
