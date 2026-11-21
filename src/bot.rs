@@ -39,7 +39,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m10-boost".to_string(),
+            name: "rust-bot-m10-endgame".to_string(),
             config: hello.config,
             map,
             nav,
@@ -65,7 +65,11 @@ impl Bot {
         };
 
         if let Some(offer) = &obs.offer {
-            action.pick = Some(self.strategy.pick_upgrade(&self.config, offer, me));
+            let late_game = obs.t >= 260.0 || obs.zone.next_radius <= 75.0;
+            action.pick = Some(
+                self.strategy
+                    .pick_upgrade(&self.config, offer, me, late_game),
+            );
         }
 
         let muzzle_h = stat(&me.stats, "muzzle_height", 7.0);
@@ -613,7 +617,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            bot.strategy.pick_upgrade(&bot.config, &offer1, &me),
+            bot.strategy.pick_upgrade(&bot.config, &offer1, &me, false),
             1,
             "armor should win Tier S"
         );
@@ -640,7 +644,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            bot.strategy.pick_upgrade(&bot.config, &offer2, &me),
+            bot.strategy.pick_upgrade(&bot.config, &offer2, &me, false),
             1,
             "held gun_rate should beat unheld laser_damage"
         );
@@ -668,7 +672,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            bot.strategy.pick_upgrade(&bot.config, &offer3, &me),
+            bot.strategy.pick_upgrade(&bot.config, &offer3, &me, false),
             1,
             "nanites should win"
         );
@@ -2094,6 +2098,114 @@ mod tests {
             act_lt.boost,
             Some(false),
             "must save energy for Lightning DPS inside range"
+        );
+    }
+
+    #[test]
+    fn endgame_holds_final_center_and_prioritizes_hp_survival() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(-45.0, 0.0);
+        let cz = bot.map.ground_height(-70.0, 0.0);
+        obs.t = 360.0;
+        obs.self_obs.pos = [-45.0, 0.0, mz];
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 100.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 60.0;
+        obs.zone.next_center = [0.0, 0.0];
+        obs.zone.next_radius = 25.0;
+        obs.zone.shrink_start = 420.0;
+        obs.mechs.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.crates.clear();
+        obs.cubes = vec![ItemObs {
+            id: 950,
+            pos: [-70.0, 0.0, cz],
+            hp: None,
+        }];
+
+        // 1. At t=360, outside next_radius*0.45 (11.25 m), skips far cube and moves toward final center
+        let act_rot = bot.act(&obs);
+        assert_eq!(bot.strategy.posture, Posture::ZoneRotate);
+        assert!(
+            act_rot.move_dir.unwrap()[0] > 0.5,
+            "endgame at [-45, 0] must claim [0, 0] instead of detours, got {:?}",
+            act_rot.move_dir
+        );
+
+        // 2. At t=360 near cover with 55% HP facing healthier 1300 HP enemy -> preserves HP via EmergencyRegen
+        let cxy = [86.0, -70.0];
+        let exy = [155.0, -25.0];
+        let cmz = bot.map.ground_height(cxy[0], cxy[1]);
+        let ez = bot.map.ground_height(exy[0], exy[1]);
+        obs.t = 360.5;
+        obs.self_obs.pos = [cxy[0], cxy[1], cmz];
+        obs.self_obs.hp = 0.55 * 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.zone.center = [cxy[0], cxy[1]];
+        obs.zone.radius = 70.0;
+        obs.zone.next_center = [cxy[0], cxy[1]];
+        obs.zone.next_radius = 25.0;
+        obs.cubes.clear();
+        obs.mechs = vec![ActorObs {
+            id: 7,
+            kind: "mech".into(),
+            pos: [exy[0], exy[1], ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [-2.8, 0.0],
+            hp: Some(1300.0),
+            max_hp: Some(1400.0),
+            cubes: Some(4),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+        bot.act(&obs);
+        assert_eq!(
+            bot.strategy.posture,
+            Posture::EmergencyRegen,
+            "endgame at 55% HP against healthier mech must preserve HP for final circle"
+        );
+
+        // 3. Late-game upgrade scorer prefers plating (mech.hp) over gun/laser damage
+        let mut me = obs.self_obs.clone();
+        let laser = WeaponObs {
+            kind: WeaponKind::Laser,
+            cooldown: 0.0,
+            ammo: None,
+            reload: None,
+            charge: Some(0.0),
+            stats: bot.config.weapons.laser.clone(),
+        };
+        me.weapons = vec![Some(obs.self_obs.weapons[0].clone().unwrap()), Some(laser)];
+        let offer_late = Offer {
+            id: 21,
+            expires: 370.0,
+            choices: vec![
+                OfferChoice {
+                    id: "gun_damage".into(),
+                    name: "Heavy rounds".into(),
+                    desc: "".into(),
+                },
+                OfferChoice {
+                    id: "laser_damage".into(),
+                    name: "Focusing lens".into(),
+                    desc: "".into(),
+                },
+                OfferChoice {
+                    id: "plating".into(),
+                    name: "Reinforced plating".into(),
+                    desc: "".into(),
+                },
+            ],
+        };
+        assert_eq!(
+            bot.strategy.pick_upgrade(&bot.config, &offer_late, &me, true),
+            2,
+            "late_game=true must prioritize plating (HP) over DPS"
         );
     }
 }

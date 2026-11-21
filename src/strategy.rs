@@ -94,7 +94,13 @@ impl StrategyState {
         }
     }
 
-    pub fn pick_upgrade(&self, config: &Config, offer: &Offer, me: &SelfObs) -> usize {
+    pub fn pick_upgrade(
+        &self,
+        config: &Config,
+        offer: &Offer,
+        me: &SelfObs,
+        late_game: bool,
+    ) -> usize {
         let mut best_idx = 0usize;
         let mut best_score = f64::NEG_INFINITY;
 
@@ -107,10 +113,11 @@ impl StrategyState {
 
                 let mut max_eff = 10.0_f64;
                 for eff in &def.effects {
+                    let lg_bonus = if late_game { 12.0 } else { 0.0 };
                     let base = match eff.path.as_str() {
-                        "mech.regen_per_s" | "mech.regen_delay" => 108.0,
-                        "mech.armor" => 104.0,
-                        "mech.hp" => 100.0,
+                        "mech.regen_per_s" | "mech.regen_delay" => 108.0 + lg_bonus,
+                        "mech.armor" => 104.0 + lg_bonus,
+                        "mech.hp" => 100.0 + lg_bonus,
                         "weapons.lightning.damage"
                         | "weapons.lightning.energy"
                         | "weapons.lightning.range"
@@ -305,15 +312,31 @@ impl StrategyState {
             obs.zone.next_center[1],
         );
         let safe_r = (obs.zone.next_radius - 18.0).max(0.0);
+        let endgame = obs.t >= 340.0 || obs.zone.next_radius <= 30.0;
 
         if !me.in_zone || (dist_next > safe_r && obs.t >= obs.zone.shrink_start - 20.0) {
             self.posture = Posture::ZoneRotate;
             return;
         }
 
+        let endgame_hold_r = (obs.zone.next_radius * 0.45).max(8.0);
+        if endgame && dist_next > endgame_hold_r && los_count == 0 && !immediate_kill_avail {
+            self.posture = Posture::ZoneRotate;
+            return;
+        }
+
         let winning_or_even_1v1 = los_count == 1 && los_mechs[0].hp <= me.hp + 180.0;
         let enemy_in_face = los_mechs.iter().any(|m| m.dist < 32.0);
-        let want_regen = if self.posture == Posture::EmergencyRegen {
+        let want_regen = if endgame {
+            if self.posture == Posture::EmergencyRegen {
+                !immediate_kill_avail && !enemy_in_face && me.hp < 0.85 * me.max_hp
+            } else {
+                !immediate_kill_avail
+                    && !enemy_in_face
+                    && ((me.hp < 0.72 * me.max_hp && los_count >= 2)
+                        || (me.hp < 0.60 * me.max_hp && near_mechs > 0 && !winning_or_even_1v1))
+            }
+        } else if self.posture == Posture::EmergencyRegen {
             !immediate_kill_avail
                 && !enemy_in_face
                 && me.hp < 0.72 * me.max_hp
@@ -334,12 +357,15 @@ impl StrategyState {
             return;
         }
 
-        if self.find_best_supply_drop(world, obs, los_mechs).is_some() {
+        if !endgame && self.find_best_supply_drop(world, obs, los_mechs).is_some() {
             self.posture = Posture::SupplyDrop;
             return;
         }
 
-        if self.find_best_weapon_goal(map, world, obs, los_mechs).is_some() {
+        let slot1_empty = me.weapons.get(1).and_then(|w| w.as_ref()).is_none();
+        if (!endgame || slot1_empty)
+            && self.find_best_weapon_goal(map, world, obs, los_mechs).is_some()
+        {
             self.posture = Posture::LootWeapon;
             return;
         }
@@ -383,6 +409,7 @@ impl StrategyState {
         let nc = obs.zone.next_center;
         let safe_r = (obs.zone.next_radius - 18.0).max(0.0);
         let dist_next = dist2d(me.pos[0], me.pos[1], nc[0], nc[1]);
+        let endgame = obs.t >= 340.0 || obs.zone.next_radius <= 30.0;
 
         match self.posture {
             Posture::ZoneRotate => {
@@ -834,7 +861,12 @@ impl StrategyState {
                         }
                     }
 
-                    if dist_next > safe_r * 0.85 {
+                    let endgame_pull_r = (obs.zone.next_radius * 0.55).max(8.0);
+                    if endgame && dist_next > endgame_pull_r {
+                        let zdir = unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]);
+                        gx += zdir[0] * 0.75;
+                        gy += zdir[1] * 0.75;
+                    } else if dist_next > safe_r * 0.85 {
                         let zdir = unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]);
                         gx += zdir[0] * 0.55;
                         gy += zdir[1] * 0.55;
@@ -845,6 +877,14 @@ impl StrategyState {
                 }
             }
             Posture::EarlyFarm => {}
+        }
+
+        if endgame {
+            if dist_next > 10.0 {
+                let wp = self.follow_astar(nav, scratch, me_xy, nc, obs.t);
+                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), nc);
+            }
+            return ([0.0, 0.0], nc);
         }
 
         // EarlyFarm / fallback: cubes -> farm_target -> crates -> zone -> near sounds -> 50 m unvisited snowball -> 15 s hunt -> mid/far sounds -> sweep
