@@ -393,7 +393,10 @@ impl StrategyState {
                         return ([0.0, 0.0], cp);
                     }
                     let wp = self.follow_astar(nav, scratch, me_xy, cp, obs.t);
-                    return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), cp);
+                    return (
+                        zigzag_cover_dir(me.pos, wp, cp, los_mech_count, world.strafe_sign),
+                        cp,
+                    );
                 }
                 if let Some((_, th)) = world.closest_tracked_enemy_within(me.pos, 220.0) {
                     let away = unit2d(me.pos[0] - th.pos[0], me.pos[1] - th.pos[1]);
@@ -403,7 +406,10 @@ impl StrategyState {
                         me.pos[1] + (away[1] * 0.75 + zdir[1] * 0.35) * 40.0,
                     ];
                     let wp = self.follow_astar(nav, scratch, me_xy, goal, obs.t);
-                    return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), goal);
+                    return (
+                        zigzag_cover_dir(me.pos, wp, goal, los_mech_count, world.strafe_sign),
+                        goal,
+                    );
                 }
                 return (unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]), nc);
             }
@@ -626,7 +632,10 @@ impl StrategyState {
                                 return ([0.0, 0.0], cp);
                             }
                             let wp = self.follow_astar(nav, scratch, me_xy, cp, obs.t);
-                            return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), cp);
+                            return (
+                                zigzag_cover_dir(me.pos, wp, cp, los_mech_count, world.strafe_sign),
+                                cp,
+                            );
                         }
                     }
                 }
@@ -1126,4 +1135,21 @@ impl StrategyState {
 
         best.map(|(_, pt)| pt)
     }
+}
+
+#[inline]
+fn zigzag_cover_dir(
+    me_pos: [f64; 3],
+    wp: [f64; 2],
+    cp: [f64; 2],
+    los_mech_count: usize,
+    strafe_sign: f64,
+) -> [f64; 2] {
+    let base = unit2d(wp[0] - me_pos[0], wp[1] - me_pos[1]);
+    if los_mech_count == 0 || dist2d(me_pos[0], me_pos[1], cp[0], cp[1]) <= 8.0 {
+        return base;
+    }
+    let ang = 0.52 * strafe_sign;
+    let (s, c) = ang.sin_cos();
+    [base[0] * c - base[1] * s, base[0] * s + base[1] * c]
 }
