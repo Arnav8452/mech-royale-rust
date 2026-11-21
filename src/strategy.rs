@@ -11,6 +11,7 @@ use crate::world::WorldState;
 pub(crate) enum Posture {
     ZoneRotate,
     EmergencyRegen,
+    ResetHeal,
     SupplyDrop,
     LootWeapon,
     Combat,
@@ -22,6 +23,7 @@ impl Posture {
         match self {
             Posture::ZoneRotate => "ZON",
             Posture::EmergencyRegen => "REG",
+            Posture::ResetHeal => "RST",
             Posture::SupplyDrop => "DRP",
             Posture::LootWeapon => "LOT",
             Posture::Combat => "CMB",
@@ -63,6 +65,8 @@ pub(crate) struct StrategyState {
     pub cover_target: Option<[f64; 2]>,
     pub prev_cover_target: Option<[f64; 2]>,
     pub cover_target_t: f64,
+    pub reset_cover_target: Option<[f64; 2]>,
+    pub reset_cover_t: f64,
     pub combat_cover_target: Option<[f64; 2]>,
     pub combat_cover_t: f64,
     pub ambush_anchor: Option<[f64; 2]>,
@@ -84,6 +88,8 @@ impl StrategyState {
             cover_target: None,
             prev_cover_target: None,
             cover_target_t: -100.0,
+            reset_cover_target: None,
+            reset_cover_t: -100.0,
             combat_cover_target: None,
             combat_cover_t: -100.0,
             ambush_anchor: None,
@@ -97,6 +103,11 @@ impl StrategyState {
     pub fn pick_upgrade(&self, config: &Config, offer: &Offer, me: &SelfObs) -> usize {
         let mut best_idx = 0usize;
         let mut best_score = f64::NEG_INFINITY;
+        let have_lightning = me
+            .weapons
+            .iter()
+            .flatten()
+            .any(|w| w.kind == WeaponKind::Lightning);
 
         for (i, choice) in offer.choices.iter().enumerate() {
             let score = if let Some(def) = config.upgrades.iter().find(|u| u.id == choice.id) {
@@ -108,31 +119,41 @@ impl StrategyState {
                 let mut max_eff = 10.0_f64;
                 for eff in &def.effects {
                     let base = match eff.path.as_str() {
-                        "mech.regen_per_s" | "mech.regen_delay" => 108.0,
-                        "mech.armor" => 104.0,
-                        "mech.hp" => 100.0,
-                        "weapons.lightning.damage"
-                        | "weapons.lightning.energy"
-                        | "weapons.lightning.range"
-                        | "weapons.lightning.cone_deg" => 98.0,
+                        "mech.regen_per_s" | "mech.regen_delay" => 114.0,
+                        "mech.hp" => 108.0,
+                        "mech.armor" => 106.0,
+                        "weapons.lightning.range" | "weapons.lightning.cone_deg" => 104.0,
+                        "weapons.lightning.damage" | "weapons.lightning.energy" => 103.0,
                         "weapons.laser.damage" | "weapons.laser.charge" | "weapons.laser.pierce" => {
-                            97.0
+                            100.0
                         }
-                        "weapons.gun.mag" | "weapons.gun.reload" => 95.0,
-                        "weapons.gun.cooldown" | "weapons.gun.damage" => 92.0,
-                        "weapons.lightning.chain" => 90.0,
-                        "mech.near_range_bonus" | "mech.vision_bonus" | "mech.hearing" => {
-                            if existing_stacks == 0 {
-                                88.0
+                        "weapons.gun.damage" | "weapons.gun.cooldown" => 98.0,
+                        "weapons.gun.mag" | "weapons.gun.reload" => 96.0,
+                        "weapons.lightning.chain" => 95.0,
+                        "mech.walk_speed" | "mech.boost_speed" => 89.0,
+                        "weapons.gun.speed" | "weapons.gun.range" => 86.0,
+                        "mech.energy_regen" | "mech.boost_drain" | "mech.jet_drain" => {
+                            if have_lightning {
+                                84.0
                             } else {
-                                72.0
+                                76.0
                             }
                         }
-                        "weapons.gun.speed" | "weapons.gun.range" => 84.0,
-                        "mech.walk_speed" | "mech.boost_speed" => 82.0,
-                        "mech.energy_regen" | "mech.boost_drain" | "mech.jet_drain" => 76.0,
+                        "mech.energy" => {
+                            if have_lightning {
+                                80.0
+                            } else {
+                                68.0
+                            }
+                        }
+                        "mech.near_range_bonus" | "mech.vision_bonus" | "mech.hearing" => {
+                            if existing_stacks == 0 {
+                                72.0
+                            } else {
+                                58.0
+                            }
+                        }
                         "mech.turn_rate" | "mech.pitch_rate" => 70.0,
-                        "mech.energy" => 64.0,
                         p if p.starts_with("weapons.mortar.") => 30.0,
                         _ => 25.0,
                     };
@@ -193,7 +214,7 @@ impl StrategyState {
             }
         }
 
-        let Some((prio, _, _pk_kind, pid)) = best_pickup else {
+        let Some((_prio, _, pk_kind, pid)) = best_pickup else {
             return (None, None);
         };
 
@@ -201,7 +222,7 @@ impl StrategyState {
             return (Some(pid), None);
         }
 
-        // Swapping when both slots full: never swap under close LOS fire, charging laser, or invested gun upgrades
+        // Swapping when both slots full: never swap under close LOS fire or charging laser
         let close_threat = los_mechs.iter().any(|m| m.dist < 65.0);
         let laser_busy = me
             .weapons
@@ -212,25 +233,8 @@ impl StrategyState {
             return (None, None);
         }
 
-        let has_gun_upgrades = me.upgrades.iter().any(|u| u.starts_with("gun_"));
-
-        let mut worst: Option<(u8, usize, WeaponKind)> = None;
-        for (slot, wopt) in me.weapons.iter().enumerate().take(2) {
-            if let Some(w) = wopt {
-                let wp = weapon_desirability(w.kind);
-                if worst.is_none_or(|(bw, _, _)| wp < bw) {
-                    worst = Some((wp, slot, w.kind));
-                }
-            }
-        }
-
-        if let Some((worst_prio, worst_slot, worst_kind)) = worst {
-            if prio > worst_prio {
-                if worst_kind == WeaponKind::Gun && (has_gun_upgrades || obs.alive > 8) {
-                    return (None, None);
-                }
-                return (Some(pid), Some(worst_slot));
-            }
+        if let Some(drop_slot) = swap_slot_for(me, pk_kind) {
+            return (Some(pid), Some(drop_slot));
         }
         (None, None)
     }
@@ -245,11 +249,16 @@ impl StrategyState {
         los_mech_count: usize,
     ) -> Option<[f64; 2]> {
         let me = &obs.self_obs;
-        let threats: Vec<[f64; 3]> = world
+        let mut tracked_sorted: Vec<(u64, &crate::world::TrackedEnemy)> = world
             .tracked_enemies
-            .values()
-            .filter(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 220.0)
-            .map(|e| [e.pos[0], e.pos[1], e.pos[2] + 7.5])
+            .iter()
+            .filter(|(_, e)| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 220.0)
+            .map(|(&id, e)| (id, e))
+            .collect();
+        tracked_sorted.sort_by_key(|(id, _)| *id);
+        let threats: Vec<[f64; 3]> = tracked_sorted
+            .iter()
+            .map(|(_, e)| [e.pos[0], e.pos[1], e.pos[2] + 7.5])
             .collect();
         if threats.is_empty() {
             return None;
@@ -290,6 +299,7 @@ impl StrategyState {
         map: &Map,
         nav: &NavGrid,
         world: &WorldState,
+        config: &Config,
         obs: &Observation,
         los_mechs: &[&TargetCandidate],
         near_mechs: usize,
@@ -305,6 +315,8 @@ impl StrategyState {
             obs.zone.next_center[1],
         );
         let safe_r = (obs.zone.next_radius - 18.0).max(0.0);
+        let stat_cap = config.cubes.stat_cap.round() as u64;
+        let slot1_empty = me.weapons.get(1).and_then(|w| w.as_ref()).is_none();
 
         if !me.in_zone || (dist_next > safe_r && obs.t >= obs.zone.shrink_start - 20.0) {
             self.posture = Posture::ZoneRotate;
@@ -313,10 +325,11 @@ impl StrategyState {
 
         let winning_or_even_1v1 = los_count == 1 && los_mechs[0].hp <= me.hp + 180.0;
         let enemy_in_face = los_mechs.iter().any(|m| m.dist < 32.0);
+        let regen_exit = if near_mechs > 0 { 0.78 } else { 0.72 };
         let want_regen = if self.posture == Posture::EmergencyRegen {
             !immediate_kill_avail
                 && !enemy_in_face
-                && me.hp < 0.72 * me.max_hp
+                && me.hp < regen_exit * me.max_hp
                 && !(me.hp >= 0.65 * me.max_hp && near_mechs == 0)
         } else {
             !immediate_kill_avail
@@ -339,7 +352,30 @@ impl StrategyState {
             return;
         }
 
-        if self.find_best_weapon_goal(map, world, obs, los_mechs).is_some() {
+        let weapon_goal = self.find_best_weapon_goal(map, world, obs, los_mechs);
+        if slot1_empty && me.hp >= 0.45 * me.max_hp && weapon_goal.is_some() {
+            self.posture = Posture::LootWeapon;
+            return;
+        }
+
+        // Silent between-kill full heal: hide out of LOS and wait quietly up to 96% HP
+        let post_kill_cube = obs.t - world.last_kill_t <= 2.5
+            && me.cubes < stat_cap
+            && obs.cubes.iter().any(|c| {
+                is_ground_level(map, c.pos)
+                    && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 22.0
+            });
+        let want_reset = if self.posture == Posture::ResetHeal {
+            me.hp < 0.96 * me.max_hp
+        } else {
+            me.hp < 0.88 * me.max_hp
+        };
+        if los_count == 0 && want_reset && !post_kill_cube {
+            self.posture = Posture::ResetHeal;
+            return;
+        }
+
+        if weapon_goal.is_some() {
             self.posture = Posture::LootWeapon;
             return;
         }
@@ -363,6 +399,7 @@ impl StrategyState {
         nav: &NavGrid,
         scratch: &mut NavScratch,
         world: &mut WorldState,
+        config: &Config,
         obs: &Observation,
         eye_h: f64,
         mech_cands: &[TargetCandidate],
@@ -378,6 +415,16 @@ impl StrategyState {
         world.orbit_active_1v1 = false;
 
         let me = &obs.self_obs;
+        let stat_cap = config.cubes.stat_cap.round() as u64;
+        let want_cubes = me.cubes < stat_cap || (me.cubes >= 13 && me.cubes < 15);
+        let slot1_empty = me.weapons.get(1).and_then(|w| w.as_ref()).is_none();
+        let my_lt_range = me
+            .weapons
+            .iter()
+            .flatten()
+            .find(|w| w.kind == WeaponKind::Lightning)
+            .map(|w| stat(&w.stats, "range", 45.0))
+            .unwrap_or(45.0);
         let los_mech_count = los_mechs.len();
         let me_xy = [me.pos[0], me.pos[1]];
         let nc = obs.zone.next_center;
@@ -396,7 +443,10 @@ impl StrategyState {
                         return ([0.0, 0.0], cp);
                     }
                     let wp = self.follow_astar(nav, scratch, me_xy, cp, obs.t);
-                    return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), cp);
+                    return (
+                        zigzag_cover_dir(me.pos, wp, cp, los_mech_count, world.strafe_sign),
+                        cp,
+                    );
                 }
                 if let Some((_, th)) = world.closest_tracked_enemy_within(me.pos, 220.0) {
                     let away = unit2d(me.pos[0] - th.pos[0], me.pos[1] - th.pos[1]);
@@ -406,9 +456,101 @@ impl StrategyState {
                         me.pos[1] + (away[1] * 0.75 + zdir[1] * 0.35) * 40.0,
                     ];
                     let wp = self.follow_astar(nav, scratch, me_xy, goal, obs.t);
-                    return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), goal);
+                    return (
+                        zigzag_cover_dir(me.pos, wp, goal, los_mech_count, world.strafe_sign),
+                        goal,
+                    );
                 }
                 return (unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]), nc);
+            }
+            Posture::ResetHeal => {
+                if want_cubes && obs.t - world.last_kill_t <= 3.0 {
+                    if let Some(cube) = obs
+                        .cubes
+                        .iter()
+                        .filter(|c| {
+                            is_ground_level(map, c.pos)
+                                && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 18.0
+                                && dist2d(c.pos[0], c.pos[1], nc[0], nc[1])
+                                    <= obs.zone.next_radius - 5.0
+                        })
+                        .min_by(|a, b| {
+                            let da = dist2d(me.pos[0], me.pos[1], a.pos[0], a.pos[1]);
+                            let db = dist2d(me.pos[0], me.pos[1], b.pos[0], b.pos[1]);
+                            da.total_cmp(&db).then_with(|| a.id.cmp(&b.id))
+                        })
+                    {
+                        let goal = [cube.pos[0], cube.pos[1]];
+                        let wp = self.follow_astar(nav, scratch, me_xy, goal, obs.t);
+                        return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), goal);
+                    }
+                }
+
+                let mut tracked_sorted: Vec<(u64, &crate::world::TrackedEnemy)> = world
+                    .tracked_enemies
+                    .iter()
+                    .filter(|(_, e)| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 220.0)
+                    .map(|(&id, e)| (id, e))
+                    .collect();
+                tracked_sorted.sort_by_key(|(id, _)| *id);
+                let threats: Vec<[f64; 3]> = tracked_sorted
+                    .iter()
+                    .map(|(_, e)| [e.pos[0], e.pos[1], e.pos[2] + 7.5])
+                    .collect();
+
+                if !threats.is_empty() {
+                    let keep = self.reset_cover_target.is_some_and(|cp| {
+                        obs.t - self.reset_cover_t < 2.5
+                            && dist2d(cp[0], cp[1], nc[0], nc[1])
+                                <= (obs.zone.next_radius - 8.0).max(0.0)
+                    });
+                    if !keep {
+                        self.reset_cover_target = nav.find_cover_point_within(
+                            map,
+                            me.pos,
+                            eye_h,
+                            &threats,
+                            obs.zone.center,
+                            obs.zone.radius,
+                            obs.zone.next_center,
+                            obs.zone.next_radius,
+                            52.0,
+                            None,
+                        );
+                        self.reset_cover_t = obs.t;
+                    }
+                } else {
+                    let keep = self.reset_cover_target.is_some_and(|cp| {
+                        obs.t - self.reset_cover_t < 5.0
+                            && dist2d(cp[0], cp[1], nc[0], nc[1])
+                                <= (obs.zone.next_radius - 10.0).max(0.0)
+                    });
+                    if !keep {
+                        self.reset_cover_target = nav.find_cover_anchor(
+                            me.pos,
+                            obs.zone.center,
+                            obs.zone.radius,
+                            nc,
+                            obs.zone.next_radius,
+                            None,
+                            36.0,
+                        );
+                        self.reset_cover_t = obs.t;
+                    }
+                }
+
+                if let Some(cp) = self.reset_cover_target {
+                    if dist2d(me.pos[0], me.pos[1], cp[0], cp[1]) <= 5.5 {
+                        return ([0.0, 0.0], cp);
+                    }
+                    let wp = self.follow_astar(nav, scratch, me_xy, cp, obs.t);
+                    return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), cp);
+                }
+                if dist_next > safe_r * 0.75 {
+                    let wp = self.follow_astar(nav, scratch, me_xy, nc, obs.t);
+                    return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), nc);
+                }
+                return ([0.0, 0.0], me_xy);
             }
             Posture::SupplyDrop => {
                 if let Some(drop) = self.find_best_supply_drop(world, obs, los_mechs) {
@@ -514,7 +656,7 @@ impl StrategyState {
                 let lt_ready_for_charger = me.weapons.iter().flatten().any(|w| {
                     w.kind == WeaponKind::Lightning
                         && me.energy >= 12.0
-                        && los_mechs.iter().any(|m| m.charging && m.dist <= 45.0)
+                        && los_mechs.iter().any(|m| m.charging && m.dist <= my_lt_range)
                 });
                 let enemy_laser_duck = !immediate_kill_avail
                     && !lt_ready_for_charger
@@ -523,8 +665,9 @@ impl StrategyState {
 
                 let near_cover_14 = nav.has_near_cover_within(me.pos, 14.0);
 
-                // A. Mid-Combat Power Cube Magnet: free +4% max HP heal & +4% dmg mid-fight
-                if !enemy_laser_duck
+                // A. Mid-Combat Power Cube Magnet: free +4% max HP heal & +4% dmg mid-fight (gated on want_cubes)
+                if want_cubes
+                    && !enemy_laser_duck
                     && los_mech_count <= 1
                     && !(no_weapon_can_shoot_now && los_mech_count >= 1)
                 {
@@ -588,11 +731,18 @@ impl StrategyState {
                         .map(|m| [m.pos[0], m.pos[1], m.pos[2] + 7.5])
                         .collect();
                     if threats.is_empty() {
-                        threats = world
+                        let mut tracked_sorted: Vec<(u64, &crate::world::TrackedEnemy)> = world
                             .tracked_enemies
-                            .values()
-                            .filter(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 220.0)
-                            .map(|e| [e.pos[0], e.pos[1], e.pos[2] + 7.5])
+                            .iter()
+                            .filter(|(_, e)| {
+                                dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 220.0
+                            })
+                            .map(|(&id, e)| (id, e))
+                            .collect();
+                        tracked_sorted.sort_by_key(|(id, _)| *id);
+                        threats = tracked_sorted
+                            .iter()
+                            .map(|(_, e)| [e.pos[0], e.pos[1], e.pos[2] + 7.5])
                             .collect();
                     }
 
@@ -629,7 +779,10 @@ impl StrategyState {
                                 return ([0.0, 0.0], cp);
                             }
                             let wp = self.follow_astar(nav, scratch, me_xy, cp, obs.t);
-                            return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), cp);
+                            return (
+                                zigzag_cover_dir(me.pos, wp, cp, los_mech_count, world.strafe_sign),
+                                cp,
+                            );
                         }
                     }
                 }
@@ -681,14 +834,9 @@ impl StrategyState {
                         return ([0.0, 0.0], me_xy);
                     }
 
-                    // 3. Direct engagement: Swing 3 continuous 1v1 orbit (or M7 strafing when 2+ enemies)
+                    // 3. Direct engagement: continuous 1v1 orbit on any single LOS enemy
                     let to_e = unit2d(e.pos[0] - me.pos[0], e.pos[1] - me.pos[1]);
-                    let known_nearby_180 = world
-                        .tracked_enemies
-                        .values()
-                        .filter(|te| dist2d(me.pos[0], me.pos[1], te.pos[0], te.pos[1]) <= 180.0)
-                        .count();
-                    let is_1v1 = los_mech_count == 1 && known_nearby_180 <= 1;
+                    let is_1v1 = los_mech_count == 1;
 
                     let (perp, radial_band, tang_w) = if is_1v1 {
                         world.orbit_active_1v1 = true;
@@ -773,7 +921,11 @@ impl StrategyState {
                         && me.hp > 0.30 * me.max_hp
                         && (!have_laser || e.dist <= 80.0 || e.charging)
                     {
-                        30.0
+                        if enemy_has_lightning && my_lt_range >= 50.0 {
+                            (my_lt_range - 5.0).max(47.0)
+                        } else {
+                            (my_lt_range - 15.0).max(30.0)
+                        }
                     } else if enemy_has_lightning && !has_lightning {
                         54.0
                     } else if enemy_has_laser && !have_laser {
@@ -788,7 +940,10 @@ impl StrategyState {
                     let (pref_dist, push_w) = if e.is_vulnerable || e.hp <= 480.0 {
                         self.tactic = CombatTactic::AggressivePush;
                         ((base_pref_dist - 10.0).max(22.0), 0.78)
-                    } else if has_lightning && me.energy > 20.0 && d2 > 42.0 && base_pref_dist <= 32.0
+                    } else if has_lightning
+                        && me.energy > 20.0
+                        && d2 > (my_lt_range - 3.0).max(36.0)
+                        && base_pref_dist <= my_lt_range - 5.0
                     {
                         self.tactic = CombatTactic::AggressivePush;
                         (base_pref_dist, 0.80)
@@ -849,23 +1004,25 @@ impl StrategyState {
             && (obs.t - world.last_combat_t) >= 2.0
             && (obs.t - world.last_combat_t) <= regen_delay + 12.0;
 
-        if let Some(cube) = obs
-            .cubes
-            .iter()
-            .filter(|c| {
-                is_ground_level(map, c.pos)
-                    && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 85.0
-                    && dist2d(c.pos[0], c.pos[1], nc[0], nc[1]) <= obs.zone.next_radius - 5.0
-            })
-            .min_by(|a, b| {
-                dist2d(me.pos[0], me.pos[1], a.pos[0], a.pos[1])
-                    .partial_cmp(&dist2d(me.pos[0], me.pos[1], b.pos[0], b.pos[1]))
-                    .unwrap()
-            })
-        {
-            let goal = [cube.pos[0], cube.pos[1]];
-            let wp = self.follow_astar(nav, scratch, me_xy, goal, obs.t);
-            return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), goal);
+        if want_cubes {
+            if let Some(cube) = obs
+                .cubes
+                .iter()
+                .filter(|c| {
+                    is_ground_level(map, c.pos)
+                        && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 85.0
+                        && dist2d(c.pos[0], c.pos[1], nc[0], nc[1]) <= obs.zone.next_radius - 5.0
+                })
+                .min_by(|a, b| {
+                    dist2d(me.pos[0], me.pos[1], a.pos[0], a.pos[1])
+                        .partial_cmp(&dist2d(me.pos[0], me.pos[1], b.pos[0], b.pos[1]))
+                        .unwrap()
+                })
+            {
+                let goal = [cube.pos[0], cube.pos[1]];
+                let wp = self.follow_astar(nav, scratch, me_xy, goal, obs.t);
+                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), goal);
+            }
         }
 
         if let Some(ft) = farm_target {
@@ -882,7 +1039,11 @@ impl StrategyState {
             }
         }
 
-        if me.hp > 0.45 * me.max_hp && obs.t - world.last_damage_t > 2.5 && !protecting_regen {
+        if (want_cubes || slot1_empty)
+            && me.hp > 0.45 * me.max_hp
+            && obs.t - world.last_damage_t > 2.5
+            && !protecting_regen
+        {
             if let Some(cr) = obs
                 .crates
                 .iter()
@@ -937,8 +1098,8 @@ impl StrategyState {
             }
         }
 
-        // Early-game 50 m unvisited-grid cube snowball until 10 cubes (or t >= 200 s)
-        if me.cubes < 10 && obs.t < 200.0 {
+        // Early-game 50 m unvisited-grid cube snowball until stat_cap cubes (or t >= 200 s)
+        if me.cubes < stat_cap && obs.t < 200.0 {
             let explore_invalid = self.explore_goal.is_none_or(|g| {
                 obs.zone.next_radius > 24.0
                     && dist2d(g[0], g[1], nc[0], nc[1]) > (obs.zone.next_radius - 16.0).max(0.0)
@@ -1146,23 +1307,25 @@ impl StrategyState {
     ) -> Option<[f64; 2]> {
         let me = &obs.self_obs;
         let slot1_empty = me.weapons.get(1).and_then(|w| w.as_ref()).is_none();
-        let has_gun_upgrades = me.upgrades.iter().any(|u| u.starts_with("gun_"));
-
-        let worst_held = me
+        let have_lightning = me
             .weapons
             .iter()
-            .take(2)
             .flatten()
-            .map(|w| (weapon_desirability(w.kind), w.kind))
-            .min_by_key(|&(p, _)| p);
+            .any(|w| w.kind == WeaponKind::Lightning);
 
         let close_los_enemy = los_mechs.iter().any(|m| m.dist < 60.0);
         let any_los_enemy = !los_mechs.is_empty();
-        let max_seek_d = if slot1_empty { 210.0 } else { 65.0 };
-        let mut best: Option<(f64, [f64; 2])> = None;
+        let max_seek_d = if slot1_empty {
+            210.0
+        } else if !have_lightning {
+            115.0
+        } else {
+            65.0
+        };
+        let mut best: Option<(f64, u64, [f64; 2])> = None;
 
-        for (id, &(kind, pos, _)) in &world.last_pickup_seen {
-            if kind == WeaponKind::Mortar || world.blacklisted_pickups.contains_key(id) {
+        for (&id, &(kind, pos, _)) in &world.last_pickup_seen {
+            if kind == WeaponKind::Mortar || world.blacklisted_pickups.contains_key(&id) {
                 continue;
             }
             if me.weapons.iter().flatten().any(|w| w.kind == kind) {
@@ -1186,24 +1349,74 @@ impl StrategyState {
                 if kind == WeaponKind::Gun || (close_los_enemy && d >= 35.0) {
                     continue;
                 }
-            } else {
-                let Some((worst_prio, worst_kind)) = worst_held else {
-                    continue;
-                };
-                if prio <= worst_prio || any_los_enemy {
-                    continue;
-                }
-                if worst_kind == WeaponKind::Gun && (has_gun_upgrades || obs.alive > 8) {
-                    continue;
-                }
+            } else if any_los_enemy || swap_slot_for(me, kind).is_none() {
+                continue;
             }
 
             let score = prio as f64 * 45.0 - d;
-            if best.is_none_or(|(bs, _)| score > bs) {
-                best = Some((score, [pos[0], pos[1]]));
+            if best.is_none_or(|(bs, bid, _)| score > bs || (score == bs && id < bid)) {
+                best = Some((score, id, [pos[0], pos[1]]));
             }
         }
 
-        best.map(|(_, pt)| pt)
+        best.map(|(_, _, pt)| pt)
     }
+}
+
+/// Preferred loadout [Gun, Lightning] (protects invested Laser if Laser-upgraded and Gun un-upgraded).
+fn swap_slot_for(me: &SelfObs, new_kind: WeaponKind) -> Option<usize> {
+    if new_kind == WeaponKind::Mortar {
+        return None;
+    }
+    if let Some(m_slot) = me
+        .weapons
+        .iter()
+        .take(2)
+        .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Mortar))
+    {
+        return Some(m_slot);
+    }
+    if new_kind == WeaponKind::Lightning {
+        let has_gun_upgrades = me.upgrades.iter().any(|u| u.starts_with("gun_"));
+        let has_laser_upgrades = me.upgrades.iter().any(|u| u.starts_with("laser_"));
+        let laser_slot = me
+            .weapons
+            .iter()
+            .take(2)
+            .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Laser));
+        let gun_slot = me
+            .weapons
+            .iter()
+            .take(2)
+            .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Gun));
+        if let Some(ls) = laser_slot {
+            if !has_laser_upgrades || has_gun_upgrades {
+                return Some(ls);
+            }
+        }
+        if let Some(gs) = gun_slot {
+            if !has_gun_upgrades {
+                return Some(gs);
+            }
+        }
+        return laser_slot.or(gun_slot);
+    }
+    None
+}
+
+#[inline]
+fn zigzag_cover_dir(
+    me_pos: [f64; 3],
+    wp: [f64; 2],
+    cp: [f64; 2],
+    los_mech_count: usize,
+    strafe_sign: f64,
+) -> [f64; 2] {
+    let base = unit2d(wp[0] - me_pos[0], wp[1] - me_pos[1]);
+    if los_mech_count == 0 || dist2d(me_pos[0], me_pos[1], cp[0], cp[1]) <= 8.0 {
+        return base;
+    }
+    let ang = 0.52 * strafe_sign;
+    let (s, c) = ang.sin_cos();
+    [base[0] * c - base[1] * s, base[0] * s + base[1] * c]
 }

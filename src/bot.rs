@@ -4,7 +4,9 @@ use crate::combat::{
 use crate::geom::{dist2d, wrap_angle};
 use crate::map::Map;
 use crate::nav::{NavGrid, NavScratch};
-use crate::protocol::{stat, Action, Config, DebugDraw, DebugLine, DebugPoint, Hello, Observation};
+use crate::protocol::{
+    stat, Action, Config, DebugDraw, DebugLine, DebugPoint, Hello, Observation, WeaponKind,
+};
 use crate::steering;
 use crate::strategy::{CombatTactic, Posture, StrategyState};
 use crate::world::WorldState;
@@ -37,7 +39,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m9-orbit".to_string(),
+            name: "rust-bot-m11-reset".to_string(),
             config: hello.config,
             map,
             nav,
@@ -101,6 +103,7 @@ impl Bot {
             &self.map,
             &self.nav,
             &self.world,
+            &self.config,
             obs,
             &los_mechs,
             near_mech_count,
@@ -122,7 +125,9 @@ impl Bot {
                 .cloned()
         });
 
-        let combat_target = if self.strategy.posture == Posture::EmergencyRegen {
+        let combat_target = if self.strategy.posture == Posture::ResetHeal {
+            None
+        } else if self.strategy.posture == Posture::EmergencyRegen {
             primary_mech.clone()
         } else {
             primary_mech.clone().or_else(|| primary_farm.clone())
@@ -134,6 +139,7 @@ impl Bot {
             &self.nav,
             &mut self.nav_scratch,
             &mut self.world,
+            &self.config,
             obs,
             eye_h,
             &mech_cands,
@@ -144,12 +150,29 @@ impl Bot {
             stuck_active,
         );
 
-        // Fire back while retreating in plain sight; hold fire once LOS broken or 1.8 s clear
-        let actively_taking_fire = los_mech_count > 0
-            && (t - self.world.last_damage_t < 1.8 || los_mechs.iter().any(|m| m.dist < 50.0));
-        let hold_fire_for_regen = self.strategy.posture == Posture::EmergencyRegen
-            && !immediate_kill_avail
-            && !actively_taking_fire;
+        let my_lt_range = me
+            .weapons
+            .iter()
+            .flatten()
+            .find(|w| w.kind == WeaponKind::Lightning)
+            .map(|w| stat(&w.stats, "range", 45.0))
+            .unwrap_or(45.0);
+        let lt_can_short = me
+            .weapons
+            .iter()
+            .flatten()
+            .any(|w| w.kind == WeaponKind::Lightning)
+            && me.energy >= 12.0
+            && los_mechs.iter().any(|m| m.charging && m.dist <= my_lt_range);
+        let suppress_new_laser = self.strategy.posture == Posture::EmergencyRegen
+            || self.strategy.tactic == CombatTactic::CoverDuck
+            || los_mechs.iter().any(|m| m.charging && !lt_can_short);
+
+        // Silent ResetHeal never shoots (protects 5s regen timer); EmergencyRegen keeps shooting Gun/Lightning until LOS breaks
+        let hold_fire_for_regen = self.strategy.posture == Posture::ResetHeal
+            || (self.strategy.posture == Posture::EmergencyRegen
+                && !immediate_kill_avail
+                && los_mech_count == 0);
 
         let (fire, mut reload, chosen_aim, debug_aim_target) = if hold_fire_for_regen {
             ([false, false], false, None, None)
@@ -164,6 +187,7 @@ impl Bot {
                 max_pitch,
                 &mech_cands,
                 tgt,
+                suppress_new_laser,
             )
         } else {
             let (pre_fire, pre_aim) = combat::eval_precharge_laser(
@@ -266,11 +290,15 @@ impl Bot {
             .weapons
             .iter()
             .flatten()
-            .any(|w| w.kind == crate::protocol::WeaponKind::Lightning)
-            && los_mechs.iter().any(|m| m.dist <= 45.0);
+            .any(|w| w.kind == WeaponKind::Lightning)
+            && los_mechs.iter().any(|m| m.dist <= my_lt_range + 2.0);
         let juke_boost = ((t <= self.world.juke_boost_until) || dodged_bullet)
             && me.energy > 45.0
             && !saving_for_lightning;
+        let orbit_boost = self.world.orbit_active_1v1
+            && self.world.orbit_boost_latched
+            && !saving_for_lightning;
+        let stat_cap = self.config.cubes.stat_cap.round() as u64;
 
         let ground_boost = me.grounded
             && moving
@@ -278,9 +306,13 @@ impl Bot {
                 || (aimed_laser_dodge && me.energy > 25.0)
                 || (dodged_hazard && me.energy > 15.0)
                 || juke_boost
+                || orbit_boost
                 || (self.strategy.posture == Posture::EmergencyRegen
                     && los_mech_count > 0
                     && me.energy > 18.0)
+                || (self.strategy.posture == Posture::ResetHeal
+                    && near_mech_count > 0
+                    && me.energy > 35.0)
                 || (self.strategy.tactic == CombatTactic::CoverDuck
                     && los_mech_count > 0
                     && me.energy > 25.0)
@@ -289,14 +321,14 @@ impl Bot {
                     && me.energy > 45.0
                     && any_visible_mech
                         .as_ref()
-                        .is_none_or(|m| !m.has_los || m.dist > 38.0))
+                        .is_none_or(|m| !m.has_los || m.dist > (my_lt_range - 7.0).max(34.0)))
                 || (self.strategy.posture == Posture::ZoneRotate && me.energy > 25.0)
                 || (self.strategy.posture == Posture::SupplyDrop && me.energy > 45.0)
                 || (self.strategy.posture == Posture::LootWeapon
                     && slot1_empty
                     && me.energy > 28.0)
                 || (self.strategy.posture == Posture::EarlyFarm
-                    && (t < 45.0 || (me.cubes < 10 && t < 120.0))
+                    && (t < 45.0 || (me.cubes < stat_cap && t < 120.0))
                     && me.energy > 48.0));
 
         let boost = ground_boost || air_unstuck_boost;
@@ -1899,6 +1931,215 @@ mod tests {
         assert_eq!(
             bot.world.orbit_sign, 1.0,
             "obstacle 8-13 m ahead along orbit tangent must cleanly bounce-flip orbit_sign"
+        );
+    }
+
+    #[test]
+    fn reset_heal_hides_silently_to_full_hp_between_kills_and_fights_if_spotted() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let me_xy = [86.0, -70.0];
+        let mz = bot.map.ground_height(me_xy[0], me_xy[1]);
+        let crate_z = bot.map.ground_height(101.0, -70.0);
+        obs.t = 50.0;
+        obs.self_obs.pos = [me_xy[0], me_xy[1], mz];
+        obs.self_obs.hp = 840.0; // 60% HP -> enters ResetHeal (< 88%)
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 100.0;
+        obs.self_obs.in_zone = true;
+        obs.self_obs.aim = [0.0, 0.0];
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [86.0, -70.0];
+        obs.zone.next_radius = 240.0;
+        obs.zone.shrink_start = 120.0;
+        obs.mechs.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.crates = vec![ItemObs {
+            id: 910,
+            pos: [101.0, -70.0, crate_z],
+            hp: Some(300.0),
+        }];
+        let laser = WeaponObs {
+            kind: WeaponKind::Laser,
+            cooldown: 0.0,
+            ammo: None,
+            reload: None,
+            charge: Some(0.0),
+            stats: bot.config.weapons.laser.clone(),
+        };
+        obs.self_obs.weapons = vec![Some(obs.self_obs.weapons[0].clone().unwrap()), Some(laser)];
+
+        let act1 = bot.act(&obs);
+        assert_eq!(bot.strategy.posture, Posture::ResetHeal);
+        assert_eq!(
+            act1.fire.unwrap(),
+            [false, false],
+            "ResetHeal must NOT shoot crates and reset 5s regen timer"
+        );
+        let cp = bot
+            .strategy
+            .reset_cover_target
+            .expect("must pick cover anchor during ResetHeal");
+
+        // Arriving within 5.5 m of cover anchor: stops silently
+        let cp_z = bot.map.ground_height(cp[0], cp[1]);
+        obs.t = 52.0;
+        obs.self_obs.pos = [cp[0], cp[1], cp_z];
+        obs.self_obs.hp = 1288.0; // 92% HP -> stays in ResetHeal (< 96%)
+        let act_wait = bot.act(&obs);
+        assert_eq!(bot.strategy.posture, Posture::ResetHeal);
+        assert_eq!(act_wait.move_dir.unwrap(), [0.0, 0.0]);
+        assert_eq!(act_wait.boost, Some(false));
+
+        // If an enemy walks into LOS while healing at 92%, immediately fight in Combat!
+        obs.t = 52.2;
+        let ez = bot.map.ground_height(-90.0, 0.0);
+        let p_z = bot.map.ground_height(-45.0, 0.0);
+        obs.self_obs.pos = [-45.0, 0.0, p_z];
+        obs.mechs = vec![ActorObs {
+            id: 5,
+            kind: "mech".into(),
+            pos: [-90.0, 0.0, ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1200.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+        bot.act(&obs);
+        assert_eq!(bot.strategy.posture, Posture::Combat);
+
+        // Once healed >= 96% out of LOS, exits ResetHeal cleanly
+        obs.t = 58.0;
+        obs.mechs.clear();
+        bot.world.tracked_enemies.clear();
+        obs.self_obs.hp = 1360.0; // 97% HP
+        obs.self_obs.pos = [cp[0], cp[1], cp_z];
+        bot.strategy.posture = Posture::ResetHeal;
+        bot.act(&obs);
+        assert_ne!(bot.strategy.posture, Posture::ResetHeal);
+    }
+
+    #[test]
+    fn suppresses_new_laser_charge_during_retreat_and_enemy_laser_duck() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let me_xy = [86.0, -70.0];
+        let e1_xy = [155.0, -25.0];
+        let e2_xy = [165.0, -35.0];
+        let mz = bot.map.ground_height(me_xy[0], me_xy[1]);
+        let ez1 = bot.map.ground_height(e1_xy[0], e1_xy[1]);
+        let ez2 = bot.map.ground_height(e2_xy[0], e2_xy[1]);
+        obs.t = 40.0;
+        obs.self_obs.pos = [me_xy[0], me_xy[1], mz];
+        obs.self_obs.hp = 360.0; // Triggers EmergencyRegen vs 2 enemies
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.in_zone = true;
+        obs.self_obs.aim =
+            direct_aim([me_xy[0], me_xy[1], mz + 7.0], [e1_xy[0], e1_xy[1], ez1 + 4.5]);
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [0.0, 0.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 120.0;
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        let laser = WeaponObs {
+            kind: WeaponKind::Laser,
+            cooldown: 0.0,
+            ammo: None,
+            reload: None,
+            charge: Some(0.0),
+            stats: bot.config.weapons.laser.clone(),
+        };
+        obs.self_obs.weapons = vec![Some(obs.self_obs.weapons[0].clone().unwrap()), Some(laser)];
+        obs.mechs = vec![
+            ActorObs {
+                id: 5,
+                kind: "mech".into(),
+                pos: [e1_xy[0], e1_xy[1], ez1],
+                vel: [0.0, 0.0, 0.0],
+                aim: [-2.8, 0.0],
+                hp: Some(1200.0),
+                max_hp: Some(1400.0),
+                cubes: Some(0),
+                weapons: vec![WeaponKind::Gun],
+                charging: false,
+            },
+            ActorObs {
+                id: 6,
+                kind: "mech".into(),
+                pos: [e2_xy[0], e2_xy[1], ez2],
+                vel: [0.0, 0.0, 0.0],
+                aim: [-2.8, 0.0],
+                hp: Some(1200.0),
+                max_hp: Some(1400.0),
+                cubes: Some(0),
+                weapons: vec![WeaponKind::Gun],
+                charging: false,
+            },
+        ];
+
+        let act_reg = bot.act(&obs);
+        assert_eq!(bot.strategy.posture, Posture::EmergencyRegen);
+        let fire_reg = act_reg.fire.unwrap();
+        assert!(
+            fire_reg[0] && !fire_reg[1],
+            "during EmergencyRegen retreat must fire Gun without starting 0.5x-speed Laser charge, got {fire_reg:?}"
+        );
+
+        // Even at full HP in 1v1, enemy charging Laser must suppress starting a 0.5x-speed Laser charge
+        obs.t = 40.2;
+        obs.self_obs.hp = 1400.0;
+        obs.mechs.truncate(1);
+        obs.mechs[0].weapons = vec![WeaponKind::Laser];
+        obs.mechs[0].charging = true;
+        let act_duck = bot.act(&obs);
+        assert_eq!(bot.strategy.tactic, CombatTactic::CoverDuck);
+        assert!(
+            !act_duck.fire.unwrap()[1],
+            "must NOT start 0.5x-speed Laser charge while dodging enemy Laser"
+        );
+    }
+
+    #[test]
+    fn velocity_aware_bullet_dodge_does_not_reverse_fast_clearing_orbit() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let bot = Bot::new(hello);
+        // Moving fast +y along orbit at y=-0.5: old dodge saw signed_perp=-0.5 and reversed to -y through v=0!
+        let mz = bot.map.ground_height(0.0, -0.5);
+        obs.t = 20.0;
+        obs.self_obs.pos = [0.0, -0.5, mz];
+        obs.self_obs.vel = [0.0, 19.5, 0.0];
+        obs.self_obs.grounded = true;
+        obs.projectiles = vec![ProjectileObs {
+            id: 4003,
+            kind: "gun".into(),
+            pos: [-60.0, 0.0, mz + 4.5],
+            vel: [252.0, 0.0, 0.0],
+        }];
+
+        let (mv, _, _, _) = steering::steer(
+            &bot.map,
+            &bot.nav,
+            &bot.config,
+            &obs,
+            [0.0, 1.0],
+            [0.0, 1.0],
+            2.5,
+            9.0,
+            1.0,
+        );
+        assert!(
+            mv[1] > 0.5,
+            "fast +y orbit past bullet center must keep +y velocity instead of reversing into v=0, got {mv:?}"
         );
     }
 }

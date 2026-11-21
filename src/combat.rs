@@ -50,9 +50,13 @@ pub(crate) fn select_targets(
     let crate_r = stat(&config.crates, "radius", 1.4);
     let crate_h = stat(&config.crates, "height", 2.4);
     let regen_delay = stat(&me.stats, "regen_delay", 5.0);
-    let protecting_regen = me.hp < 0.72 * me.max_hp
-        && (obs.t - world.last_combat_t) >= 2.0
-        && (obs.t - world.last_combat_t) <= regen_delay + 12.0;
+    let protecting_regen = me.hp < 0.88 * me.max_hp
+        && (obs.t - world.last_combat_t) >= 1.5
+        && (obs.t - world.last_combat_t) <= regen_delay + 16.0;
+    let stat_cap = config.cubes.stat_cap.round() as u64;
+    let want_cubes = me.cubes < stat_cap || (me.cubes >= 13 && me.cubes < 15);
+    let slot1_empty = me.weapons.get(1).and_then(|w| w.as_ref()).is_none();
+    let npc_max_d = if want_cubes { 125.0 } else { 50.0 };
 
     let mut mech_cands = Vec::new();
     let mut best_farm: Option<(f64, TargetCandidate)> = None;
@@ -74,6 +78,7 @@ pub(crate) fn select_targets(
             } else {
                 (false, com_z)
             };
+            let d = dist3d(muzzle, [actor.pos[0], actor.pos[1], com_z]);
             let aim_off = aim_z - actor.pos[2];
             let aim_half_h = (mech_h - aim_off).min(aim_off).max(1.0);
             let radius = base_mech_r * scale;
@@ -105,7 +110,7 @@ pub(crate) fn select_targets(
                 is_vulnerable,
             });
         } else if actor.kind == "npc"
-            && d <= 125.0
+            && d <= npc_max_d
             && me.hp > 0.45 * me.max_hp
             && obs.t - world.last_damage_t > 2.5
             && !protecting_regen
@@ -142,6 +147,7 @@ pub(crate) fn select_targets(
     }
 
     if best_farm.is_none()
+        && (want_cubes || slot1_empty)
         && me.hp > 0.45 * me.max_hp
         && obs.t - world.last_damage_t > 2.5
         && !protecting_regen
@@ -202,6 +208,13 @@ pub(crate) fn pick_best_mech_target(
         .flatten()
         .find(|w| w.kind == WeaponKind::Lightning)
         .map(|w| stat(&w.stats, "chain_range", 14.0));
+    let lt_range = me
+        .weapons
+        .iter()
+        .flatten()
+        .find(|w| w.kind == WeaponKind::Lightning)
+        .map(|w| stat(&w.stats, "range", 45.0))
+        .unwrap_or(45.0);
     let have_lightning = lt_chain_range.is_some();
 
     let mut best_los: Option<(f64, &TargetCandidate)> = None;
@@ -230,7 +243,7 @@ pub(crate) fn pick_best_mech_target(
             score += 95.0; // Cook-off!
         }
         if have_lightning {
-            if c.dist <= 50.0 {
+            if c.dist <= lt_range + 5.0 {
                 if c.charging {
                     score += 130.0;
                 } else if c.weapons.contains(&WeaponKind::Laser) {
@@ -242,7 +255,7 @@ pub(crate) fn pick_best_mech_target(
                     .iter()
                     .filter(|o| dist3d(c.pos, o.pos) <= cr)
                     .count();
-                if c.dist <= 48.0 && cluster >= 2 {
+                if c.dist <= lt_range + 3.0 && cluster >= 2 {
                     score += 45.0;
                 }
             }
@@ -251,7 +264,7 @@ pub(crate) fn pick_best_mech_target(
             score += 40.0;
         }
 
-        if best_los.is_none_or(|(bs, _)| score > bs) {
+        if best_los.is_none_or(|(bs, prev)| score > bs || (score == bs && c.id < prev.id)) {
             best_los = Some((score, c));
         }
     }
@@ -270,6 +283,7 @@ pub(crate) fn eval_combat(
     max_pitch: f64,
     mech_cands: &[TargetCandidate],
     tgt: &TargetCandidate,
+    suppress_new_laser: bool,
 ) -> ([bool; 2], bool, Option<[f64; 2]>, Option<[f64; 3]>) {
     let me = &obs.self_obs;
     let mut fire = [false, false];
@@ -397,31 +411,33 @@ pub(crate) fn eval_combat(
             fire[lts] = lt_fire;
             chosen_aim = Some(lt_aim);
 
-            // Simultaneous Lightning + Laser charge at <= 45 m when Laser is off cooldown
-            if let Some(ls) = laser_slot {
-                let lw = me.weapons[ls].as_ref().unwrap();
-                let l_range = stat(&lw.stats, "range", 280.0);
-                let allow_laser_farm = matches!(tgt.kind, TargetKind::Npc | TargetKind::Crate)
-                    && me.hp > 0.55 * me.max_hp;
-                if tgt.dist <= l_range - 2.0
-                    && lw.cooldown <= 0.08
-                    && (matches!(tgt.kind, TargetKind::Mech) || allow_laser_farm)
-                    && me.hp > 0.35 * me.max_hp
-                    && !tgt.charging
-                {
-                    let (l_aim, should_hold) = eval_laser(
-                        map,
-                        config,
-                        me.aim,
-                        muzzle,
-                        me.cubes,
-                        lw,
-                        tgt,
-                        min_pitch,
-                        max_pitch,
-                    );
-                    fire[ls] = should_hold;
-                    chosen_aim = Some(l_aim);
+            // Simultaneous Lightning + Laser charge at <= 45 m when Laser is off cooldown (unless retreating/ducking)
+            if !suppress_new_laser {
+                if let Some(ls) = laser_slot {
+                    let lw = me.weapons[ls].as_ref().unwrap();
+                    let l_range = stat(&lw.stats, "range", 280.0);
+                    let allow_laser_farm = matches!(tgt.kind, TargetKind::Npc | TargetKind::Crate)
+                        && me.hp > 0.55 * me.max_hp;
+                    if tgt.dist <= l_range - 2.0
+                        && lw.cooldown <= 0.08
+                        && (matches!(tgt.kind, TargetKind::Mech) || allow_laser_farm)
+                        && me.hp > 0.35 * me.max_hp
+                        && !tgt.charging
+                    {
+                        let (l_aim, should_hold) = eval_laser(
+                            map,
+                            config,
+                            me.aim,
+                            muzzle,
+                            me.cubes,
+                            lw,
+                            tgt,
+                            min_pitch,
+                            max_pitch,
+                        );
+                        fire[ls] = should_hold;
+                        chosen_aim = Some(l_aim);
+                    }
                 }
             }
 
@@ -429,33 +445,35 @@ pub(crate) fn eval_combat(
         }
     }
 
-    // 3. Laser ready check
-    if let Some(ls) = laser_slot {
-        let w = me.weapons[ls].as_ref().unwrap();
-        let l_range = stat(&w.stats, "range", 280.0);
-        let allow_laser_farm =
-            matches!(tgt.kind, TargetKind::Npc | TargetKind::Crate) && me.hp > 0.55 * me.max_hp;
-        if tgt.has_los
-            && tgt.dist <= l_range - 2.0
-            && w.cooldown <= 0.08
-            && (matches!(tgt.kind, TargetKind::Mech) || allow_laser_farm)
-        {
-            let (l_aim, should_hold) =
-                eval_laser(map, config, me.aim, muzzle, me.cubes, w, tgt, min_pitch, max_pitch);
-            fire[ls] = should_hold;
-            if let Some(gs) = gun_slot {
-                let (g_aim, g_fire, g_rel, g_ready) = eval_gun_slot(gs);
-                reload = g_rel;
-                if g_ready {
-                    chosen_aim = Some(g_aim);
-                    fire[gs] = g_fire;
+    // 3. Laser ready check (suppress starting a new 0.5x-speed charge while retreating/ducking)
+    if !suppress_new_laser {
+        if let Some(ls) = laser_slot {
+            let w = me.weapons[ls].as_ref().unwrap();
+            let l_range = stat(&w.stats, "range", 280.0);
+            let allow_laser_farm =
+                matches!(tgt.kind, TargetKind::Npc | TargetKind::Crate) && me.hp > 0.55 * me.max_hp;
+            if tgt.has_los
+                && tgt.dist <= l_range - 2.0
+                && w.cooldown <= 0.08
+                && (matches!(tgt.kind, TargetKind::Mech) || allow_laser_farm)
+            {
+                let (l_aim, should_hold) =
+                    eval_laser(map, config, me.aim, muzzle, me.cubes, w, tgt, min_pitch, max_pitch);
+                fire[ls] = should_hold;
+                if let Some(gs) = gun_slot {
+                    let (g_aim, g_fire, g_rel, g_ready) = eval_gun_slot(gs);
+                    reload = g_rel;
+                    if g_ready {
+                        chosen_aim = Some(g_aim);
+                        fire[gs] = g_fire;
+                    } else {
+                        chosen_aim = Some(l_aim);
+                    }
                 } else {
                     chosen_aim = Some(l_aim);
                 }
-            } else {
-                chosen_aim = Some(l_aim);
+                return (fire, reload, chosen_aim, debug_pt);
             }
-            return (fire, reload, chosen_aim, debug_pt);
         }
     }
 

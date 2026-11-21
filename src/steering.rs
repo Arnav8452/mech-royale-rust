@@ -57,7 +57,14 @@ pub(crate) fn steer(
             if signed_perp.abs() > mech_radius + 2.2 {
                 continue;
             }
-            let sign = if signed_perp.abs() < 0.25 {
+            let vel_perp = me.vel[0] * perp_left[0] + me.vel[1] * perp_left[1];
+            let pred_perp = signed_perp + vel_perp * t_hit;
+            if pred_perp.abs() > mech_radius + 0.85 && signed_perp * vel_perp >= 0.0 {
+                continue;
+            }
+            let sign = if vel_perp.abs() >= 6.0 && signed_perp.abs() <= 1.4 {
+                vel_perp.signum()
+            } else if signed_perp.abs() < 0.25 {
                 strafe_sign
             } else if signed_perp > 0.0 {
                 1.0
@@ -65,7 +72,7 @@ pub(crate) fn steer(
                 -1.0
             };
             let esc = [perp_left[0] * sign, perp_left[1] * sign];
-            let urgency = 2.0 * (1.0 - (t_hit / 0.65).clamp(0.0, 0.7));
+            let urgency = 1.25 * (1.0 - (t_hit / 0.65).clamp(0.0, 0.7));
             bullet_escapes.push((esc, urgency));
         }
     }
