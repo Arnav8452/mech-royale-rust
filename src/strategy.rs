@@ -97,6 +97,11 @@ impl StrategyState {
     pub fn pick_upgrade(&self, config: &Config, offer: &Offer, me: &SelfObs) -> usize {
         let mut best_idx = 0usize;
         let mut best_score = f64::NEG_INFINITY;
+        let have_lightning = me
+            .weapons
+            .iter()
+            .flatten()
+            .any(|w| w.kind == WeaponKind::Lightning);
 
         for (i, choice) in offer.choices.iter().enumerate() {
             let score = if let Some(def) = config.upgrades.iter().find(|u| u.id == choice.id) {
@@ -109,30 +114,40 @@ impl StrategyState {
                 for eff in &def.effects {
                     let base = match eff.path.as_str() {
                         "mech.regen_per_s" | "mech.regen_delay" => 108.0,
+                        "mech.hp" => 105.0,
                         "mech.armor" => 104.0,
-                        "mech.hp" => 100.0,
-                        "weapons.lightning.damage"
-                        | "weapons.lightning.energy"
-                        | "weapons.lightning.range"
-                        | "weapons.lightning.cone_deg" => 98.0,
+                        "weapons.lightning.range" | "weapons.lightning.cone_deg" => 103.0,
+                        "weapons.lightning.damage" | "weapons.lightning.energy" => 102.0,
                         "weapons.laser.damage" | "weapons.laser.charge" | "weapons.laser.pierce" => {
-                            97.0
+                            99.0
                         }
-                        "weapons.gun.mag" | "weapons.gun.reload" => 95.0,
-                        "weapons.gun.cooldown" | "weapons.gun.damage" => 92.0,
-                        "weapons.lightning.chain" => 90.0,
-                        "mech.near_range_bonus" | "mech.vision_bonus" | "mech.hearing" => {
-                            if existing_stacks == 0 {
-                                88.0
+                        "weapons.gun.damage" | "weapons.gun.cooldown" => 98.0,
+                        "weapons.gun.mag" | "weapons.gun.reload" => 96.0,
+                        "weapons.lightning.chain" => 95.0,
+                        "mech.walk_speed" | "mech.boost_speed" => 89.0,
+                        "weapons.gun.speed" | "weapons.gun.range" => 86.0,
+                        "mech.energy_regen" | "mech.boost_drain" | "mech.jet_drain" => {
+                            if have_lightning {
+                                84.0
                             } else {
-                                72.0
+                                76.0
                             }
                         }
-                        "weapons.gun.speed" | "weapons.gun.range" => 84.0,
-                        "mech.walk_speed" | "mech.boost_speed" => 82.0,
-                        "mech.energy_regen" | "mech.boost_drain" | "mech.jet_drain" => 76.0,
+                        "mech.energy" => {
+                            if have_lightning {
+                                80.0
+                            } else {
+                                68.0
+                            }
+                        }
+                        "mech.near_range_bonus" | "mech.vision_bonus" | "mech.hearing" => {
+                            if existing_stacks == 0 {
+                                72.0
+                            } else {
+                                58.0
+                            }
+                        }
                         "mech.turn_rate" | "mech.pitch_rate" => 70.0,
-                        "mech.energy" => 64.0,
                         p if p.starts_with("weapons.mortar.") => 30.0,
                         _ => 25.0,
                     };
@@ -363,6 +378,7 @@ impl StrategyState {
         nav: &NavGrid,
         scratch: &mut NavScratch,
         world: &mut WorldState,
+        config: &Config,
         obs: &Observation,
         eye_h: f64,
         mech_cands: &[TargetCandidate],
@@ -378,6 +394,16 @@ impl StrategyState {
         world.orbit_active_1v1 = false;
 
         let me = &obs.self_obs;
+        let stat_cap = config.cubes.stat_cap.round() as u64;
+        let want_cubes = me.cubes < stat_cap || (me.cubes >= 13 && me.cubes < 15);
+        let slot1_empty = me.weapons.get(1).and_then(|w| w.as_ref()).is_none();
+        let my_lt_range = me
+            .weapons
+            .iter()
+            .flatten()
+            .find(|w| w.kind == WeaponKind::Lightning)
+            .map(|w| stat(&w.stats, "range", 45.0))
+            .unwrap_or(45.0);
         let los_mech_count = los_mechs.len();
         let me_xy = [me.pos[0], me.pos[1]];
         let nc = obs.zone.next_center;
@@ -520,7 +546,7 @@ impl StrategyState {
                 let lt_ready_for_charger = me.weapons.iter().flatten().any(|w| {
                     w.kind == WeaponKind::Lightning
                         && me.energy >= 12.0
-                        && los_mechs.iter().any(|m| m.charging && m.dist <= 45.0)
+                        && los_mechs.iter().any(|m| m.charging && m.dist <= my_lt_range)
                 });
                 let enemy_laser_duck = !immediate_kill_avail
                     && !lt_ready_for_charger
@@ -529,8 +555,9 @@ impl StrategyState {
 
                 let near_cover_14 = nav.has_near_cover_within(me.pos, 14.0);
 
-                // A. Mid-Combat Power Cube Magnet: free +4% max HP heal & +4% dmg mid-fight
-                if !enemy_laser_duck
+                // A. Mid-Combat Power Cube Magnet: free +4% max HP heal & +4% dmg mid-fight (gated on want_cubes)
+                if want_cubes
+                    && !enemy_laser_duck
                     && los_mech_count <= 1
                     && !(no_weapon_can_shoot_now && los_mech_count >= 1)
                 {
@@ -777,7 +804,11 @@ impl StrategyState {
                         && me.hp > 0.30 * me.max_hp
                         && (!have_laser || e.dist <= 80.0 || e.charging)
                     {
-                        30.0
+                        if enemy_has_lightning && my_lt_range >= 50.0 {
+                            (my_lt_range - 5.0).max(47.0)
+                        } else {
+                            (my_lt_range - 15.0).max(30.0)
+                        }
                     } else if enemy_has_lightning && !has_lightning {
                         54.0
                     } else if enemy_has_laser && !have_laser {
@@ -792,7 +823,10 @@ impl StrategyState {
                     let (pref_dist, push_w) = if e.is_vulnerable || e.hp <= 480.0 {
                         self.tactic = CombatTactic::AggressivePush;
                         ((base_pref_dist - 10.0).max(22.0), 0.78)
-                    } else if has_lightning && me.energy > 20.0 && d2 > 42.0 && base_pref_dist <= 32.0
+                    } else if has_lightning
+                        && me.energy > 20.0
+                        && d2 > (my_lt_range - 3.0).max(36.0)
+                        && base_pref_dist <= my_lt_range - 5.0
                     {
                         self.tactic = CombatTactic::AggressivePush;
                         (base_pref_dist, 0.80)
@@ -853,23 +887,25 @@ impl StrategyState {
             && (obs.t - world.last_combat_t) >= 2.0
             && (obs.t - world.last_combat_t) <= regen_delay + 12.0;
 
-        if let Some(cube) = obs
-            .cubes
-            .iter()
-            .filter(|c| {
-                is_ground_level(map, c.pos)
-                    && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 85.0
-                    && dist2d(c.pos[0], c.pos[1], nc[0], nc[1]) <= obs.zone.next_radius - 5.0
-            })
-            .min_by(|a, b| {
-                dist2d(me.pos[0], me.pos[1], a.pos[0], a.pos[1])
-                    .partial_cmp(&dist2d(me.pos[0], me.pos[1], b.pos[0], b.pos[1]))
-                    .unwrap()
-            })
-        {
-            let goal = [cube.pos[0], cube.pos[1]];
-            let wp = self.follow_astar(nav, scratch, me_xy, goal, obs.t);
-            return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), goal);
+        if want_cubes {
+            if let Some(cube) = obs
+                .cubes
+                .iter()
+                .filter(|c| {
+                    is_ground_level(map, c.pos)
+                        && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 85.0
+                        && dist2d(c.pos[0], c.pos[1], nc[0], nc[1]) <= obs.zone.next_radius - 5.0
+                })
+                .min_by(|a, b| {
+                    dist2d(me.pos[0], me.pos[1], a.pos[0], a.pos[1])
+                        .partial_cmp(&dist2d(me.pos[0], me.pos[1], b.pos[0], b.pos[1]))
+                        .unwrap()
+                })
+            {
+                let goal = [cube.pos[0], cube.pos[1]];
+                let wp = self.follow_astar(nav, scratch, me_xy, goal, obs.t);
+                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), goal);
+            }
         }
 
         if let Some(ft) = farm_target {
@@ -886,7 +922,11 @@ impl StrategyState {
             }
         }
 
-        if me.hp > 0.45 * me.max_hp && obs.t - world.last_damage_t > 2.5 && !protecting_regen {
+        if (want_cubes || slot1_empty)
+            && me.hp > 0.45 * me.max_hp
+            && obs.t - world.last_damage_t > 2.5
+            && !protecting_regen
+        {
             if let Some(cr) = obs
                 .crates
                 .iter()
@@ -941,8 +981,8 @@ impl StrategyState {
             }
         }
 
-        // Early-game 50 m unvisited-grid cube snowball until 10 cubes (or t >= 200 s)
-        if me.cubes < 10 && obs.t < 200.0 {
+        // Early-game 50 m unvisited-grid cube snowball until stat_cap cubes (or t >= 200 s)
+        if me.cubes < stat_cap && obs.t < 200.0 {
             let explore_invalid = self.explore_goal.is_none_or(|g| {
                 obs.zone.next_radius > 24.0
                     && dist2d(g[0], g[1], nc[0], nc[1]) > (obs.zone.next_radius - 16.0).max(0.0)

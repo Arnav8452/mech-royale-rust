@@ -39,7 +39,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m10-boost".to_string(),
+            name: "rust-bot-m10-fixes".to_string(),
             config: hello.config,
             map,
             nav,
@@ -136,6 +136,7 @@ impl Bot {
             &self.nav,
             &mut self.nav_scratch,
             &mut self.world,
+            &self.config,
             obs,
             eye_h,
             &mech_cands,
@@ -262,18 +263,26 @@ impl Bot {
             && self.world.cmd_move_streak >= 8
             && me.energy > 40.0;
 
+        let my_lt_range = me
+            .weapons
+            .iter()
+            .flatten()
+            .find(|w| w.kind == WeaponKind::Lightning)
+            .map(|w| stat(&w.stats, "range", 45.0))
+            .unwrap_or(45.0);
         let saving_for_lightning = me
             .weapons
             .iter()
             .flatten()
             .any(|w| w.kind == WeaponKind::Lightning)
-            && los_mechs.iter().any(|m| m.dist <= 45.0);
+            && los_mechs.iter().any(|m| m.dist <= my_lt_range + 2.0);
         let juke_boost = ((t <= self.world.juke_boost_until) || dodged_bullet)
             && me.energy > 45.0
             && !saving_for_lightning;
         let orbit_boost = self.world.orbit_active_1v1
             && self.world.orbit_boost_latched
             && !saving_for_lightning;
+        let stat_cap = self.config.cubes.stat_cap.round() as u64;
 
         let ground_boost = me.grounded
             && moving
@@ -293,14 +302,14 @@ impl Bot {
                     && me.energy > 45.0
                     && any_visible_mech
                         .as_ref()
-                        .is_none_or(|m| !m.has_los || m.dist > 38.0))
+                        .is_none_or(|m| !m.has_los || m.dist > (my_lt_range - 7.0).max(34.0)))
                 || (self.strategy.posture == Posture::ZoneRotate && me.energy > 25.0)
                 || (self.strategy.posture == Posture::SupplyDrop && me.energy > 45.0)
                 || (self.strategy.posture == Posture::LootWeapon
                     && slot1_empty
                     && me.energy > 28.0)
                 || (self.strategy.posture == Posture::EarlyFarm
-                    && (t < 45.0 || (me.cubes < 10 && t < 120.0))
+                    && (t < 45.0 || (me.cubes < stat_cap && t < 120.0))
                     && me.energy > 48.0));
 
         let boost = ground_boost || air_unstuck_boost;
@@ -2094,6 +2103,148 @@ mod tests {
             act_lt.boost,
             Some(false),
             "must save energy for Lightning DPS inside range"
+        );
+    }
+
+    #[test]
+    fn upgrade_scorer_prefers_weapon_dps_over_sensors() {
+        let (hello, obs) = load_sample_hello_and_obs();
+        let bot = Bot::new(hello);
+        let mut me = obs.self_obs.clone();
+
+        let offer_gun = Offer {
+            id: 10,
+            expires: 30.0,
+            choices: vec![
+                OfferChoice {
+                    id: "sensors".into(),
+                    name: "Sensor suite".into(),
+                    desc: "".into(),
+                },
+                OfferChoice {
+                    id: "gun_damage".into(),
+                    name: "Heavy rounds".into(),
+                    desc: "".into(),
+                },
+                OfferChoice {
+                    id: "gun_rate".into(),
+                    name: "Rotary feed".into(),
+                    desc: "".into(),
+                },
+            ],
+        };
+        let pick_gun = bot.strategy.pick_upgrade(&bot.config, &offer_gun, &me);
+        assert!(
+            pick_gun == 1 || pick_gun == 2,
+            "held Gun DPS upgrade must beat sensors, picked idx {pick_gun}"
+        );
+
+        let laser = WeaponObs {
+            kind: WeaponKind::Laser,
+            cooldown: 0.0,
+            ammo: None,
+            reload: None,
+            charge: Some(0.0),
+            stats: bot.config.weapons.laser.clone(),
+        };
+        me.weapons = vec![Some(laser), None];
+        let offer_laser = Offer {
+            id: 11,
+            expires: 30.0,
+            choices: vec![
+                OfferChoice {
+                    id: "sensors".into(),
+                    name: "Sensor suite".into(),
+                    desc: "".into(),
+                },
+                OfferChoice {
+                    id: "laser_damage".into(),
+                    name: "Focusing lens".into(),
+                    desc: "".into(),
+                },
+            ],
+        };
+        assert_eq!(
+            bot.strategy.pick_upgrade(&bot.config, &offer_laser, &me),
+            1,
+            "held laser_damage must beat sensors"
+        );
+    }
+
+    #[test]
+    fn stops_chasing_cubes_and_crates_at_stat_cap_10() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(-45.0, 0.0);
+        let cz = bot.map.ground_height(-60.0, 0.0);
+        let kz = bot.map.ground_height(-85.0, 0.0);
+        obs.t = 220.0;
+        obs.self_obs.pos = [-45.0, 0.0, mz];
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 100.0;
+        obs.self_obs.aim = [PI, 0.0];
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [-45.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [-45.0, 0.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 260.0;
+        obs.mechs.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.cubes = vec![ItemObs {
+            id: 901,
+            pos: [-60.0, 0.0, cz],
+            hp: None,
+        }];
+        obs.crates = vec![ItemObs {
+            id: 902,
+            pos: [-85.0, 0.0, kz],
+            hp: Some(200.0),
+        }];
+        let laser = WeaponObs {
+            kind: WeaponKind::Laser,
+            cooldown: 0.0,
+            ammo: None,
+            reload: None,
+            charge: Some(0.0),
+            stats: bot.config.weapons.laser.clone(),
+        };
+        obs.self_obs.weapons = vec![Some(obs.self_obs.weapons[0].clone().unwrap()), Some(laser)];
+
+        // 1. At stat_cap = 10 with both slots filled: skips cube & crate (neither walks West to cube/crate nor shoots crate)
+        obs.self_obs.cubes = 10;
+        let act_cap = bot.act(&obs);
+        assert!(
+            act_cap.move_dir.unwrap()[0] > 0.0,
+            "at stat_cap 10 with full slots should skip West cube/crate and continue patrol, got {:?}",
+            act_cap.move_dir
+        );
+        assert_eq!(act_cap.fire.unwrap(), [false, false]);
+
+        // 2. At 13 cubes (close to 5th upgrade at 15): chases nearby cube again
+        obs.t = 220.2;
+        obs.self_obs.cubes = 13;
+        let act_13 = bot.act(&obs);
+        assert!(
+            act_13.move_dir.unwrap()[0] < -0.5,
+            "at 13..14 cubes should chase cube for 5th upgrade, got {:?}",
+            act_13.move_dir
+        );
+
+        // 3. At 10 cubes with empty slot 1: still targets & walks toward crate for weapon slot 2
+        obs.t = 220.4;
+        obs.self_obs.cubes = 10;
+        obs.cubes.clear();
+        obs.self_obs.weapons[1] = None;
+        obs.self_obs.aim = direct_aim([-45.0, 0.0, mz + 7.0], [-85.0, 0.0, kz + 1.2]);
+        let act_slot1 = bot.act(&obs);
+        assert!(
+            act_slot1.move_dir.unwrap()[0] < -0.5 && act_slot1.fire.unwrap()[0],
+            "at 10 cubes with empty slot 1 must still break/chase crate, got mv={:?} fire={:?}",
+            act_slot1.move_dir,
+            act_slot1.fire
         );
     }
 }
