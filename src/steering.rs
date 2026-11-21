@@ -1,0 +1,151 @@
+use std::f64::consts::PI;
+
+use crate::geom::{dist2d, unit2d};
+use crate::map::Map;
+use crate::nav::NavGrid;
+use crate::protocol::{stat, Config, Observation};
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn steer(
+    map: &Map,
+    nav: &NavGrid,
+    config: &Config,
+    obs: &Observation,
+    goal_dir: [f64; 2],
+    last_move: [f64; 2],
+    mech_radius: f64,
+    mech_height: f64,
+) -> ([f64; 2], bool, bool) {
+    let me = &obs.self_obs;
+    let step_up = stat(&me.stats, "step_up", 1.2);
+    let max_slope_rad = stat(&me.stats, "max_slope_deg", 50.0).to_radians();
+    let max_slope_tan = max_slope_rad.tan();
+    let mortar_g = stat(&config.weapons.mortar, "gravity", 22.0);
+    let splash_r = stat(&config.weapons.mortar, "splash_radius", 7.0);
+
+    let mut mortar_threats: Vec<[f64; 2]> = Vec::new();
+    for proj in &obs.projectiles {
+        if proj.kind != "mortar" {
+            continue;
+        }
+        if let Some(impact) = predict_mortar_impact(map, proj.pos, proj.vel, mortar_g) {
+            if dist2d(me.pos[0], me.pos[1], impact[0], impact[1]) <= splash_r + 10.0 {
+                mortar_threats.push(impact);
+            }
+        }
+    }
+
+    // Exact ray-distance anti-laser dodge: ray from charging enemy within 8 m perpendicular distance
+    let mut laser_threats: Vec<[f64; 2]> = Vec::new();
+    for m in &obs.mechs {
+        if m.kind == "mech" && m.charging {
+            let ray = [m.aim[0].cos(), m.aim[0].sin()];
+            let rel = [me.pos[0] - m.pos[0], me.pos[1] - m.pos[1]];
+            let proj = rel[0] * ray[0] + rel[1] * ray[1];
+            let perp_dist = (rel[0] * ray[1] - rel[1] * ray[0]).abs();
+            if proj > 0.0 && proj <= 265.0 && perp_dist <= 8.0 {
+                laser_threats.push(ray);
+            }
+        }
+    }
+
+    let aimed_laser_dodge = !laser_threats.is_empty();
+    let dodged_hazard = !mortar_threats.is_empty() || aimed_laser_dodge;
+
+    if goal_dir[0].hypot(goal_dir[1]) < 0.05 && !dodged_hazard {
+        return ([0.0, 0.0], false, false);
+    }
+
+    let on_ground_here =
+        me.grounded && (me.pos[2] - map.ground_height(me.pos[0], me.pos[1])).abs() <= 2.0;
+
+    let mut best_dir = goal_dir;
+    let mut best_score = f64::NEG_INFINITY;
+
+    for k in 0..16 {
+        let theta = (k as f64) * (PI / 8.0);
+        let dir = [theta.cos(), theta.sin()];
+        let mut score = dir[0] * goal_dir[0] + dir[1] * goal_dir[1];
+        score += 0.18 * (dir[0] * last_move[0] + dir[1] * last_move[1]);
+
+        let check_step = |dist_m: f64| -> bool {
+            let nx = me.pos[0] + dir[0] * dist_m;
+            let ny = me.pos[1] + dir[1] * dist_m;
+            let g_next = map.ground_height(nx, ny);
+            let dz_g = g_next - me.pos[2];
+            if on_ground_here && dz_g > step_up && dz_g / dist_m > max_slope_tan {
+                return false;
+            }
+            let probe_z = if on_ground_here { g_next } else { me.pos[2] };
+            let (ok, surf_z) = map.is_pos_walkable(
+                nx,
+                ny,
+                probe_z,
+                mech_radius,
+                mech_height,
+                step_up,
+            );
+            if !ok {
+                return false;
+            }
+            let dz = surf_z - me.pos[2];
+            if dz > step_up && dz / dist_m > max_slope_tan {
+                return false;
+            }
+            true
+        };
+
+        let ok_near = check_step(3.5);
+        let ok_mid = ok_near && check_step(7.5);
+        let ok_far = ok_mid && check_step(13.0);
+
+        if !ok_near {
+            score -= 4.0;
+        } else if !ok_mid {
+            score -= 1.8;
+        } else if !ok_far {
+            score -= 0.6;
+        }
+
+        for imp in &mortar_threats {
+            let away = unit2d(me.pos[0] - imp[0], me.pos[1] - imp[1]);
+            score += 2.2 * (dir[0] * away[0] + dir[1] * away[1]);
+        }
+
+        for ray in &laser_threats {
+            let cross = (dir[0] * ray[1] - dir[1] * ray[0]).abs();
+            score += 3.5 * cross;
+        }
+
+        if aimed_laser_dodge && ok_near {
+            let nx3 = me.pos[0] + dir[0] * 3.5;
+            let ny3 = me.pos[1] + dir[1] * 3.5;
+            let (ncx, ncy) = nav.world_to_cell(nx3, ny3);
+            if nav.near_cover[ncy * nav.nx + ncx] {
+                score += 0.40;
+            }
+        }
+
+        if score > best_score {
+            best_score = score;
+            best_dir = dir;
+        }
+    }
+
+    (best_dir, dodged_hazard, aimed_laser_dodge)
+}
+
+fn predict_mortar_impact(map: &Map, pos: [f64; 3], vel: [f64; 3], g: f64) -> Option<[f64; 2]> {
+    let mut t = 0.2;
+    for _ in 0..14 {
+        let x = pos[0] + vel[0] * t;
+        let y = pos[1] + vel[1] * t;
+        let z = pos[2] + vel[2] * t - 0.5 * g * t * t;
+        let surf = map.surface_height(x, y, z + 5.0);
+        if z <= surf {
+            return Some([x, y]);
+        }
+        t += 0.25;
+    }
+    None
+}

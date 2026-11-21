@@ -553,6 +553,218 @@ impl NavGrid {
 
         best_pt
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_cover_anchor(
+        &self,
+        me_pos: [f64; 3],
+        zone_center: [f64; 2],
+        zone_radius: f64,
+        next_center: [f64; 2],
+        next_radius: f64,
+        avoid_prev: Option<[f64; 2]>,
+        max_dist_from_me: f64,
+    ) -> Option<[f64; 2]> {
+        let safe_zone_r = (zone_radius - 10.0).max(0.0);
+        let safe_next_r = (next_radius - 16.0).max(0.0);
+        let in_next_safe = next_radius <= 24.0
+            || (me_pos[0] - next_center[0]).hypot(me_pos[1] - next_center[1]) <= safe_next_r;
+
+        let (sx, sy) = if in_next_safe {
+            (me_pos[0], me_pos[1])
+        } else {
+            (next_center[0], next_center[1])
+        };
+        let (scx, scy) = self.world_to_cell(sx, sy);
+        let r_cells: isize = ((max_dist_from_me / self.cell).ceil() as isize).clamp(4, 48);
+        let x0 = (scx as isize - r_cells).max(0) as usize;
+        let x1 = (scx as isize + r_cells).min((self.nx - 1) as isize) as usize;
+        let y0 = (scy as isize - r_cells).max(0) as usize;
+        let y1 = (scy as isize + r_cells).min((self.ny - 1) as isize) as usize;
+
+        const DIRS4: [(isize, isize); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
+
+        let mut best: Option<(f64, [f64; 2])> = None;
+
+        for cy in (y0..=y1).step_by(2) {
+            for cx in (x0..=x1).step_by(2) {
+                let idx = cy * self.nx + cx;
+                if !self.walkable[idx] || !self.near_cover[idx] {
+                    continue;
+                }
+                let cz = self.ground_z[idx] as f64;
+                if (cz - me_pos[2]).abs() > 24.0 {
+                    continue;
+                }
+                let w = self.cell_to_world(cx, cy);
+                let d_me = (w[0] - me_pos[0]).hypot(w[1] - me_pos[1]);
+                if d_me > max_dist_from_me {
+                    continue;
+                }
+                if (w[0] - zone_center[0]).hypot(w[1] - zone_center[1]) > safe_zone_r {
+                    continue;
+                }
+                let d_next = (w[0] - next_center[0]).hypot(w[1] - next_center[1]);
+                if next_radius > 24.0 && d_next > safe_next_r {
+                    continue;
+                }
+
+                let mut open_nbrs = 0u8;
+                let mut wall_nbrs = 0u8;
+                for (dx, dy) in DIRS4 {
+                    let ncx = cx as isize + dx;
+                    let ncy = cy as isize + dy;
+                    if ncx >= 0
+                        && ncx < self.nx as isize
+                        && ncy >= 0
+                        && ncy < self.ny as isize
+                    {
+                        let nidx = ncy as usize * self.nx + ncx as usize;
+                        if self.walkable[nidx] {
+                            open_nbrs += 1;
+                        } else {
+                            wall_nbrs += 1;
+                        }
+                    } else {
+                        wall_nbrs += 1;
+                    }
+                }
+
+                let corner_bonus = if open_nbrs == 3 && wall_nbrs == 1 {
+                    35.0
+                } else if open_nbrs >= 2 && wall_nbrs >= 1 {
+                    25.0
+                } else if open_nbrs <= 1 {
+                    -40.0
+                } else {
+                    0.0
+                };
+
+                let mut score = corner_bonus - 0.7 * d_me - 0.15 * d_next;
+                if let Some(prev) = avoid_prev {
+                    if (w[0] - prev[0]).hypot(w[1] - prev[1]) < 35.0 {
+                        score -= 90.0;
+                    }
+                }
+
+                if best.is_none_or(|(bs, _)| score > bs) {
+                    best = Some((score, w));
+                }
+            }
+        }
+
+        best.map(|(_, pt)| pt)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_peek_point(
+        &self,
+        map: &Map,
+        me_pos: [f64; 3],
+        eye_h: f64,
+        target_eye: [f64; 3],
+        other_threats: &[[f64; 3]],
+        zone_center: [f64; 2],
+        zone_radius: f64,
+        max_dist: f64,
+    ) -> Option<[f64; 2]> {
+        let (me_cx, me_cy) = self.world_to_cell(me_pos[0], me_pos[1]);
+        let r_cells: isize = ((max_dist / self.cell).ceil() as isize).clamp(2, 6);
+        let x0 = (me_cx as isize - r_cells).max(0) as usize;
+        let x1 = (me_cx as isize + r_cells).min((self.nx - 1) as isize) as usize;
+        let y0 = (me_cy as isize - r_cells).max(0) as usize;
+        let y1 = (me_cy as isize + r_cells).min((self.ny - 1) as isize) as usize;
+
+        let safe_zone_r = (zone_radius - 6.0).max(0.0);
+        let mut cands: Vec<(f64, [f64; 3], f64, bool)> = Vec::with_capacity(64);
+
+        for cy in y0..=y1 {
+            for cx in x0..=x1 {
+                let idx = cy * self.nx + cx;
+                if !self.walkable[idx] {
+                    continue;
+                }
+                let cz = self.ground_z[idx] as f64;
+                if (cz - me_pos[2]).abs() > 14.0 {
+                    continue;
+                }
+                let w = self.cell_to_world(cx, cy);
+                let d_me = (w[0] - me_pos[0]).hypot(w[1] - me_pos[1]);
+                if d_me < 2.0 || d_me > max_dist {
+                    continue;
+                }
+                if (w[0] - zone_center[0]).hypot(w[1] - zone_center[1]) > safe_zone_r {
+                    continue;
+                }
+                let near_cov = self.near_cover[idx];
+                let pre = d_me - if near_cov { 4.0 } else { 0.0 };
+                cands.push((pre, [w[0], w[1], cz], d_me, near_cov));
+            }
+        }
+
+        if cands.is_empty() {
+            return None;
+        }
+        cands.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+        cands.truncate(20);
+
+        let mut near_others: Vec<[f64; 3]> = other_threats.to_vec();
+        near_others.sort_unstable_by(|a, b| {
+            let da = (a[0] - me_pos[0]).hypot(a[1] - me_pos[1]);
+            let db = (b[0] - me_pos[0]).hypot(b[1] - me_pos[1]);
+            da.partial_cmp(&db).unwrap_or(Ordering::Equal)
+        });
+        near_others.truncate(3);
+
+        let mut best_pt: Option<[f64; 2]> = None;
+        let mut best_score = f64::NEG_INFINITY;
+
+        for (_, pt, d_me, near_cov) in cands {
+            let eye = [pt[0], pt[1], pt[2] + eye_h];
+            if !map.has_los(eye, target_eye) {
+                continue;
+            }
+            let mut exposed_other = 0usize;
+            for ot in &near_others {
+                if map.has_los(eye, *ot) {
+                    exposed_other += 1;
+                }
+            }
+            let score = -1.8 * d_me
+                + if near_cov { 24.0 } else { 0.0 }
+                - 95.0 * (exposed_other as f64);
+            if score > best_score {
+                best_score = score;
+                best_pt = Some([pt[0], pt[1]]);
+            }
+        }
+
+        best_pt
+    }
+
+    pub fn has_near_cover_within(&self, pos: [f64; 3], max_dist: f64) -> bool {
+        let (cx0, cy0) = self.world_to_cell(pos[0], pos[1]);
+        let r: isize = ((max_dist / self.cell).ceil() as isize).clamp(1, 8);
+        let x0 = (cx0 as isize - r).max(0) as usize;
+        let x1 = (cx0 as isize + r).min((self.nx - 1) as isize) as usize;
+        let y0 = (cy0 as isize - r).max(0) as usize;
+        let y1 = (cy0 as isize + r).min((self.ny - 1) as isize) as usize;
+        for cy in y0..=y1 {
+            for cx in x0..=x1 {
+                let idx = cy * self.nx + cx;
+                if self.walkable[idx]
+                    && self.near_cover[idx]
+                    && (self.ground_z[idx] as f64 - pos[2]).abs() <= 16.0
+                {
+                    let w = self.cell_to_world(cx, cy);
+                    if (w[0] - pos[0]).hypot(w[1] - pos[1]) <= max_dist {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
 }
 
 #[inline]
@@ -612,6 +824,73 @@ mod tests {
         assert!(
             !map.has_los([cover[0], cover[1], cz + 8.0], threat),
             "cover point {cover:?} must block LOS from threat"
+        );
+    }
+
+    #[test]
+    fn find_cover_anchor_and_peek_point_on_arena_map() {
+        let map = Map::load(
+            "mechfight-kit/arena",
+            &["v2/world.json".into(), "v2/terrain.i16".into()],
+        )
+        .expect("arena should load");
+        let nav = NavGrid::build(&map, 2.5, 9.0, 1.2, 50.0);
+
+        let me_z = map.ground_height(86.0, -110.0);
+        let next_center = [50.0, -100.0];
+        let next_radius = 220.0;
+        let anchor = nav
+            .find_cover_anchor(
+                [86.0, -110.0, me_z],
+                [50.0, -100.0],
+                400.0,
+                next_center,
+                next_radius,
+                None,
+                160.0,
+            )
+            .expect("should find cover anchor inside next_zone");
+        let (acx, acy) = nav.world_to_cell(anchor[0], anchor[1]);
+        let aidx = acy * nav.nx + acx;
+        assert!(nav.walkable[aidx], "anchor must be walkable");
+        assert!(nav.near_cover[aidx], "anchor must be near_cover");
+        let d_next = (anchor[0] - next_center[0]).hypot(anchor[1] - next_center[1]);
+        assert!(
+            d_next <= next_radius - 16.0 + 1e-6,
+            "anchor must lie inside safe next_zone ({d_next:.1})"
+        );
+
+        let th_z = map.ground_height(75.0, -140.0);
+        let threat = [75.0, -140.0, th_z + 8.0];
+        let cover = nav
+            .find_cover_point(
+                &map,
+                [86.0, -110.0, me_z],
+                8.0,
+                &[threat],
+                [0.0, 0.0],
+                500.0,
+                [0.0, 0.0],
+                400.0,
+            )
+            .expect("should find cover behind building");
+        let cz = map.ground_height(cover[0], cover[1]);
+        let peek = nav
+            .find_peek_point(
+                &map,
+                [cover[0], cover[1], cz],
+                8.0,
+                threat,
+                &[],
+                [0.0, 0.0],
+                500.0,
+                18.0,
+            )
+            .expect("should find peek point around corner with LOS to threat");
+        let pz = map.ground_height(peek[0], peek[1]);
+        assert!(
+            map.has_los([peek[0], peek[1], pz + 8.0], threat),
+            "peek point {peek:?} must have 3D LOS to threat"
         );
     }
 }
