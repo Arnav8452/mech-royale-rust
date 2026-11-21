@@ -53,6 +53,10 @@ pub(crate) fn select_targets(
     let protecting_regen = me.hp < 0.72 * me.max_hp
         && (obs.t - world.last_combat_t) >= 2.0
         && (obs.t - world.last_combat_t) <= regen_delay + 12.0;
+    let stat_cap = config.cubes.stat_cap.round() as u64;
+    let want_cubes = me.cubes < stat_cap || (me.cubes >= 13 && me.cubes < 15);
+    let slot1_empty = me.weapons.get(1).and_then(|w| w.as_ref()).is_none();
+    let npc_max_d = if want_cubes { 125.0 } else { 50.0 };
 
     let mut mech_cands = Vec::new();
     let mut best_farm: Option<(f64, TargetCandidate)> = None;
@@ -74,6 +78,7 @@ pub(crate) fn select_targets(
             } else {
                 (false, com_z)
             };
+            let d = dist3d(muzzle, [actor.pos[0], actor.pos[1], com_z]);
             let aim_off = aim_z - actor.pos[2];
             let aim_half_h = (mech_h - aim_off).min(aim_off).max(1.0);
             let radius = base_mech_r * scale;
@@ -105,7 +110,7 @@ pub(crate) fn select_targets(
                 is_vulnerable,
             });
         } else if actor.kind == "npc"
-            && d <= 125.0
+            && d <= npc_max_d
             && me.hp > 0.45 * me.max_hp
             && obs.t - world.last_damage_t > 2.5
             && !protecting_regen
@@ -142,6 +147,7 @@ pub(crate) fn select_targets(
     }
 
     if best_farm.is_none()
+        && (want_cubes || slot1_empty)
         && me.hp > 0.45 * me.max_hp
         && obs.t - world.last_damage_t > 2.5
         && !protecting_regen
@@ -202,6 +208,13 @@ pub(crate) fn pick_best_mech_target(
         .flatten()
         .find(|w| w.kind == WeaponKind::Lightning)
         .map(|w| stat(&w.stats, "chain_range", 14.0));
+    let lt_range = me
+        .weapons
+        .iter()
+        .flatten()
+        .find(|w| w.kind == WeaponKind::Lightning)
+        .map(|w| stat(&w.stats, "range", 45.0))
+        .unwrap_or(45.0);
     let have_lightning = lt_chain_range.is_some();
 
     let mut best_los: Option<(f64, &TargetCandidate)> = None;
@@ -230,7 +243,7 @@ pub(crate) fn pick_best_mech_target(
             score += 95.0; // Cook-off!
         }
         if have_lightning {
-            if c.dist <= 50.0 {
+            if c.dist <= lt_range + 5.0 {
                 if c.charging {
                     score += 130.0;
                 } else if c.weapons.contains(&WeaponKind::Laser) {
@@ -242,7 +255,7 @@ pub(crate) fn pick_best_mech_target(
                     .iter()
                     .filter(|o| dist3d(c.pos, o.pos) <= cr)
                     .count();
-                if c.dist <= 48.0 && cluster >= 2 {
+                if c.dist <= lt_range + 3.0 && cluster >= 2 {
                     score += 45.0;
                 }
             }
@@ -493,14 +506,16 @@ pub(crate) fn eval_precharge_laser(
 
     let mut active_laser_idx: Option<usize> = None;
     let mut ready_laser_idx: Option<usize> = None;
+    let enemy_nearby = world.closest_tracked_enemy_within(me.pos, 220.0).is_some();
 
     for (idx, wopt) in me.weapons.iter().enumerate().take(2) {
         if let Some(w) = wopt {
             if w.kind == WeaponKind::Laser {
                 let charge = w.charge.unwrap_or(0.0);
                 let full_charge = stat(&w.stats, "charge", 0.75);
+                let hold_s = stat(&w.stats, "hold_s", 2.0);
                 if charge > 0.0 {
-                    fire[idx] = charge < full_charge;
+                    fire[idx] = enemy_nearby && charge < full_charge + hold_s - 0.25;
                     active_laser_idx = Some(idx);
                 } else if w.cooldown <= 0.08 {
                     ready_laser_idx = Some(idx);

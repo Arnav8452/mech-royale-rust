@@ -80,6 +80,7 @@ pub(crate) struct WorldState {
     pub pos_history: VecDeque<[f64; 2]>,
     pub cmd_move_streak: u32,
     pub unstuck_air_boost_until: f64,
+    pub travel_boost_latched: bool,
     pub last_combat_t: f64,
     pub last_scan_dir: f64,
 }
@@ -113,6 +114,7 @@ impl WorldState {
             pos_history: VecDeque::with_capacity(7),
             cmd_move_streak: 0,
             unstuck_air_boost_until: -100.0,
+            travel_boost_latched: false,
             last_combat_t: -100.0,
             last_scan_dir: 1.0,
         }
@@ -121,6 +123,11 @@ impl WorldState {
     pub fn update(&mut self, obs: &Observation, map: &Map, config: &Config) -> bool {
         let t = obs.t;
         let me = &obs.self_obs;
+        if me.energy >= 74.0 {
+            self.travel_boost_latched = true;
+        } else if me.energy <= 45.0 {
+            self.travel_boost_latched = false;
+        }
         let eye_h = stat(&me.stats, "eye_height", 8.0);
         let eye = [me.pos[0], me.pos[1], me.pos[2] + eye_h];
 
