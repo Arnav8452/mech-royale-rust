@@ -75,6 +75,7 @@ pub struct Bot {
     cached_path_t: f64,
     posture: Posture,
     cover_target: Option<[f64; 2]>,
+    prev_cover_target: Option<[f64; 2]>,
     cover_target_t: f64,
     tracked_enemies: HashMap<u64, TrackedEnemy>,
     last_pickup_seen: HashMap<u64, (WeaponKind, [f64; 3], f64)>,
@@ -113,7 +114,7 @@ impl Bot {
         let nav_scratch = NavScratch::new(nav.len());
         let strafe_sign = if hello.seed % 2 == 0 { 1.0 } else { -1.0 };
         Self {
-            name: "rust-bot-m2b".to_string(),
+            name: "rust-bot-m3".to_string(),
             config: hello.config,
             map,
             nav,
@@ -123,6 +124,7 @@ impl Bot {
             cached_path_t: -100.0,
             posture: Posture::EarlyFarm,
             cover_target: None,
+            prev_cover_target: None,
             cover_target_t: -100.0,
             tracked_enemies: HashMap::new(),
             last_pickup_seen: HashMap::new(),
@@ -137,7 +139,7 @@ impl Bot {
             last_move: [0.0, 0.0],
             strafe_sign,
             last_strafe_flip_t: -100.0,
-            pos_history: VecDeque::with_capacity(5),
+            pos_history: VecDeque::with_capacity(7),
             cmd_move_streak: 0,
             unstuck_air_boost_until: -100.0,
             last_combat_t: -100.0,
@@ -171,8 +173,6 @@ impl Bot {
         let mech_height = stat(&me.stats, "height", 9.0);
         let min_pitch = stat(&me.stats, "min_pitch", -0.7);
         let max_pitch = stat(&me.stats, "max_pitch", 1.3);
-        let turn_rate = stat(&me.stats, "turn_rate", 4.0);
-        let pitch_rate = stat(&me.stats, "pitch_rate", 3.0);
 
         let (mech_cands, primary_farm) = self.select_targets(obs, muzzle);
         let los_mechs: Vec<&TargetCandidate> = mech_cands.iter().filter(|c| c.has_los).collect();
@@ -191,15 +191,9 @@ impl Bot {
             }
         }
 
-        let have_laser_ready_or_charging = me.weapons.iter().flatten().any(|w| {
-            w.kind == WeaponKind::Laser && (w.charge.unwrap_or(0.0) > 0.0 || w.cooldown <= 0.15)
-        });
-        let immediate_kill_avail = me.hp > 280.0
-            && los_mechs.iter().any(|m| {
-                m.hp <= 260.0 || (m.hp <= 340.0 && have_laser_ready_or_charging)
-            });
+        let immediate_kill_avail = me.hp > 220.0 && los_mechs.iter().any(|m| m.hp <= 420.0);
 
-        self.update_posture(obs, los_mech_count, near_mech_count, immediate_kill_avail);
+        self.update_posture(obs, &los_mechs, near_mech_count, immediate_kill_avail, eye_h);
 
         let primary_mech = self.pick_best_mech_target(&mech_cands, me);
         let any_visible_mech = primary_mech.clone().or_else(|| {
@@ -209,12 +203,18 @@ impl Bot {
                 .cloned()
         });
 
-        let combat_target = primary_mech.clone().or_else(|| primary_farm.clone());
+        let combat_target = if self.posture == Posture::EmergencyRegen {
+            primary_mech.clone()
+        } else {
+            primary_mech.clone().or_else(|| primary_farm.clone())
+        };
 
-        // Strict 5-second EmergencyRegen fire discipline unless point-blank duel or immediate kill
+        // Fire back while retreating in plain sight; hold fire once LOS broken or 1.8 s clear
+        let actively_taking_fire = los_mech_count > 0
+            && (t - self.last_damage_t < 1.8 || los_mechs.iter().any(|m| m.dist < 50.0));
         let hold_fire_for_regen = self.posture == Posture::EmergencyRegen
             && !immediate_kill_avail
-            && !los_mechs.iter().any(|m| m.dist < 25.0);
+            && !actively_taking_fire;
 
         let (fire, mut reload, chosen_aim, debug_aim_target) = if hold_fire_for_regen {
             ([false, false], false, None, None)
@@ -223,8 +223,6 @@ impl Bot {
                 obs,
                 muzzle,
                 mech_radius,
-                turn_rate,
-                pitch_rate,
                 min_pitch,
                 max_pitch,
                 &mech_cands,
@@ -237,7 +235,6 @@ impl Bot {
                     if w.kind == WeaponKind::Laser && w.charge.unwrap_or(0.0) > 0.0 {
                         let charge = w.charge.unwrap_or(0.0);
                         let full_charge = stat(&w.stats, "charge", 0.75);
-                        // Release if full charge reached and no target visible; only hold briefly while building
                         f[idx] = charge < full_charge;
                     }
                 }
@@ -249,14 +246,18 @@ impl Bot {
             self.last_combat_t = t;
         }
 
-        // Proactive gun reload when ammo is low (< 4 or <= 35% mag) and no enemy mech in LOS
-        if !reload && los_mech_count == 0 {
+        // Proactive reload only when safely clear of enemies within 100 m
+        let near_mech_100 = self
+            .tracked_enemies
+            .values()
+            .filter(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 100.0)
+            .count();
+        if !reload && near_mech_100 == 0 {
             for wopt in me.weapons.iter().flatten() {
                 if wopt.kind == WeaponKind::Gun && wopt.reload.unwrap_or(0.0) <= 0.0 {
                     let mag = stat(&wopt.stats, "mag", 12.0);
                     let ammo = wopt.ammo.unwrap_or(mag);
-                    let thresh = 4.0_f64.min(mag * 0.5).max(mag * 0.35);
-                    if ammo < thresh {
+                    if ammo <= 3.0 {
                         reload = true;
                         break;
                     }
@@ -269,12 +270,12 @@ impl Bot {
             obs,
             eye_h,
             &mech_cands,
-            los_mech_count,
+            &los_mechs,
             primary_mech.as_ref().or(any_visible_mech.as_ref()),
             primary_farm.as_ref(),
         );
 
-        let (move_dir, blocked_ahead, dodged_hazard, aimed_laser_dodge) =
+        let (move_dir, dodged_hazard, aimed_laser_dodge) =
             self.steer(obs, goal_dir, mech_radius, mech_height);
         self.last_move = move_dir;
 
@@ -302,14 +303,13 @@ impl Bot {
                 [wrap_angle(me.aim[0] + 0.95 * self.last_scan_dir), 0.0]
             }
         } else {
-            // Continuous 360-degree torso scan to spot loot, crates, cubes, and ambushers
             [wrap_angle(me.aim[0] + 0.95 * self.last_scan_dir), 0.0]
         };
 
-        // Boost & jump (including brief air-jet pulse over low ledges after unstuck jump)
+        // Boost & jump (only jump when truly wedged for 5+ ticks; never on wall-graze)
         let moving = move_dir[0].hypot(move_dir[1]) > 0.25;
         let slot1_empty = me.weapons.get(1).and_then(|w| w.as_ref()).is_none();
-        let stuck_jump = me.grounded && (stuck_active || blocked_ahead);
+        let stuck_jump = me.grounded && stuck_active;
         if stuck_jump {
             if t - self.last_strafe_flip_t > 0.6 {
                 self.strafe_sign = -self.strafe_sign;
@@ -319,8 +319,11 @@ impl Bot {
             self.unstuck_air_boost_until = t + 0.35;
         }
 
-        let air_unstuck_boost =
-            !me.grounded && me.vel[2] > 0.0 && t <= self.unstuck_air_boost_until && me.energy > 40.0;
+        let air_unstuck_boost = !me.grounded
+            && me.vel[2] > 0.0
+            && t <= self.unstuck_air_boost_until
+            && self.cmd_move_streak >= 8
+            && me.energy > 40.0;
 
         let ground_boost = me.grounded
             && moving
@@ -330,7 +333,8 @@ impl Bot {
                 || (self.posture == Posture::EmergencyRegen && los_mech_count > 0 && me.energy > 22.0)
                 || (self.posture == Posture::ZoneRotate && me.energy > 25.0)
                 || (self.posture == Posture::SupplyDrop && me.energy > 45.0)
-                || (self.posture == Posture::LootWeapon && slot1_empty && me.energy > 50.0));
+                || (self.posture == Posture::LootWeapon && slot1_empty && me.energy > 35.0)
+                || (self.posture == Posture::EarlyFarm && t < 35.0 && me.energy > 55.0));
 
         let boost = ground_boost || air_unstuck_boost;
 
@@ -464,8 +468,7 @@ impl Bot {
             if p.kind == WeaponKind::Mortar || self.blacklisted_pickups.contains_key(&p.id) {
                 continue;
             }
-            let gh = self.map.ground_height(p.pos[0], p.pos[1]);
-            if (p.pos[2] - gh).abs() <= 3.0 {
+            if self.is_ground_level(p.pos) {
                 self.last_pickup_seen.insert(p.id, (p.kind, p.pos, t));
             }
         }
@@ -500,20 +503,20 @@ impl Bot {
             }
         }
 
-        // 3-tick displacement anti-stuck tracking
+        // 5-tick displacement anti-stuck tracking
         if self.last_move[0].hypot(self.last_move[1]) > 0.5 {
             self.cmd_move_streak = self.cmd_move_streak.saturating_add(1);
         } else {
             self.cmd_move_streak = 0;
         }
-        if self.pos_history.len() >= 4 {
+        if self.pos_history.len() >= 6 {
             self.pos_history.pop_front();
         }
         self.pos_history.push_back([me.pos[0], me.pos[1]]);
 
-        let stuck_active = if self.cmd_move_streak >= 3 && self.pos_history.len() >= 4 {
+        let stuck_active = if self.cmd_move_streak >= 5 && self.pos_history.len() >= 6 {
             if let Some(&oldest) = self.pos_history.front() {
-                dist2d(me.pos[0], me.pos[1], oldest[0], oldest[1]) < 1.0
+                dist2d(me.pos[0], me.pos[1], oldest[0], oldest[1]) < 0.8
             } else {
                 false
             }
@@ -685,14 +688,67 @@ impl Bot {
         (None, None)
     }
 
+    #[inline]
+    fn is_ground_level(&self, pos: [f64; 3]) -> bool {
+        (pos[2] - self.map.ground_height(pos[0], pos[1])).abs() <= 2.5
+    }
+
+    fn ensure_regen_cover(
+        &mut self,
+        obs: &Observation,
+        eye_h: f64,
+        los_mech_count: usize,
+    ) -> Option<[f64; 2]> {
+        let me = &obs.self_obs;
+        let threats: Vec<[f64; 3]> = self
+            .tracked_enemies
+            .values()
+            .filter(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 220.0)
+            .map(|e| [e.pos[0], e.pos[1], e.pos[2] + 7.5])
+            .collect();
+        if threats.is_empty() {
+            return None;
+        }
+
+        let arrived_exposed = self.cover_target.is_some_and(|cp| {
+            dist2d(me.pos[0], me.pos[1], cp[0], cp[1]) <= 5.5 && los_mech_count > 0
+        });
+        if arrived_exposed {
+            self.prev_cover_target = self.cover_target;
+            self.cover_target = None;
+        }
+
+        let keep = self
+            .cover_target
+            .is_some_and(|_| obs.t - self.cover_target_t < 2.5);
+        if !keep {
+            self.cover_target = self.nav.find_cover_point_within(
+                &self.map,
+                me.pos,
+                eye_h,
+                &threats,
+                obs.zone.center,
+                obs.zone.radius,
+                obs.zone.next_center,
+                obs.zone.next_radius,
+                48.0,
+                self.prev_cover_target,
+            );
+            self.cover_target_t = obs.t;
+        }
+        self.cover_target
+    }
+
     fn update_posture(
         &mut self,
         obs: &Observation,
-        los_mechs: usize,
+        los_mechs: &[&TargetCandidate],
         near_mechs: usize,
         immediate_kill_avail: bool,
+        eye_h: f64,
     ) {
         let me = &obs.self_obs;
+        let los_count = los_mechs.len();
         let dist_next = dist2d(
             me.pos[0],
             me.pos[1],
@@ -706,19 +762,25 @@ impl Bot {
             return;
         }
 
-        let regen_active = if self.posture == Posture::EmergencyRegen {
-            me.hp < 0.84 * me.max_hp && !(me.hp >= 0.78 * me.max_hp && near_mechs == 0)
+        let want_regen = if self.posture == Posture::EmergencyRegen {
+            !immediate_kill_avail
+                && me.hp < 0.80 * me.max_hp
+                && !(me.hp >= 0.72 * me.max_hp && near_mechs == 0)
         } else {
             !immediate_kill_avail
-                && ((me.hp < 0.50 * me.max_hp && near_mechs > 0)
-                    || (me.hp < 0.68 * me.max_hp && los_mechs >= 2))
+                && ((me.hp < 0.42 * me.max_hp && near_mechs > 0)
+                    || (me.hp < 0.58 * me.max_hp && los_count >= 2))
         };
-        if regen_active {
-            self.posture = Posture::EmergencyRegen;
-            return;
+        if want_regen {
+            if self.ensure_regen_cover(obs, eye_h, los_count).is_some()
+                || (self.posture == Posture::EmergencyRegen && los_count == 0)
+            {
+                self.posture = Posture::EmergencyRegen;
+                return;
+            }
         }
 
-        if self.find_best_supply_drop(obs, los_mechs).is_some() {
+        if self.find_best_supply_drop(obs, los_count).is_some() {
             self.posture = Posture::SupplyDrop;
             return;
         }
@@ -920,8 +982,6 @@ impl Bot {
         obs: &Observation,
         muzzle: [f64; 3],
         mech_radius: f64,
-        turn_rate: f64,
-        pitch_rate: f64,
         min_pitch: f64,
         max_pitch: f64,
         mech_cands: &[TargetCandidate],
@@ -962,8 +1022,6 @@ impl Bot {
                 mech_radius,
                 w,
                 tgt,
-                turn_rate,
-                pitch_rate,
                 min_pitch,
                 max_pitch,
             )
@@ -997,17 +1055,8 @@ impl Bot {
             let w = me.weapons[ls].as_ref().unwrap();
             let full_charge = stat(&w.stats, "charge", 0.75);
             let charge = w.charge.unwrap_or(0.0);
-            let (l_aim, should_hold) = self.eval_laser(
-                me.aim,
-                muzzle,
-                me.cubes,
-                w,
-                tgt,
-                turn_rate,
-                pitch_rate,
-                min_pitch,
-                max_pitch,
-            );
+            let (l_aim, should_hold) =
+                self.eval_laser(me.aim, muzzle, me.cubes, w, tgt, min_pitch, max_pitch);
             fire[ls] = should_hold;
 
             if should_hold && charge < full_charge - 0.16 {
@@ -1064,13 +1113,11 @@ impl Bot {
                         return (fire, reload, chosen_aim, debug_pt);
                     }
                 }
-                if w.cooldown <= 0.12 || tgt.dist <= 38.0 {
-                    let direct = direct_aim(muzzle, [tgt.pos[0], tgt.pos[1], tgt.com_z]);
-                    let (lt_aim, lt_fire) = eval_lt_slot(lts, direct[0]);
-                    chosen_aim = Some(lt_aim);
-                    fire[lts] = lt_fire;
-                    return (fire, reload, chosen_aim, debug_pt);
-                }
+                let direct = direct_aim(muzzle, [tgt.pos[0], tgt.pos[1], tgt.com_z]);
+                let (lt_aim, lt_fire) = eval_lt_slot(lts, direct[0]);
+                chosen_aim = Some(lt_aim);
+                fire[lts] = lt_fire;
+                return (fire, reload, chosen_aim, debug_pt);
             }
         }
 
@@ -1085,17 +1132,8 @@ impl Bot {
                 && w.cooldown <= 0.08
                 && (matches!(tgt.kind, TargetKind::Mech) || allow_laser_farm)
             {
-                let (l_aim, should_hold) = self.eval_laser(
-                    me.aim,
-                    muzzle,
-                    me.cubes,
-                    w,
-                    tgt,
-                    turn_rate,
-                    pitch_rate,
-                    min_pitch,
-                    max_pitch,
-                );
+                let (l_aim, should_hold) =
+                    self.eval_laser(me.aim, muzzle, me.cubes, w, tgt, min_pitch, max_pitch);
                 fire[ls] = should_hold;
                 if let Some(gs) = gun_slot {
                     let (g_aim, g_fire, g_rel, g_ready) = eval_gun_slot(gs);
@@ -1138,8 +1176,6 @@ impl Bot {
         mech_radius: f64,
         w: &WeaponObs,
         tgt: &TargetCandidate,
-        turn_rate: f64,
-        pitch_rate: f64,
         min_pitch: f64,
         max_pitch: f64,
     ) -> ([f64; 2], bool, bool, bool) {
@@ -1166,15 +1202,17 @@ impl Bot {
 
         let need_reload = reload_left <= 0.0 && ammo <= 0.0;
         let dist = dist3d(muzzle, lead_pos);
-        let ready = w.cooldown <= 0.12 && reload_left <= 0.0 && ammo > 0.0 && dist <= range;
+        // Never gate trigger on cooldown <= 0.12: holding trigger fires cleanly every 0.24 s!
+        let ready = reload_left <= 0.0 && ammo > 0.0 && dist <= range;
+        let half_h = (tgt.com_z - tgt.pos[2]).max(1.2);
         let slew_ok = slew_aligned(
             cur_aim,
             aim,
             tgt.radius,
+            half_h,
             dist.max(4.0),
-            turn_rate,
-            pitch_rate,
-            1.15,
+            1.25,
+            0.012,
         );
         let los_ok = tgt.has_los && self.map.has_los(muzzle, lead_pos);
 
@@ -1204,11 +1242,8 @@ impl Bot {
         };
         let yaw_err = angle_diff(cur_aim[0], check_yaw).abs();
         let energy_ok = lightning_energy_ok(energy, e_cost, tgt, cluster_count);
-        let should_fire = tgt.has_los
-            && tgt.dist <= range - 0.5
-            && yaw_err <= 0.5 * cone_rad
-            && w.cooldown <= 0.12
-            && energy_ok;
+        let should_fire =
+            tgt.has_los && tgt.dist <= range - 0.5 && yaw_err <= 0.5 * cone_rad && energy_ok;
         (direct, should_fire)
     }
 
@@ -1220,16 +1255,15 @@ impl Bot {
         my_cubes: u64,
         w: &WeaponObs,
         tgt: &TargetCandidate,
-        turn_rate: f64,
-        pitch_rate: f64,
         min_pitch: f64,
         max_pitch: f64,
     ) -> ([f64; 2], bool) {
-        let hit_pt = [
-            tgt.pos[0] + tgt.vel[0] * 0.04,
-            tgt.pos[1] + tgt.vel[1] * 0.04,
-            tgt.com_z + tgt.vel[2] * 0.04,
-        ];
+        let com_off = tgt.com_z - tgt.pos[2];
+        let hit_x = tgt.pos[0] + tgt.vel[0] * 0.04;
+        let hit_y = tgt.pos[1] + tgt.vel[1] * 0.04;
+        let surf_hit = self.map.surface_height(hit_x, hit_y, tgt.pos[2]) + com_off;
+        let hit_z = (tgt.com_z + tgt.vel[2] * 0.04).max(surf_hit);
+        let hit_pt = [hit_x, hit_y, hit_z];
         let mut aim = direct_aim(muzzle, hit_pt);
         aim[1] = aim[1].clamp(min_pitch, max_pitch);
 
@@ -1242,14 +1276,15 @@ impl Bot {
         let cookoff = stat(&w.stats, "cookoff", 0.6);
         let charge = w.charge.unwrap_or(0.0);
 
+        let half_h = com_off.max(1.2);
         let aligned = slew_aligned(
             cur_aim,
             aim,
             tgt.radius,
+            half_h,
             tgt.dist.max(5.0),
-            turn_rate,
-            pitch_rate,
-            0.90,
+            0.95,
+            0.0,
         );
 
         let frac = min_frac + (1.0 - min_frac) * (charge / full_charge.max(0.01)).clamp(0.0, 1.0);
@@ -1306,11 +1341,12 @@ impl Bot {
         obs: &Observation,
         eye_h: f64,
         mech_cands: &[TargetCandidate],
-        los_mech_count: usize,
+        los_mechs: &[&TargetCandidate],
         combat_enemy: Option<&TargetCandidate>,
         farm_target: Option<&TargetCandidate>,
     ) -> ([f64; 2], [f64; 2]) {
         let me = &obs.self_obs;
+        let los_mech_count = los_mechs.len();
         let me_xy = [me.pos[0], me.pos[1]];
         let nc = obs.zone.next_center;
         let safe_r = (obs.zone.next_radius - 18.0).max(0.0);
@@ -1322,48 +1358,15 @@ impl Bot {
                 return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), nc);
             }
             Posture::EmergencyRegen => {
-                let threats: Vec<[f64; 3]> = self
-                    .tracked_enemies
-                    .values()
-                    .filter(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 220.0)
-                    .map(|e| [e.pos[0], e.pos[1], e.pos[2] + 7.5])
-                    .collect();
-
-                // Live cover re-validation: if enemy rounded our cover corner, immediately relocate
-                let exposed_at_cover = self
-                    .cover_target
-                    .is_some_and(|cp| dist2d(me.pos[0], me.pos[1], cp[0], cp[1]) <= 6.0 && los_mech_count > 0);
-                if exposed_at_cover {
-                    self.cover_target = None;
-                }
-
-                let keep_cover = self.cover_target.is_some_and(|cp| {
-                    obs.t - self.cover_target_t < 1.2
-                        && dist2d(me.pos[0], me.pos[1], cp[0], cp[1]) > 5.0
-                });
-                if !keep_cover && (self.cover_target.is_none() || los_mech_count > 0) {
-                    self.cover_target = self.nav.find_cover_point(
-                        &self.map,
-                        me.pos,
-                        eye_h,
-                        &threats,
-                        obs.zone.center,
-                        obs.zone.radius,
-                        obs.zone.next_center,
-                        obs.zone.next_radius,
-                    );
-                    self.cover_target_t = obs.t;
-                }
-
-                if let Some(cp) = self.cover_target {
+                if let Some(cp) = self.ensure_regen_cover(obs, eye_h, los_mech_count) {
                     if dist2d(me.pos[0], me.pos[1], cp[0], cp[1]) <= 5.0 && los_mech_count == 0 {
                         return ([0.0, 0.0], cp);
                     }
                     let wp = self.follow_astar(me_xy, cp, obs.t);
                     return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), cp);
                 }
-                if let Some(th) = threats.first() {
-                    let away = unit2d(me.pos[0] - th[0], me.pos[1] - th[1]);
+                if let Some(th) = self.closest_tracked_enemy_within(me.pos, 220.0) {
+                    let away = unit2d(me.pos[0] - th.pos[0], me.pos[1] - th.pos[1]);
                     let zdir = unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]);
                     let goal = [
                         me.pos[0] + (away[0] * 0.75 + zdir[0] * 0.35) * 40.0,
@@ -1422,7 +1425,7 @@ impl Bot {
                 }
             }
             Posture::LootWeapon => {
-                if let Some(pk_pos) = self.find_best_weapon_goal(obs, los_mech_count) {
+                if let Some(pk_pos) = self.find_best_weapon_goal(obs, los_mechs) {
                     let wp = self.follow_astar(me_xy, pk_pos, obs.t);
                     return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), pk_pos);
                 }
@@ -1458,14 +1461,24 @@ impl Bot {
                     false
                 };
 
-                if los_mech_count >= 2 || no_weapon_can_shoot_now {
+                let have_laser = me
+                    .weapons
+                    .iter()
+                    .flatten()
+                    .any(|w| w.kind == WeaponKind::Laser);
+                let anti_laser_duck = !have_laser
+                    && combat_enemy.is_some_and(|e| {
+                        e.weapons.contains(&WeaponKind::Laser) && e.charging && e.dist > 50.0
+                    });
+
+                if los_mech_count >= 2 || no_weapon_can_shoot_now || anti_laser_duck {
                     let threats: Vec<[f64; 3]> = mech_cands
                         .iter()
                         .filter(|m| m.has_los)
                         .map(|m| [m.pos[0], m.pos[1], m.pos[2] + 7.5])
                         .collect();
                     if !threats.is_empty() {
-                        if let Some(cp) = self.nav.find_cover_point(
+                        if let Some(cp) = self.nav.find_cover_point_within(
                             &self.map,
                             me.pos,
                             eye_h,
@@ -1474,6 +1487,8 @@ impl Bot {
                             obs.zone.radius,
                             obs.zone.next_center,
                             obs.zone.next_radius,
+                            48.0,
+                            None,
                         ) {
                             let wp = self.follow_astar(me_xy, cp, obs.t);
                             return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), cp);
@@ -1494,9 +1509,12 @@ impl Bot {
                         .iter()
                         .flatten()
                         .any(|w| w.kind == WeaponKind::Lightning);
+                    let enemy_has_laser = e.weapons.contains(&WeaponKind::Laser);
                     let pref_dist =
                         if has_lightning && me.energy > 30.0 && (e.charging || e.dist < 52.0) {
-                            32.0
+                            30.0
+                        } else if enemy_has_laser && !have_laser {
+                            if has_lightning { 30.0 } else { 45.0 }
                         } else if me.hp < 0.50 * me.max_hp {
                             92.0
                         } else {
@@ -1525,12 +1543,12 @@ impl Bot {
             Posture::EarlyFarm => {}
         }
 
-        // EarlyFarm / fallback: ground cubes -> NPCs -> ground crates (especially if slot 1 empty) -> safe interior
+        // EarlyFarm / fallback: ground cubes -> NPCs -> ground crates -> safe interior
         if let Some(cube) = obs
             .cubes
             .iter()
             .filter(|c| {
-                (c.pos[2] - me.pos[2]).abs() <= 4.0
+                self.is_ground_level(c.pos)
                     && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 65.0
                     && dist2d(c.pos[0], c.pos[1], nc[0], nc[1]) <= obs.zone.next_radius - 5.0
             })
@@ -1564,7 +1582,7 @@ impl Bot {
                 .crates
                 .iter()
                 .filter(|c| {
-                    (c.pos[2] - me.pos[2]).abs() <= 4.0
+                    self.is_ground_level(c.pos)
                         && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 85.0
                         && dist2d(c.pos[0], c.pos[1], nc[0], nc[1]) <= obs.zone.next_radius - 5.0
                 })
@@ -1665,7 +1683,11 @@ impl Bot {
         best.map(|(_, d)| d)
     }
 
-    fn find_best_weapon_goal(&self, obs: &Observation, los_mechs: usize) -> Option<[f64; 2]> {
+    fn find_best_weapon_goal(
+        &self,
+        obs: &Observation,
+        los_mechs: &[&TargetCandidate],
+    ) -> Option<[f64; 2]> {
         let me = &obs.self_obs;
         let slot1_empty = me.weapons.get(1).and_then(|w| w.as_ref()).is_none();
         let has_gun_upgrades = me.upgrades.iter().any(|u| u.starts_with("gun_"));
@@ -1683,6 +1705,8 @@ impl Bot {
             .map(|w| (weapon_desirability(w.kind), w.kind))
             .min_by_key(|&(p, _)| p);
 
+        let close_los_enemy = los_mechs.iter().any(|m| m.dist < 60.0);
+        let any_los_enemy = !los_mechs.is_empty();
         let max_seek_d = if slot1_empty { 185.0 } else { 65.0 };
         let mut best: Option<(f64, [f64; 2])> = None;
 
@@ -1693,7 +1717,7 @@ impl Bot {
             if me.weapons.iter().flatten().any(|w| w.kind == kind) {
                 continue;
             }
-            if (pos[2] - me.pos[2]).abs() > 4.0 {
+            if !self.is_ground_level(pos) {
                 continue;
             }
             if dist2d(pos[0], pos[1], obs.zone.next_center[0], obs.zone.next_center[1])
@@ -1708,14 +1732,14 @@ impl Bot {
 
             let prio = weapon_desirability(kind);
             if slot1_empty {
-                if kind == WeaponKind::Gun || (los_mechs > 0 && d >= 40.0) {
+                if kind == WeaponKind::Gun || (close_los_enemy && d >= 35.0) {
                     continue;
                 }
             } else {
                 let Some((worst_prio, worst_kind)) = worst_held else {
                     continue;
                 };
-                if prio <= worst_prio || los_mechs > 0 {
+                if prio <= worst_prio || any_los_enemy {
                     continue;
                 }
                 if worst_kind == WeaponKind::Gun {
@@ -1756,7 +1780,7 @@ impl Bot {
         goal_dir: [f64; 2],
         mech_radius: f64,
         mech_height: f64,
-    ) -> ([f64; 2], bool, bool, bool) {
+    ) -> ([f64; 2], bool, bool) {
         let me = &obs.self_obs;
         let step_up = stat(&me.stats, "step_up", 1.2);
         let max_slope_rad = stat(&me.stats, "max_slope_deg", 50.0).to_radians();
@@ -1794,12 +1818,14 @@ impl Bot {
         let dodged_hazard = !mortar_threats.is_empty() || aimed_laser_dodge;
 
         if goal_dir[0].hypot(goal_dir[1]) < 0.05 && !dodged_hazard {
-            return ([0.0, 0.0], false, false, false);
+            return ([0.0, 0.0], false, false);
         }
+
+        let on_ground_here =
+            me.grounded && (me.pos[2] - self.map.ground_height(me.pos[0], me.pos[1])).abs() <= 2.0;
 
         let mut best_dir = goal_dir;
         let mut best_score = f64::NEG_INFINITY;
-        let mut goal_blocked_near = false;
 
         for k in 0..16 {
             let theta = (k as f64) * (PI / 8.0);
@@ -1810,10 +1836,16 @@ impl Bot {
             let check_step = |dist_m: f64| -> bool {
                 let nx = me.pos[0] + dir[0] * dist_m;
                 let ny = me.pos[1] + dir[1] * dist_m;
+                let g_next = self.map.ground_height(nx, ny);
+                let dz_g = g_next - me.pos[2];
+                if on_ground_here && dz_g > step_up && dz_g / dist_m > max_slope_tan {
+                    return false;
+                }
+                let probe_z = if on_ground_here { g_next } else { me.pos[2] };
                 let (ok, surf_z) = self.map.is_pos_walkable(
                     nx,
                     ny,
-                    me.pos[2],
+                    probe_z,
                     mech_radius,
                     mech_height,
                     step_up,
@@ -1834,9 +1866,6 @@ impl Bot {
 
             if !ok_near {
                 score -= 4.0;
-                if dir[0] * goal_dir[0] + dir[1] * goal_dir[1] > 0.85 {
-                    goal_blocked_near = true;
-                }
             } else if !ok_mid {
                 score -= 1.8;
             } else if !ok_far {
@@ -1859,7 +1888,7 @@ impl Bot {
             }
         }
 
-        (best_dir, goal_blocked_near, dodged_hazard, aimed_laser_dodge)
+        (best_dir, dodged_hazard, aimed_laser_dodge)
     }
 
     fn predict_mortar_impact(&self, pos: [f64; 3], vel: [f64; 3], g: f64) -> Option<[f64; 2]> {
@@ -2091,17 +2120,16 @@ fn slew_aligned(
     cur_aim: [f64; 2],
     target_aim: [f64; 2],
     target_radius: f64,
+    target_half_h: f64,
     dist: f64,
-    turn_rate: f64,
-    pitch_rate: f64,
     slack_mult: f64,
+    extra_rad: f64,
 ) -> bool {
-    let ang_rad = (target_radius * slack_mult / dist.max(1.0))
-        .atan()
-        .clamp(0.02, 0.30);
-    let yaw_err = angle_diff(cur_aim[0], target_aim[0]).abs();
-    let pitch_err = (cur_aim[1] - target_aim[1]).abs();
-    yaw_err <= ang_rad + 0.05 * turn_rate && pitch_err <= ang_rad + 0.05 * pitch_rate
+    let d = dist.max(1.0);
+    let yaw_tol = (target_radius * slack_mult / d).atan().clamp(0.012, 0.28) + extra_rad;
+    let pitch_tol = (target_half_h * slack_mult / d).atan().clamp(0.016, 0.32) + extra_rad;
+    angle_diff(cur_aim[0], target_aim[0]).abs() <= yaw_tol
+        && (cur_aim[1] - target_aim[1]).abs() <= pitch_tol
 }
 
 #[cfg(test)]
@@ -2171,32 +2199,12 @@ mod tests {
         assert!(bot.map.has_los(muzzle, [100.0, 0.0, 64.5]));
 
         // 1. Mid-charge against healthy enemy -> keep holding
-        let (_, hold1) = bot.eval_laser(
-            [0.0, 0.0],
-            muzzle,
-            0,
-            &w_laser,
-            &tgt_healthy,
-            4.0,
-            3.0,
-            -0.7,
-            1.3,
-        );
+        let (_, hold1) = bot.eval_laser([0.0, 0.0], muzzle, 0, &w_laser, &tgt_healthy, -0.7, 1.3);
         assert!(hold1, "should keep holding while charging at 0.20s");
 
         // 2. Full charge + aligned -> release (false)
         w_laser.charge = Some(0.72);
-        let (_, hold2) = bot.eval_laser(
-            [0.0, -0.025],
-            muzzle,
-            0,
-            &w_laser,
-            &tgt_healthy,
-            4.0,
-            3.0,
-            -0.7,
-            1.3,
-        );
+        let (_, hold2) = bot.eval_laser([0.0, -0.025], muzzle, 0, &w_laser, &tgt_healthy, -0.7, 1.3);
         assert!(!hold2, "should release laser at >= 90% full charge when aligned");
 
         // 3. Partial charge lethal with cookoff (+60%) + rear armor (x1.5) -> release early!
@@ -2205,34 +2213,79 @@ mod tests {
         tgt_mortar_rear.hp = 350.0;
         tgt_mortar_rear.weapons = vec![WeaponKind::Mortar];
         tgt_mortar_rear.aim = [0.0, 0.0]; // facing +x, muzzle at 0 is behind it
-        let (_, hold3) = bot.eval_laser(
-            [0.0, -0.025],
-            muzzle,
-            0,
-            &w_laser,
-            &tgt_mortar_rear,
-            4.0,
-            3.0,
-            -0.7,
-            1.3,
-        );
+        let (_, hold3) =
+            bot.eval_laser([0.0, -0.025], muzzle, 0, &w_laser, &tgt_mortar_rear, -0.7, 1.3);
         assert!(!hold3, "should release partial charge for lethal mortar cookoff/rear finish");
 
         // 4. Approaching hold_s forced timeout -> release cleanly
         w_laser.charge = Some(2.60);
-        let (_, hold4) = bot.eval_laser(
-            [1.5, 0.0],
-            muzzle,
-            0,
-            &w_laser,
-            &tgt_healthy,
-            4.0,
-            3.0,
-            -0.7,
-            1.3,
-        );
+        let (_, hold4) = bot.eval_laser([1.5, 0.0], muzzle, 0, &w_laser, &tgt_healthy, -0.7, 1.3);
         assert!(!hold4, "must release before hold_s timeout");
         let _ = obs;
+    }
+
+    #[test]
+    fn laser_slew_gate_blocks_off_target_release() {
+        let (hello, _) = load_sample_hello_and_obs();
+        let bot = Bot::new(hello);
+        let w_laser = WeaponObs {
+            kind: WeaponKind::Laser,
+            cooldown: 0.0,
+            ammo: None,
+            reload: None,
+            charge: Some(0.74),
+            stats: bot.config.weapons.laser.clone(),
+        };
+        let tgt = TargetCandidate {
+            id: 5,
+            kind: TargetKind::Mech,
+            pos: [100.0, 0.0, 60.0],
+            vel: [0.0, 0.0, 0.0],
+            est_accel_z: 0.0,
+            aim: [0.0, 0.0],
+            com_z: 64.5,
+            radius: 2.5,
+            hp: 1000.0,
+            max_hp: 1400.0,
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+            has_los: true,
+            dist: 100.0,
+        };
+        let muzzle = [0.0, 0.0, 67.0];
+        // 0.15 rad (~8.6 deg) off target at 100 m must NOT release!
+        let (_, hold) = bot.eval_laser([0.15, -0.025], muzzle, 0, &w_laser, &tgt, -0.7, 1.3);
+        assert!(hold, "must keep holding while 0.15 rad off target at 100 m");
+    }
+
+    #[test]
+    fn finds_ground_pickup_on_sloped_terrain() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        obs.t = 5.0;
+        // Simulate stream.jsonl.gz scenario: bot at low ground (-1.93 m), Laser on slope at +3.2 m
+        let mz = bot.map.ground_height(310.0, -275.0);
+        let pz = bot.map.ground_height(305.1, -129.7);
+        obs.self_obs.pos = [310.0, -275.0, mz];
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [41.3, -72.8];
+        obs.zone.radius = 560.0;
+        obs.zone.next_center = [-42.1, 7.1];
+        obs.zone.next_radius = 380.0;
+        obs.zone.shrink_start = 60.0;
+        obs.pickups = vec![PickupObs {
+            id: 8022,
+            kind: WeaponKind::Laser,
+            pos: [305.1, -129.7, pz],
+        }];
+        bot.act(&obs);
+        assert_eq!(
+            bot.posture,
+            Posture::LootWeapon,
+            "must seek ground-level Laser pickup across sloped campus elevation"
+        );
     }
 
     #[test]
@@ -2392,10 +2445,13 @@ mod tests {
     fn emergency_regen_holds_fire_and_shields_rear() {
         let (hello, mut obs) = load_sample_hello_and_obs();
         let mut bot = Bot::new(hello);
+        // Position near building block 14 so cover exists within 48 m
         obs.t = 40.0;
-        obs.self_obs.pos = [0.0, 0.0, bot.map.ground_height(0.0, 0.0)];
-        obs.self_obs.hp = 600.0; // < 50% of 1400
+        let mz = bot.map.ground_height(86.0, -110.0);
+        obs.self_obs.pos = [86.0, -110.0, mz];
+        obs.self_obs.hp = 500.0; // < 42% of 1400
         obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.aim = [0.0, 0.0];
         obs.self_obs.in_zone = true;
         obs.zone.center = [0.0, 0.0];
         obs.zone.radius = 400.0;
@@ -2409,25 +2465,34 @@ mod tests {
             by: Some(5),
             rear: true,
         }];
-        let ez = bot.map.ground_height(80.0, 0.0);
+        let ez = bot.map.ground_height(75.0, -140.0);
+        obs.self_obs.aim = direct_aim([86.0, -110.0, mz + 7.0], [75.0, -140.0, ez + 4.5]);
         obs.mechs = vec![ActorObs {
             id: 5,
             kind: "mech".into(),
-            pos: [80.0, 0.0, ez],
+            pos: [75.0, -140.0, ez],
             vel: [0.0, 0.0, 0.0],
-            aim: [PI, 0.0],
+            aim: [1.3, 0.0],
             hp: Some(1400.0),
             max_hp: Some(1400.0),
             cubes: Some(0),
             weapons: vec![WeaponKind::Gun],
             charging: false,
         }];
-        let act = bot.act(&obs);
+        let act1 = bot.act(&obs);
         assert_eq!(bot.posture, Posture::EmergencyRegen);
-        assert_eq!(act.fire.unwrap(), [false, false]);
+        assert!(act1.fire.unwrap()[0], "should fire back while taking fire in LOS on way to cover");
+
+        // Once behind cover (no LOS enemy) -> strictly holds fire & shields toward damage bearing
+        obs.t = 40.3;
+        obs.events.clear();
+        obs.mechs.clear();
+        let act2 = bot.act(&obs);
+        assert_eq!(bot.posture, Posture::EmergencyRegen);
+        assert_eq!(act2.fire.unwrap(), [false, false]);
         assert!(
-            angle_diff(act.aim.unwrap()[0], 2.4).abs() < 1e-6,
-            "EmergencyRegen should shield rear toward damage bearing"
+            angle_diff(act2.aim.unwrap()[0], 2.4).abs() < 1e-6,
+            "EmergencyRegen should shield rear toward damage bearing when hidden"
         );
     }
 
@@ -2482,21 +2547,21 @@ mod tests {
     fn slew_gate_rejects_large_misalignment() {
         assert!(!slew_aligned(
             [0.0, 0.0],
-            [1.2, 0.0],
+            [0.15, 0.0],
             2.5,
-            60.0,
-            4.0,
-            3.0,
-            1.15
+            4.5,
+            100.0,
+            0.95,
+            0.0
         ));
         assert!(slew_aligned(
             [0.0, 0.0],
-            [0.05, 0.02],
+            [0.02, 0.02],
             2.5,
-            60.0,
-            4.0,
-            3.0,
-            1.15
+            4.5,
+            100.0,
+            1.25,
+            0.012
         ));
     }
 

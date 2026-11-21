@@ -416,11 +416,39 @@ impl NavGrid {
         next_center: [f64; 2],
         next_radius: f64,
     ) -> Option<[f64; 2]> {
+        self.find_cover_point_within(
+            map,
+            me_pos,
+            eye_h,
+            threats,
+            zone_center,
+            zone_radius,
+            next_center,
+            next_radius,
+            64.0,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_cover_point_within(
+        &self,
+        map: &Map,
+        me_pos: [f64; 3],
+        eye_h: f64,
+        threats: &[[f64; 3]],
+        zone_center: [f64; 2],
+        zone_radius: f64,
+        next_center: [f64; 2],
+        next_radius: f64,
+        max_dist: f64,
+        avoid_prev: Option<[f64; 2]>,
+    ) -> Option<[f64; 2]> {
         if threats.is_empty() {
             return None;
         }
         let (me_cx, me_cy) = self.world_to_cell(me_pos[0], me_pos[1]);
-        let r_cells: isize = 16;
+        let r_cells: isize = ((max_dist / self.cell).ceil() as isize).clamp(4, 24);
         let x0 = (me_cx as isize - r_cells).max(0) as usize;
         let x1 = (me_cx as isize + r_cells).min((self.nx - 1) as isize) as usize;
         let y0 = (me_cy as isize - r_cells).max(0) as usize;
@@ -439,12 +467,12 @@ impl NavGrid {
                     continue;
                 }
                 let cz = self.ground_z[idx] as f64;
-                if (cz - me_pos[2]).abs() > 10.0 {
+                if (cz - me_pos[2]).abs() > 22.0 {
                     continue;
                 }
                 let w = self.cell_to_world(cx, cy);
                 let d_me = (w[0] - me_pos[0]).hypot(w[1] - me_pos[1]);
-                if !(6.0..=64.0).contains(&d_me) {
+                if d_me < 6.0 || d_me > max_dist {
                     continue;
                 }
                 if (w[0] - zone_center[0]).hypot(w[1] - zone_center[1]) > safe_zone_r {
@@ -507,11 +535,16 @@ impl NavGrid {
             if hidden == 0 {
                 continue;
             }
-            let score = hidden as f64 * 120.0
+            let mut score = hidden as f64 * 120.0
                 + if hidden == n_threats { 80.0 } else { 0.0 }
                 - 1.1 * d_me
                 + if in_next { 30.0 } else { -20.0 }
                 + 0.3 * min_d_th.min(80.0);
+            if let Some(prev) = avoid_prev {
+                if (pt[0] - prev[0]).hypot(pt[1] - prev[1]) < 16.0 {
+                    score -= 180.0;
+                }
+            }
             if score > best_score {
                 best_score = score;
                 best_pt = Some([pt[0], pt[1]]);
