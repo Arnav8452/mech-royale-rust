@@ -15,10 +15,15 @@ pub(crate) struct TargetCandidate {
     pub id: u64,
     pub kind: TargetKind,
     pub pos: [f64; 3],
+    #[allow(dead_code)]
     pub vel: [f64; 3],
     pub est_accel_z: f64,
     pub aim: [f64; 2],
+    #[allow(dead_code)]
     pub com_z: f64,
+    pub aim_z: f64,
+    pub aim_half_h: f64,
+    pub lead_vel: [f64; 3],
     pub radius: f64,
     pub hp: f64,
     pub max_hp: f64,
@@ -58,11 +63,25 @@ pub(crate) fn select_targets(
         let d = dist3d(muzzle, actor.pos);
         if actor.kind == "mech" {
             let scale = 1.0 + size_per_cube * (actor.cubes.unwrap_or(0) as f64);
-            let com_z = actor.pos[2] + 0.5 * base_mech_h * scale;
+            let mech_h = base_mech_h * scale;
+            let com_z = actor.pos[2] + 0.50 * mech_h;
+            let upper_z = actor.pos[2] + 0.82 * mech_h;
+            let lower_z = actor.pos[2] + 0.22 * mech_h;
+            let (has_los, aim_z) = if map.has_los(muzzle, [actor.pos[0], actor.pos[1], com_z]) {
+                (true, com_z)
+            } else if map.has_los(muzzle, [actor.pos[0], actor.pos[1], upper_z]) {
+                (true, upper_z)
+            } else if map.has_los(muzzle, [actor.pos[0], actor.pos[1], lower_z]) {
+                (true, lower_z)
+            } else {
+                (false, com_z)
+            };
+            let aim_off = aim_z - actor.pos[2];
+            let aim_half_h = (mech_h - aim_off).min(aim_off).max(1.0);
             let radius = base_mech_r * scale;
-            let has_los = map.has_los(muzzle, [actor.pos[0], actor.pos[1], com_z]);
             let tracked = world.tracked_enemies.get(&actor.id);
             let est_az = tracked.map(|e| e.est_accel_z).unwrap_or(0.0);
+            let lead_vel = tracked.map(|e| e.effective_lead_vel()).unwrap_or(actor.vel);
             let is_reloading = tracked.is_some_and(|e| e.is_reloading(obs.t));
             let is_laser_on_cd = tracked.is_some_and(|e| e.is_laser_on_cd(obs.t));
             let is_vulnerable = tracked.is_some_and(|e| e.is_vulnerable(obs.t));
@@ -75,6 +94,9 @@ pub(crate) fn select_targets(
                 est_accel_z: est_az,
                 aim: actor.aim,
                 com_z,
+                aim_z,
+                aim_half_h,
+                lead_vel,
                 radius,
                 hp: actor.hp.unwrap_or(1400.0),
                 max_hp: actor.max_hp.unwrap_or(1400.0),
@@ -102,6 +124,9 @@ pub(crate) fn select_targets(
                     est_accel_z: 0.0,
                     aim: actor.aim,
                     com_z,
+                    aim_z: com_z,
+                    aim_half_h: (com_z - actor.pos[2]).max(1.0),
+                    lead_vel: actor.vel,
                     radius: npc_r,
                     hp: actor.hp.unwrap_or(350.0),
                     max_hp: actor.max_hp.unwrap_or(350.0),
@@ -141,6 +166,9 @@ pub(crate) fn select_targets(
                     est_accel_z: 0.0,
                     aim: [0.0, 0.0],
                     com_z,
+                    aim_z: com_z,
+                    aim_half_h: (com_z - c.pos[2]).max(1.0),
+                    lead_vel: [0.0, 0.0, 0.0],
                     radius: crate_r,
                     hp: c.hp.unwrap_or(300.0),
                     max_hp: 300.0,
@@ -255,7 +283,7 @@ pub(crate) fn eval_combat(
     let mut fire = [false, false];
     let mut reload = false;
     let mut chosen_aim: Option<[f64; 2]>;
-    let debug_pt = Some([tgt.pos[0], tgt.pos[1], tgt.com_z]);
+    let debug_pt = Some([tgt.pos[0], tgt.pos[1], tgt.aim_z]);
 
     let mut laser_slot = None;
     let mut gun_slot = None;
@@ -372,7 +400,7 @@ pub(crate) fn eval_combat(
                 }
             }
 
-            let direct = direct_aim(muzzle, [tgt.pos[0], tgt.pos[1], tgt.com_z]);
+            let direct = direct_aim(muzzle, [tgt.pos[0], tgt.pos[1], tgt.aim_z]);
             let (lt_aim, lt_fire) = eval_lt_slot(lts, direct[0]);
             fire[lts] = lt_fire;
             chosen_aim = Some(lt_aim);
@@ -456,7 +484,7 @@ pub(crate) fn eval_combat(
         }
     }
 
-    chosen_aim = Some(direct_aim(muzzle, [tgt.pos[0], tgt.pos[1], tgt.com_z]));
+    chosen_aim = Some(direct_aim(muzzle, [tgt.pos[0], tgt.pos[1], tgt.aim_z]));
     (fire, reload, chosen_aim, debug_pt)
 }
 
@@ -577,9 +605,9 @@ fn eval_gun(
         map,
         muzzle,
         tgt.pos,
-        tgt.vel,
+        tgt.lead_vel,
         tgt.est_accel_z,
-        tgt.com_z - tgt.pos[2],
+        tgt.aim_z - tgt.pos[2],
         gravity,
         speed,
         mech_radius + 0.5,
@@ -591,12 +619,11 @@ fn eval_gun(
     let dist = dist3d(muzzle, lead_pos);
     // Never gate trigger on cooldown <= 0.12: holding trigger fires cleanly every 0.24 s!
     let ready = reload_left <= 0.0 && ammo > 0.0 && dist <= range;
-    let half_h = (tgt.com_z - tgt.pos[2]).max(1.2);
     let slew_ok = slew_aligned(
         cur_aim,
         aim,
         tgt.radius,
-        half_h,
+        tgt.aim_half_h,
         dist.max(4.0),
         1.25,
         0.012,
@@ -620,7 +647,7 @@ fn eval_lightning(
     let cone_rad = stat(&w.stats, "cone_deg", 30.0).to_radians();
     let e_cost = stat(&w.stats, "energy", 3.0);
 
-    let direct = direct_aim(muzzle, [tgt.pos[0], tgt.pos[1], tgt.com_z]);
+    let direct = direct_aim(muzzle, [tgt.pos[0], tgt.pos[1], tgt.aim_z]);
     let check_yaw = if angle_diff(preferred_yaw, direct[0]).abs() < 0.35 * cone_rad {
         direct[0]
     } else {
@@ -645,11 +672,11 @@ pub(crate) fn eval_laser(
     min_pitch: f64,
     max_pitch: f64,
 ) -> ([f64; 2], bool) {
-    let com_off = tgt.com_z - tgt.pos[2];
-    let hit_x = tgt.pos[0] + tgt.vel[0] * 0.05;
-    let hit_y = tgt.pos[1] + tgt.vel[1] * 0.05;
-    let surf_hit = map.surface_height(hit_x, hit_y, tgt.pos[2]) + com_off;
-    let hit_z = (tgt.com_z + tgt.vel[2] * 0.05).max(surf_hit);
+    let aim_off = tgt.aim_z - tgt.pos[2];
+    let hit_x = tgt.pos[0] + tgt.lead_vel[0] * 0.05;
+    let hit_y = tgt.pos[1] + tgt.lead_vel[1] * 0.05;
+    let surf_hit = map.surface_height(hit_x, hit_y, tgt.pos[2]) + aim_off;
+    let hit_z = (tgt.aim_z + tgt.lead_vel[2] * 0.05).max(surf_hit);
     let hit_pt = [hit_x, hit_y, hit_z];
     let mut aim = direct_aim(muzzle, hit_pt);
     aim[1] = aim[1].clamp(min_pitch, max_pitch);
@@ -663,12 +690,11 @@ pub(crate) fn eval_laser(
     let cookoff = stat(&w.stats, "cookoff", 0.6);
     let charge = w.charge.unwrap_or(0.0);
 
-    let half_h = com_off.max(1.2);
     let aligned = slew_aligned(
         cur_aim,
         aim,
         tgt.radius,
-        half_h,
+        tgt.aim_half_h,
         tgt.dist.max(5.0),
         0.95,
         0.0,
@@ -695,9 +721,9 @@ pub(crate) fn eval_laser(
     let expected_dmg = damage * frac * cube_mult * cookoff_mult * rear_mult;
 
     let future_pt = [
-        tgt.pos[0] + tgt.vel[0] * 0.25,
-        tgt.pos[1] + tgt.vel[1] * 0.25,
-        tgt.com_z,
+        tgt.pos[0] + tgt.lead_vel[0] * 0.25,
+        tgt.pos[1] + tgt.lead_vel[1] * 0.25,
+        tgt.aim_z,
     ];
     let losing_los = tgt.has_los && !map.has_los(muzzle, future_pt);
 

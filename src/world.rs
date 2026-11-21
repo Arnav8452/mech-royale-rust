@@ -8,6 +8,8 @@ use crate::protocol::{stat, Config, GameEvent, Observation, WeaponKind};
 pub(crate) struct TrackedEnemy {
     pub pos: [f64; 3],
     pub vel: [f64; 3],
+    pub ema_vel: [f64; 2],
+    pub juke_score: f64,
     pub est_accel_z: f64,
     pub aim: [f64; 2],
     #[allow(dead_code)]
@@ -51,6 +53,16 @@ impl TrackedEnemy {
         let has_gun = self.weapons.contains(&WeaponKind::Gun);
         let has_laser = self.weapons.contains(&WeaponKind::Laser);
         (has_gun && self.is_reloading(t)) || (has_laser && self.is_laser_on_cd(t) && !self.charging)
+    }
+
+    #[inline]
+    pub fn effective_lead_vel(&self) -> [f64; 3] {
+        let blend = (self.juke_score * 0.75).clamp(0.0, 0.75);
+        [
+            self.vel[0] * (1.0 - blend) + self.ema_vel[0] * blend,
+            self.vel[1] * (1.0 - blend) + self.ema_vel[1] * blend,
+            self.vel[2],
+        ]
     }
 }
 
@@ -174,28 +186,68 @@ impl WorldState {
             if actor.kind != "mech" {
                 continue;
             }
-            let (est_az, mut gun_reload_until, mut laser_cd_until, est_gun_shots, last_gun_shot_t) =
-                if let Some(prev) = self.tracked_enemies.get(&actor.id) {
-                    let dt = t - prev.last_seen_t;
-                    let az = if (0.04..=0.5).contains(&dt) {
-                        0.5 * prev.est_accel_z + 0.5 * ((actor.vel[2] - prev.vel[2]) / dt)
-                    } else {
-                        0.0
-                    };
-                    let mut lcd = prev.laser_cd_until;
-                    if prev.charging && !actor.charging && dt <= 0.35 {
-                        lcd = lcd.max(t + laser_cd_s);
-                    }
-                    (
-                        az,
-                        prev.gun_reload_until,
-                        lcd,
-                        prev.est_gun_shots,
-                        prev.last_gun_shot_t,
-                    )
+            let (
+                est_az,
+                ema_vel,
+                juke_score,
+                mut gun_reload_until,
+                mut laser_cd_until,
+                est_gun_shots,
+                last_gun_shot_t,
+            ) = if let Some(prev) = self.tracked_enemies.get(&actor.id) {
+                let dt = t - prev.last_seen_t;
+                let in_win = (0.04..=0.5).contains(&dt);
+                let az = if in_win {
+                    0.5 * prev.est_accel_z + 0.5 * ((actor.vel[2] - prev.vel[2]) / dt)
                 } else {
-                    (0.0, -100.0, -100.0, 0, -100.0)
+                    0.0
                 };
+                let (ema, juke) = if in_win {
+                    let alpha = 0.28;
+                    let ema = [
+                        prev.ema_vel[0] * (1.0 - alpha) + actor.vel[0] * alpha,
+                        prev.ema_vel[1] * (1.0 - alpha) + actor.vel[1] * alpha,
+                    ];
+                    let mut j = prev.juke_score * (-dt / 1.2).exp();
+                    let ps = prev.vel[0].hypot(prev.vel[1]);
+                    let cs = actor.vel[0].hypot(actor.vel[1]);
+                    let dv = (actor.vel[0] - prev.vel[0]).hypot(actor.vel[1] - prev.vel[1]);
+                    let sharp_turn = ps > 3.5
+                        && cs > 3.5
+                        && ((prev.vel[0] * actor.vel[0] + prev.vel[1] * actor.vel[1]) / (ps * cs))
+                            < 0.45;
+                    let strong_snap = dv / dt > 25.0;
+                    if sharp_turn || strong_snap {
+                        j = (j + 0.55).min(1.0);
+                    }
+                    (ema, j)
+                } else {
+                    ([actor.vel[0], actor.vel[1]], 0.0)
+                };
+                let mut lcd = prev.laser_cd_until;
+                if prev.charging && !actor.charging && dt <= 0.35 {
+                    lcd = lcd.max(t + laser_cd_s);
+                }
+                (
+                    az,
+                    ema,
+                    juke,
+                    prev.gun_reload_until,
+                    lcd,
+                    prev.est_gun_shots,
+                    prev.last_gun_shot_t,
+                )
+            } else {
+                (
+                    0.0,
+                    [actor.vel[0], actor.vel[1]],
+                    0.0,
+                    -100.0,
+                    -100.0,
+                    0,
+                    -100.0,
+                )
+            };
 
             if !actor.weapons.contains(&WeaponKind::Gun) {
                 gun_reload_until = -100.0;
@@ -209,6 +261,8 @@ impl WorldState {
                 TrackedEnemy {
                     pos: actor.pos,
                     vel: actor.vel,
+                    ema_vel,
+                    juke_score,
                     est_accel_z: est_az,
                     aim: actor.aim,
                     hp: actor.hp.unwrap_or(1400.0),

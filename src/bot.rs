@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m6".to_string(),
+            name: "rust-bot-m6b".to_string(),
             config: hello.config,
             map,
             nav,
@@ -430,6 +430,9 @@ mod tests {
             est_accel_z: 0.0,
             aim: [0.0, 0.0],
             com_z: 64.5,
+            aim_z: 64.5,
+            aim_half_h: 4.5,
+            lead_vel: [0.0, 0.0, 0.0],
             radius: 2.5,
             hp: 1000.0,
             max_hp: 1400.0,
@@ -535,6 +538,9 @@ mod tests {
             est_accel_z: 0.0,
             aim: [0.0, 0.0],
             com_z: 64.5,
+            aim_z: 64.5,
+            aim_half_h: 4.5,
+            lead_vel: [0.0, 0.0, 0.0],
             radius: 2.5,
             hp: 1000.0,
             max_hp: 1400.0,
@@ -1529,6 +1535,9 @@ mod tests {
             est_accel_z: 0.0,
             aim: [PI, 0.0],
             com_z: 4.5,
+            aim_z: 4.5,
+            aim_half_h: 4.5,
+            lead_vel: [0.0, 0.0, 0.0],
             radius: 2.5,
             hp: 500.0,
             max_hp: 1400.0,
@@ -1548,6 +1557,9 @@ mod tests {
             est_accel_z: 0.0,
             aim: [PI, 0.0],
             com_z: 4.5,
+            aim_z: 4.5,
+            aim_half_h: 4.5,
+            lead_vel: [0.0, 0.0, 0.0],
             radius: 2.5,
             hp: 1400.0,
             max_hp: 1400.0,
@@ -1765,6 +1777,135 @@ mod tests {
             bot.strategy.posture,
             Posture::SupplyDrop,
             "must contest imminent drop landing in 3.0 s"
+        );
+    }
+
+    #[test]
+    fn shoots_partly_hidden_target_peeking_over_wall() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        obs.t = 40.0;
+        // Across isolated arena prism 25 (top = 4.23 m): center-of-mass blocked, top half clears top!
+        let ez = -2.2;
+        let me_pos = [-389.9, -287.2, 0.2];
+        let muzzle = [me_pos[0], me_pos[1], me_pos[2] + 7.0];
+        let com_z = ez + 4.5;
+        let upper_z = ez + 0.82 * 9.0;
+        assert!(
+            !bot.map.has_los(muzzle, [-389.9, -244.2, com_z]),
+            "center of mass across prism 25 must be blocked"
+        );
+        assert!(
+            bot.map.has_los(muzzle, [-389.9, -244.2, upper_z]),
+            "upper torso peeking over prism 25 must be clear"
+        );
+
+        obs.self_obs.pos = me_pos;
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [-389.9, -265.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [-389.9, -265.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 90.0;
+        obs.self_obs.aim = direct_aim(muzzle, [-389.9, -244.2, upper_z]);
+        obs.mechs = vec![ActorObs {
+            id: 5,
+            kind: "mech".into(),
+            pos: [-389.9, -244.2, ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [-1.5, 0.0],
+            hp: Some(1200.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+
+        let (cands, _) = select_targets(&obs, &bot.map, &bot.config, &bot.world, muzzle);
+        assert_eq!(cands.len(), 1);
+        assert!(cands[0].has_los, "partially visible target must have LOS");
+        assert!(
+            (cands[0].aim_z - upper_z).abs() < 0.05,
+            "aim_z should select exposed upper torso ({upper_z:.2}), got {:.2}",
+            cands[0].aim_z
+        );
+
+        let act = bot.act(&obs);
+        assert!(
+            act.fire.unwrap()[0],
+            "must shoot partly hidden mech whose top half peeks over wall"
+        );
+    }
+
+    #[test]
+    fn averages_velocity_for_reversing_juking_target() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(0.0, 0.0);
+        let ez = bot.map.ground_height(35.0, 0.0);
+        obs.self_obs.pos = [0.0, 0.0, mz];
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [0.0, 0.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 90.0;
+
+        // 1. Alternating A-D reversing target (+12 / -12 m/s every 0.2 s)
+        for i in 0..6u64 {
+            obs.t = 20.0 + (i as f64) * 0.20;
+            let vy = if i % 2 == 0 { 12.0 } else { -12.0 };
+            obs.mechs = vec![ActorObs {
+                id: 5,
+                kind: "mech".into(),
+                pos: [35.0, 0.0, ez],
+                vel: [0.0, vy, 0.0],
+                aim: [PI, 0.0],
+                hp: Some(1400.0),
+                max_hp: Some(1400.0),
+                cubes: Some(0),
+                weapons: vec![WeaponKind::Gun],
+                charging: false,
+            }];
+            bot.act(&obs);
+        }
+        let juker = &bot.world.tracked_enemies[&5];
+        assert!(
+            juker.juke_score > 0.5,
+            "reversing enemy must raise juke_score, got {}",
+            juker.juke_score
+        );
+        let eff_juke = juker.effective_lead_vel();
+        assert!(
+            eff_juke[1].abs() < 8.0,
+            "juker effective lead velocity should damp below raw 12.0, got {:?}",
+            eff_juke
+        );
+
+        // 2. Steady-running enemy keeps full velocity lead
+        for i in 0..6u64 {
+            obs.t = 30.0 + (i as f64) * 0.20;
+            obs.mechs = vec![ActorObs {
+                id: 6,
+                kind: "mech".into(),
+                pos: [35.0, 0.0, ez],
+                vel: [0.0, 12.0, 0.0],
+                aim: [PI, 0.0],
+                hp: Some(1400.0),
+                max_hp: Some(1400.0),
+                cubes: Some(0),
+                weapons: vec![WeaponKind::Gun],
+                charging: false,
+            }];
+            bot.act(&obs);
+        }
+        let steady = &bot.world.tracked_enemies[&6];
+        assert_eq!(steady.juke_score, 0.0);
+        assert!(
+            (steady.effective_lead_vel()[1] - 12.0).abs() < 1e-9,
+            "steady target must use full 12.0 m/s lead velocity"
         );
     }
 }
