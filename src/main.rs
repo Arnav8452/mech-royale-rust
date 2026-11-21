@@ -1,6 +1,7 @@
 mod bot;
 mod io;
 mod map;
+mod nav;
 mod protocol;
 
 fn main() {

@@ -253,8 +253,22 @@ impl Map {
 
     pub fn dist_sq_to_prism_2d(&self, prism_idx: usize, x: f64, y: f64) -> f64 {
         let p = &self.prisms[prism_idx];
-        if x < p.min_x && y < p.min_y {
-            return (p.min_x - x).powi(2) + (p.min_y - y).powi(2);
+        let dx_box = if x < p.min_x {
+            p.min_x - x
+        } else if x > p.max_x {
+            x - p.max_x
+        } else {
+            0.0
+        };
+        let dy_box = if y < p.min_y {
+            p.min_y - y
+        } else if y > p.max_y {
+            y - p.max_y
+        } else {
+            0.0
+        };
+        if dx_box > 0.0 || dy_box > 0.0 {
+            return min_dist_sq_to_ring(&p.ring, x, y);
         }
         if self.point_in_prism_2d(prism_idx, x, y) {
             return 0.0;
@@ -266,6 +280,95 @@ impl Map {
             }
         }
         best
+    }
+
+    pub fn prism_within_dist_sq(&self, prism_idx: usize, x: f64, y: f64, max_d2: f64) -> bool {
+        let p = &self.prisms[prism_idx];
+        let dx_box = if x < p.min_x {
+            p.min_x - x
+        } else if x > p.max_x {
+            x - p.max_x
+        } else {
+            0.0
+        };
+        let dy_box = if y < p.min_y {
+            p.min_y - y
+        } else if y > p.max_y {
+            y - p.max_y
+        } else {
+            0.0
+        };
+        if dx_box * dx_box + dy_box * dy_box >= max_d2 {
+            return false;
+        }
+        self.dist_sq_to_prism_2d(prism_idx, x, y) < max_d2
+    }
+
+    fn for_each_prism_in_aabb<F>(&self, min_x: f64, max_x: f64, min_y: f64, max_y: f64, mut f: F)
+    where
+        F: FnMut(usize) -> bool,
+    {
+        let cx0 = (((min_x - self.grid_origin_x) / self.grid_cell).floor() as isize)
+            .clamp(0, (self.grid_nx - 1) as isize) as usize;
+        let cx1 = (((max_x - self.grid_origin_x) / self.grid_cell).floor() as isize)
+            .clamp(0, (self.grid_nx - 1) as isize) as usize;
+        let cy0 = (((min_y - self.grid_origin_y) / self.grid_cell).floor() as isize)
+            .clamp(0, (self.grid_ny - 1) as isize) as usize;
+        let cy1 = (((max_y - self.grid_origin_y) / self.grid_cell).floor() as isize)
+            .clamp(0, (self.grid_ny - 1) as isize) as usize;
+
+        let mut seen = [usize::MAX; 32];
+        let mut seen_len = 0usize;
+
+        for cy in cy0..=cy1 {
+            for cx in cx0..=cx1 {
+                for &idx in &self.grid[cy * self.grid_nx + cx] {
+                    if seen[..seen_len].contains(&idx) {
+                        continue;
+                    }
+                    if seen_len < seen.len() {
+                        seen[seen_len] = idx;
+                        seen_len += 1;
+                    }
+                    let p = &self.prisms[idx];
+                    if max_x < p.min_x || min_x > p.max_x || max_y < p.min_y || min_y > p.max_y {
+                        continue;
+                    }
+                    if !f(idx) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn surface_height(&self, x: f64, y: f64, ref_z: f64) -> f64 {
+        let mut h = self.ground_height(x, y);
+        self.for_each_prism_in_aabb(x, x, y, y, |idx| {
+            let p = &self.prisms[idx];
+            if p.top <= ref_z + 1.8 && self.point_in_prism_2d(idx, x, y) {
+                h = h.max(p.top);
+            }
+            true
+        });
+        h
+    }
+
+    pub fn has_tall_prism_near(&self, x: f64, y: f64, ground_z: f64, probe_r: f64) -> bool {
+        let mut found = false;
+        let r2 = probe_r * probe_r;
+        self.for_each_prism_in_aabb(x - probe_r, x + probe_r, y - probe_r, y + probe_r, |idx| {
+            let p = &self.prisms[idx];
+            if p.top >= ground_z + 6.0
+                && p.base <= ground_z + 3.0
+                && self.dist_sq_to_prism_2d(idx, x, y) <= r2
+            {
+                found = true;
+                return false;
+            }
+            true
+        });
+        found
     }
 
     pub fn is_pos_walkable(
@@ -287,49 +390,22 @@ impl Map {
 
         let mut surface_z = self.ground_height(x, y);
         let r2 = radius * radius;
+        let mut blocked = false;
 
-        let cx0 = (((x - radius - self.grid_origin_x) / self.grid_cell).floor() as isize)
-            .clamp(0, (self.grid_nx - 1) as isize) as usize;
-        let cx1 = (((x + radius - self.grid_origin_x) / self.grid_cell).floor() as isize)
-            .clamp(0, (self.grid_nx - 1) as isize) as usize;
-        let cy0 = (((y - radius - self.grid_origin_y) / self.grid_cell).floor() as isize)
-            .clamp(0, (self.grid_ny - 1) as isize) as usize;
-        let cy1 = (((y + radius - self.grid_origin_y) / self.grid_cell).floor() as isize)
-            .clamp(0, (self.grid_ny - 1) as isize) as usize;
-
-        let mut seen = [usize::MAX; 16];
-        let mut seen_len = 0usize;
-
-        for cy in cy0..=cy1 {
-            for cx in cx0..=cx1 {
-                for &idx in &self.grid[cy * self.grid_nx + cx] {
-                    if seen[..seen_len].contains(&idx) {
-                        continue;
-                    }
-                    if seen_len < seen.len() {
-                        seen[seen_len] = idx;
-                        seen_len += 1;
-                    }
-                    let p = &self.prisms[idx];
-                    if x + radius < p.min_x
-                        || x - radius > p.max_x
-                        || y + radius < p.min_y
-                        || y - radius > p.max_y
-                    {
-                        continue;
-                    }
-                    if p.base < feet_z + height && p.top > feet_z + step_up {
-                        if self.dist_sq_to_prism_2d(idx, x, y) < r2 {
-                            return (false, surface_z);
-                        }
-                    } else if p.top <= feet_z + step_up && self.point_in_prism_2d(idx, x, y) {
-                        surface_z = surface_z.max(p.top);
-                    }
+        self.for_each_prism_in_aabb(x - radius, x + radius, y - radius, y + radius, |idx| {
+            let p = &self.prisms[idx];
+            if p.base < feet_z + height && p.top > feet_z + step_up {
+                if self.prism_within_dist_sq(idx, x, y, r2) {
+                    blocked = true;
+                    return false;
                 }
+            } else if p.top <= feet_z + step_up && self.point_in_prism_2d(idx, x, y) {
+                surface_z = surface_z.max(p.top);
             }
-        }
+            true
+        });
 
-        (true, surface_z)
+        (!blocked, surface_z)
     }
 
     pub fn has_los(&self, a: [f64; 3], b: [f64; 3]) -> bool {
