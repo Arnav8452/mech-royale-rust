@@ -39,7 +39,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m11-reset".to_string(),
+            name: "rust-bot-m11-corlas".to_string(),
             config: hello.config,
             map,
             nav,
@@ -199,6 +199,7 @@ impl Bot {
                 max_pitch,
                 self.strategy.peek_target,
                 los_mech_count,
+                self.strategy.tactic == CombatTactic::CoverAmbush,
             );
             (pre_fire, false, pre_aim, None)
         };
@@ -2140,6 +2141,148 @@ mod tests {
         assert!(
             mv[1] > 0.5,
             "fast +y orbit past bullet center must keep +y velocity instead of reversing into v=0, got {mv:?}"
+        );
+    }
+
+    #[test]
+    fn never_yoyos_out_of_cover_into_two_tracked_enemies_at_high_hp() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        // Me at [82, -140] (West of block 14), e1 at [196, -140] (occluded East of block 14, 114 m),
+        // e2 at [82, -90] (50 m North — any peek North around corner exposes to e2; old 75 m check could still AggressivePush if e2 at 110 m).
+        // Place e2 at [82.0, -45.0] (95 m North — outside old 75 m filter, inside new 180 m filter!).
+        let mz = bot.map.ground_height(82.0, -140.0);
+        let ez1 = bot.map.ground_height(196.0, -140.0);
+        obs.t = 40.0;
+        obs.self_obs.pos = [82.0, -140.0, mz];
+        obs.self_obs.hp = 1260.0; // 90% HP!
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 100.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [82.0, -140.0];
+        obs.zone.next_radius = 240.0;
+        obs.zone.shrink_start = 120.0;
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.mechs = vec![ActorObs {
+            id: 5,
+            kind: "mech".into(),
+            pos: [196.0, -140.0, ez1],
+            vel: [0.0, 0.0, 0.0],
+            aim: [PI, 0.0],
+            hp: Some(1200.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+        bot.world.tracked_enemies.insert(
+            6,
+            crate::world::TrackedEnemy {
+                pos: [210.0, -140.0, ez1],
+                vel: [0.0, 0.0, 0.0],
+                est_accel_z: 0.0,
+                aim: [PI, 0.0],
+                hp: 1200.0,
+                max_hp: 1400.0,
+                weapons: vec![WeaponKind::Gun, WeaponKind::Laser],
+                charging: false,
+                last_seen_t: 39.5,
+                gun_reload_until: -100.0,
+                laser_cd_until: -100.0,
+                est_gun_shots: 0,
+                last_gun_shot_t: -100.0,
+            },
+        );
+        bot.act(&obs);
+        assert_ne!(
+            bot.strategy.tactic,
+            CombatTactic::AggressivePush,
+            "at 90% HP with a 2nd tracked threat at 128 m must NEVER AggressivePush into 1v2 ambush"
+        );
+    }
+
+    #[test]
+    fn tethers_1v1_to_building_corner_and_ducks_during_laser_cooldown() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let me_xy = [84.0, -108.0];
+        let en_xy = [84.0, -185.0]; // 77 m South along clear West face of block 14
+        let mz = bot.map.ground_height(me_xy[0], me_xy[1]);
+        let ez = bot.map.ground_height(en_xy[0], en_xy[1]);
+        obs.t = 40.0;
+        obs.self_obs.pos = [me_xy[0], me_xy[1], mz];
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 100.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [0.0, 0.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 120.0;
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        let mut laser = WeaponObs {
+            kind: WeaponKind::Laser,
+            cooldown: 1.2,
+            ammo: None,
+            reload: None,
+            charge: Some(0.0),
+            stats: bot.config.weapons.laser.clone(),
+        };
+        let lt = WeaponObs {
+            kind: WeaponKind::Lightning,
+            cooldown: 0.0,
+            ammo: None,
+            reload: None,
+            charge: None,
+            stats: bot.config.weapons.lightning.clone(),
+        };
+        obs.self_obs.weapons = vec![Some(laser.clone()), Some(lt)];
+        obs.mechs = vec![ActorObs {
+            id: 5,
+            kind: "mech".into(),
+            pos: [en_xy[0], en_xy[1], ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [PI / 2.0, 0.0],
+            hp: Some(1200.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun, WeaponKind::Laser],
+            charging: false,
+        }];
+
+        // 1. Laser on cooldown (1.2 s) near cover at 77 m -> ducks behind corner (CoverDuck)
+        bot.act(&obs);
+        assert_eq!(
+            bot.strategy.tactic,
+            CombatTactic::CoverDuck,
+            "holding Laser+Lightning with Laser on 1.2 s cooldown near cover must duck"
+        );
+
+        // 2. Laser ready (cooldown=0) ~24 m West of block 14 corner -> corner tether pulls East toward cover
+        obs.t = 42.0;
+        laser.cooldown = 0.0;
+        obs.self_obs.weapons[0] = Some(laser);
+        let mz2 = bot.map.ground_height(66.0, -110.0);
+        let ez2 = bot.map.ground_height(66.0, -195.0);
+        obs.self_obs.pos = [66.0, -110.0, mz2];
+        obs.mechs[0].pos = [66.0, -195.0, ez2];
+        // Set strafe/orbit sign so perp has +x or test East pull from corner tether
+        bot.world.orbit_sign = 1.0;
+        let act_ready = bot.act(&obs);
+        assert_ne!(bot.strategy.tactic, CombatTactic::CoverDuck);
+        assert!(
+            act_ready.move_dir.unwrap()[0] > 0.2,
+            "with ready Laser 24 m from block 14 corner, corner tether must pull toward corner (+x), got {:?}",
+            act_ready.move_dir
         );
     }
 }

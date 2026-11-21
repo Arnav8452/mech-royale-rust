@@ -69,6 +69,7 @@ pub(crate) struct StrategyState {
     pub reset_cover_t: f64,
     pub combat_cover_target: Option<[f64; 2]>,
     pub combat_cover_t: f64,
+    pub cover_hold_until: f64,
     pub ambush_anchor: Option<[f64; 2]>,
     pub ambush_anchor_t: f64,
     pub prev_ambush_anchor: Option<[f64; 2]>,
@@ -92,6 +93,7 @@ impl StrategyState {
             reset_cover_t: -100.0,
             combat_cover_target: None,
             combat_cover_t: -100.0,
+            cover_hold_until: -100.0,
             ambush_anchor: None,
             ambush_anchor_t: -100.0,
             prev_ambush_anchor: None,
@@ -233,7 +235,7 @@ impl StrategyState {
             return (None, None);
         }
 
-        if let Some(drop_slot) = swap_slot_for(me, pk_kind) {
+        if let Some(drop_slot) = swap_slot_for(me, pk_kind, obs.alive) {
             return (Some(pid), Some(drop_slot));
         }
         (None, None)
@@ -664,6 +666,36 @@ impl StrategyState {
                     && los_mechs.iter().any(|e| e.charging);
 
                 let near_cover_14 = nav.has_near_cover_within(me.pos, 14.0);
+                let has_lightning = me
+                    .weapons
+                    .iter()
+                    .flatten()
+                    .any(|w| w.kind == WeaponKind::Lightning);
+                if los_mech_count >= 2 {
+                    self.cover_hold_until = obs.t + 1.1;
+                }
+                let recent_multi_cover = obs.t < self.cover_hold_until
+                    && world
+                        .tracked_enemies
+                        .values()
+                        .filter(|te| dist2d(me.pos[0], me.pos[1], te.pos[0], te.pos[1]) <= 180.0)
+                        .count()
+                        >= 2;
+                let laser_cd_duck = los_mech_count == 1
+                    && have_laser
+                    && !immediate_kill_avail
+                    && near_cover_14
+                    && combat_enemy.is_some_and(|e| {
+                        !e.is_vulnerable
+                            && e.hp > 480.0
+                            && e.dist > 45.0
+                            && !(has_lightning && e.dist <= my_lt_range + 4.0)
+                    })
+                    && me.weapons.iter().flatten().any(|w| {
+                        w.kind == WeaponKind::Laser
+                            && w.cooldown > 0.35
+                            && w.charge.unwrap_or(0.0) <= 0.0
+                    });
 
                 // A. Mid-Combat Power Cube Magnet: free +4% max HP heal & +4% dmg mid-fight (gated on want_cubes)
                 if want_cubes
@@ -709,10 +741,11 @@ impl StrategyState {
                     }
                 }
 
-                // 1. CoverDuck: outnumbered (2+ LOS), dry/reloading, or enemy charging laser
-                if (los_mech_count >= 2 && !immediate_kill_avail)
-                    || (no_weapon_can_shoot_now && !immediate_kill_avail)
+                // 1. CoverDuck: outnumbered (2+ LOS / hold hysteresis), dry/reloading, enemy charging laser, or Laser cooldown peek-cycle
+                if ((los_mech_count >= 2 || recent_multi_cover || no_weapon_can_shoot_now)
+                    && !immediate_kill_avail)
                     || enemy_laser_duck
+                    || laser_cd_duck
                 {
                     if los_mech_count == 0
                         && (near_cover_14
@@ -756,6 +789,7 @@ impl StrategyState {
                         let keep = self
                             .combat_cover_target
                             .is_some_and(|_| obs.t - self.combat_cover_t < 1.2);
+                        let cover_search_r = if los_mech_count >= 2 { 68.0 } else { 48.0 };
                         if !keep {
                             self.combat_cover_target = nav.find_cover_point_within(
                                 map,
@@ -766,7 +800,7 @@ impl StrategyState {
                                 obs.zone.radius,
                                 obs.zone.next_center,
                                 obs.zone.next_radius,
-                                48.0,
+                                cover_search_r,
                                 None,
                             );
                             self.combat_cover_t = obs.t;
@@ -785,18 +819,53 @@ impl StrategyState {
                             );
                         }
                     }
+
+                    // Open-pack escape: if 2+ LOS enemies have no cover within 68 m, kite away from pack centroid toward safety
+                    if los_mech_count >= 2 {
+                        self.tactic = CombatTactic::CoverDuck;
+                        let (mut sx, mut sy) = (0.0_f64, 0.0_f64);
+                        for m in los_mechs {
+                            sx += m.pos[0];
+                            sy += m.pos[1];
+                        }
+                        let n = los_mech_count as f64;
+                        let away = unit2d(me.pos[0] - sx / n, me.pos[1] - sy / n);
+                        let safe_pt = nav
+                            .find_cover_anchor(
+                                me.pos,
+                                obs.zone.center,
+                                obs.zone.radius,
+                                nc,
+                                obs.zone.next_radius,
+                                None,
+                                95.0,
+                            )
+                            .unwrap_or(nc);
+                        let safe_dir = unit2d(safe_pt[0] - me.pos[0], safe_pt[1] - me.pos[1]);
+                        let goal = [
+                            me.pos[0] + (away[0] * 0.65 + safe_dir[0] * 0.35) * 45.0,
+                            me.pos[1] + (away[1] * 0.65 + safe_dir[1] * 0.35) * 45.0,
+                        ];
+                        let wp = self.follow_astar(nav, scratch, me_xy, goal, obs.t);
+                        return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), goal);
+                    }
                 }
 
                 if let Some(e) = combat_enemy {
-                    // 2. Enemy behind wall (!e.has_los): slice-the-pie corner peek or aggressive chase
+                    // 2. Enemy behind wall (!e.has_los): slice-the-pie corner peek (0 exposed other) or corner hold — never yo-yo into 2+ threats!
                     if !e.has_los {
-                        let close_other_threats: Vec<[f64; 3]> = world
+                        let mut others: Vec<(u64, &crate::world::TrackedEnemy)> = world
                             .tracked_enemies
                             .iter()
                             .filter(|(&id, te)| {
                                 id != e.id
-                                    && dist2d(me.pos[0], me.pos[1], te.pos[0], te.pos[1]) <= 75.0
+                                    && dist2d(me.pos[0], me.pos[1], te.pos[0], te.pos[1]) <= 180.0
                             })
+                            .map(|(&id, te)| (id, te))
+                            .collect();
+                        others.sort_by_key(|(id, _)| *id);
+                        let close_other_threats: Vec<[f64; 3]> = others
+                            .iter()
                             .map(|(_, te)| [te.pos[0], te.pos[1], te.pos[2] + 7.5])
                             .collect();
 
@@ -816,9 +885,10 @@ impl StrategyState {
                             let wp = self.follow_astar(nav, scratch, me_xy, pp, obs.t);
                             return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), pp);
                         } else if close_other_threats.is_empty()
-                            || e.hp <= 550.0
-                            || e.is_vulnerable
-                            || me.hp >= 0.60 * me.max_hp
+                            && (e.hp <= 550.0
+                                || e.is_vulnerable
+                                || me.hp >= 0.55 * me.max_hp
+                                || immediate_kill_avail)
                         {
                             self.tactic = CombatTactic::AggressivePush;
                             let goal = [e.pos[0], e.pos[1]];
@@ -967,7 +1037,9 @@ impl StrategyState {
                     let mut gx = to_e[0] * radial_w + perp[0] * tang_w;
                     let mut gy = to_e[1] * radial_w + perp[1] * tang_w;
 
-                    if !e.is_vulnerable && (los_mech_count >= 2 || me.hp < 0.55 * me.max_hp) {
+                    if !(has_lightning && d2 <= my_lt_range + 4.0 && me.energy > 20.0)
+                        && (!e.is_vulnerable || los_mech_count >= 2)
+                    {
                         if let Some(corner) = nav.find_cover_anchor(
                             me.pos,
                             obs.zone.center,
@@ -975,12 +1047,17 @@ impl StrategyState {
                             nc,
                             obs.zone.next_radius,
                             None,
-                            26.0,
+                            32.0,
                         ) {
-                            if dist2d(me.pos[0], me.pos[1], corner[0], corner[1]) > 12.0 {
+                            if dist2d(me.pos[0], me.pos[1], corner[0], corner[1]) > 8.5 {
                                 let cdir = unit2d(corner[0] - me.pos[0], corner[1] - me.pos[1]);
-                                gx += cdir[0] * 0.18;
-                                gy += cdir[1] * 0.18;
+                                let corner_w = if enemy_has_laser || have_laser {
+                                    0.75
+                                } else {
+                                    0.45
+                                };
+                                gx += cdir[0] * corner_w;
+                                gy += cdir[1] * corner_w;
                             }
                         }
                     }
@@ -1312,12 +1389,17 @@ impl StrategyState {
             .iter()
             .flatten()
             .any(|w| w.kind == WeaponKind::Lightning);
+        let have_laser = me
+            .weapons
+            .iter()
+            .flatten()
+            .any(|w| w.kind == WeaponKind::Laser);
 
         let close_los_enemy = los_mechs.iter().any(|m| m.dist < 60.0);
         let any_los_enemy = !los_mechs.is_empty();
         let max_seek_d = if slot1_empty {
             210.0
-        } else if !have_lightning {
+        } else if !have_lightning || (!have_laser && obs.alive <= 12) {
             115.0
         } else {
             65.0
@@ -1349,7 +1431,7 @@ impl StrategyState {
                 if kind == WeaponKind::Gun || (close_los_enemy && d >= 35.0) {
                     continue;
                 }
-            } else if any_los_enemy || swap_slot_for(me, kind).is_none() {
+            } else if any_los_enemy || swap_slot_for(me, kind, obs.alive).is_none() {
                 continue;
             }
 
@@ -1363,8 +1445,8 @@ impl StrategyState {
     }
 }
 
-/// Preferred loadout [Gun, Lightning] (protects invested Laser if Laser-upgraded and Gun un-upgraded).
-fn swap_slot_for(me: &SelfObs, new_kind: WeaponKind) -> Option<usize> {
+/// Preferred loadout [Laser, Lightning] for corner peek-trades and anti-laser shorting.
+fn swap_slot_for(me: &SelfObs, new_kind: WeaponKind, alive: u64) -> Option<usize> {
     if new_kind == WeaponKind::Mortar {
         return None;
     }
@@ -1376,32 +1458,43 @@ fn swap_slot_for(me: &SelfObs, new_kind: WeaponKind) -> Option<usize> {
     {
         return Some(m_slot);
     }
-    if new_kind == WeaponKind::Lightning {
-        let has_gun_upgrades = me.upgrades.iter().any(|u| u.starts_with("gun_"));
-        let has_laser_upgrades = me.upgrades.iter().any(|u| u.starts_with("laser_"));
-        let laser_slot = me
-            .weapons
-            .iter()
-            .take(2)
-            .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Laser));
-        let gun_slot = me
-            .weapons
-            .iter()
-            .take(2)
-            .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Gun));
-        if let Some(ls) = laser_slot {
-            if !has_laser_upgrades || has_gun_upgrades {
-                return Some(ls);
+    let has_gun_upgrades = me.upgrades.iter().any(|u| u.starts_with("gun_"));
+    let has_laser_upgrades = me.upgrades.iter().any(|u| u.starts_with("laser_"));
+    let laser_slot = me
+        .weapons
+        .iter()
+        .take(2)
+        .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Laser));
+    let gun_slot = me
+        .weapons
+        .iter()
+        .take(2)
+        .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Gun));
+
+    match new_kind {
+        WeaponKind::Lightning => {
+            if let Some(gs) = gun_slot {
+                if !has_gun_upgrades || has_laser_upgrades {
+                    return Some(gs);
+                }
             }
-        }
-        if let Some(gs) = gun_slot {
-            if !has_gun_upgrades {
-                return Some(gs);
+            if let Some(ls) = laser_slot {
+                if !has_laser_upgrades {
+                    return Some(ls);
+                }
             }
+            gun_slot.or(laser_slot)
         }
-        return laser_slot.or(gun_slot);
+        WeaponKind::Laser => {
+            if let Some(gs) = gun_slot {
+                if !has_gun_upgrades && alive <= 12 {
+                    return Some(gs);
+                }
+            }
+            None
+        }
+        _ => None,
     }
-    None
 }
 
 #[inline]

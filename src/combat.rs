@@ -504,6 +504,7 @@ pub(crate) fn eval_precharge_laser(
     max_pitch: f64,
     peek_target: Option<[f64; 2]>,
     los_mech_count: usize,
+    in_cover_ambush: bool,
 ) -> ([bool; 2], Option<[f64; 2]>) {
     let me = &obs.self_obs;
     let mut fire = [false, false];
@@ -517,8 +518,13 @@ pub(crate) fn eval_precharge_laser(
             if w.kind == WeaponKind::Laser {
                 let charge = w.charge.unwrap_or(0.0);
                 let full_charge = stat(&w.stats, "charge", 0.75);
+                let hold_s = stat(&w.stats, "hold_s", 2.0);
                 if charge > 0.0 {
-                    fire[idx] = charge < full_charge;
+                    fire[idx] = if in_cover_ambush {
+                        charge < (full_charge + hold_s - 0.35).max(full_charge)
+                    } else {
+                        charge < full_charge
+                    };
                     active_laser_idx = Some(idx);
                 } else if w.cooldown <= 0.08 {
                     ready_laser_idx = Some(idx);
@@ -531,8 +537,10 @@ pub(crate) fn eval_precharge_laser(
         let d_pp = (pp[0] - me.pos[0]).hypot(pp[1] - me.pos[1]);
         d_pp <= 4.5
     });
+    let ambushing_close = in_cover_ambush
+        && world.closest_tracked_enemy_within(me.pos, 45.0).is_some();
 
-    if los_mech_count == 0 && near_peek {
+    if los_mech_count == 0 && (near_peek || ambushing_close) {
         if let Some((_, enemy)) = world.closest_tracked_enemy_within(me.pos, 180.0) {
             let base_mech_h = stat(&config.mech, "height", 9.0);
             let aim_pt = [enemy.pos[0], enemy.pos[1], enemy.pos[2] + 0.5 * base_mech_h];

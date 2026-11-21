@@ -509,12 +509,14 @@ impl NavGrid {
         cands.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
         cands.truncate(24);
 
-        // Sort threats closest-first and check up to 4
+        // Sort threats closest-first (deterministic coordinate tie-break) and check up to 4
         let mut near_threats: Vec<[f64; 3]> = threats.to_vec();
         near_threats.sort_unstable_by(|a, b| {
             let da = (a[0] - me_pos[0]).hypot(a[1] - me_pos[1]);
             let db = (b[0] - me_pos[0]).hypot(b[1] - me_pos[1]);
-            da.partial_cmp(&db).unwrap_or(Ordering::Equal)
+            da.total_cmp(&db)
+                .then_with(|| a[0].total_cmp(&b[0]))
+                .then_with(|| a[1].total_cmp(&b[1]))
         });
         near_threats.truncate(4);
         let n_threats = near_threats.len();
@@ -712,9 +714,11 @@ impl NavGrid {
         near_others.sort_unstable_by(|a, b| {
             let da = (a[0] - me_pos[0]).hypot(a[1] - me_pos[1]);
             let db = (b[0] - me_pos[0]).hypot(b[1] - me_pos[1]);
-            da.partial_cmp(&db).unwrap_or(Ordering::Equal)
+            da.total_cmp(&db)
+                .then_with(|| a[0].total_cmp(&b[0]))
+                .then_with(|| a[1].total_cmp(&b[1]))
         });
-        near_others.truncate(3);
+        near_others.truncate(4);
 
         let mut best_pt: Option<[f64; 2]> = None;
         let mut best_score = f64::NEG_INFINITY;
@@ -724,15 +728,10 @@ impl NavGrid {
             if !map.has_los(eye, target_eye) {
                 continue;
             }
-            let mut exposed_other = 0usize;
-            for ot in &near_others {
-                if map.has_los(eye, *ot) {
-                    exposed_other += 1;
-                }
+            if near_others.iter().any(|ot| map.has_los(eye, *ot)) {
+                continue;
             }
-            let score = -1.8 * d_me
-                + if near_cov { 24.0 } else { 0.0 }
-                - 95.0 * (exposed_other as f64);
+            let score = -1.8 * d_me + if near_cov { 24.0 } else { 0.0 };
             if score > best_score {
                 best_score = score;
                 best_pt = Some([pt[0], pt[1]]);
