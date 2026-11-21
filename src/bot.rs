@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m9-orbit".to_string(),
+            name: "rust-bot-m10-orbzz".to_string(),
             config: hello.config,
             map,
             nav,
@@ -144,12 +144,10 @@ impl Bot {
             stuck_active,
         );
 
-        // Fire back while retreating in plain sight; hold fire once LOS broken or 1.8 s clear
-        let actively_taking_fire = los_mech_count > 0
-            && (t - self.world.last_damage_t < 1.8 || los_mechs.iter().any(|m| m.dist < 50.0));
+        // Stack m9-zigzag: keep firing while any enemy still has LOS during cover retreat; hold only once LOS breaks
         let hold_fire_for_regen = self.strategy.posture == Posture::EmergencyRegen
             && !immediate_kill_avail
-            && !actively_taking_fire;
+            && los_mech_count == 0;
 
         let (fire, mut reload, chosen_aim, debug_aim_target) = if hold_fire_for_regen {
             ([false, false], false, None, None)
@@ -1899,6 +1897,93 @@ mod tests {
         assert_eq!(
             bot.world.orbit_sign, 1.0,
             "obstacle 8-13 m ahead along orbit tangent must cleanly bounce-flip orbit_sign"
+        );
+    }
+
+    #[test]
+    fn zigzags_30deg_to_cover_and_fires_while_exposed_in_los() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        // Open Oval spot >8m from block 14 cover while exposed to distant enemy
+        let me_xy = [86.0, -70.0];
+        let mz = bot.map.ground_height(me_xy[0], me_xy[1]);
+        let e1_xy = [155.0, -25.0];
+        let ez = bot.map.ground_height(e1_xy[0], e1_xy[1]);
+        obs.t = 40.0;
+        obs.self_obs.pos = [me_xy[0], me_xy[1], mz];
+        obs.self_obs.hp = 360.0; // Low HP -> triggers EmergencyRegen vs 2 LOS enemies
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [0.0, 0.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 120.0;
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.self_obs.aim =
+            direct_aim([me_xy[0], me_xy[1], mz + 7.0], [e1_xy[0], e1_xy[1], ez + 4.5]);
+        let e2z = bot.map.ground_height(165.0, -35.0);
+        obs.mechs = vec![
+            ActorObs {
+                id: 5,
+                kind: "mech".into(),
+                pos: [e1_xy[0], e1_xy[1], ez],
+                vel: [0.0, 0.0, 0.0],
+                aim: [-2.8, 0.0],
+                hp: Some(1200.0),
+                max_hp: Some(1400.0),
+                cubes: Some(0),
+                weapons: vec![WeaponKind::Gun],
+                charging: false,
+            },
+            ActorObs {
+                id: 6,
+                kind: "mech".into(),
+                pos: [165.0, -35.0, e2z],
+                vel: [0.0, 0.0, 0.0],
+                aim: [-2.8, 0.0],
+                hp: Some(1200.0),
+                max_hp: Some(1400.0),
+                cubes: Some(0),
+                weapons: vec![WeaponKind::Gun],
+                charging: false,
+            },
+        ];
+        // Even with no damage in the last 3.5 s, EmergencyRegen with LOS > 0 must keep firing
+        bot.world.last_damage_t = 35.0;
+        bot.world.strafe_sign = 1.0;
+        bot.world.next_strafe_flip_t = 99.0;
+        let act_pos = bot.act(&obs);
+        assert_eq!(bot.strategy.posture, Posture::EmergencyRegen);
+        assert!(
+            act_pos.fire.unwrap()[0],
+            "must keep firing while still exposed in LOS during retreat"
+        );
+
+        let mv_pos = act_pos.move_dir.unwrap();
+        obs.t = 40.2;
+        bot.world.strafe_sign = -1.0;
+        let act_neg = bot.act(&obs);
+        let mv_neg = act_neg.move_dir.unwrap();
+        let dot = (mv_pos[0] * mv_neg[0] + mv_pos[1] * mv_neg[1]).clamp(-1.0, 1.0);
+        let angle_between = dot.acos();
+        assert!(
+            angle_between > 0.35,
+            "flipping strafe_sign during retreat must produce distinct +/-30 deg zig-zag angles, got {:.2} rad ({mv_pos:?} vs {mv_neg:?})",
+            angle_between
+        );
+
+        // Once LOS is broken (0 visible mechs), stop firing immediately
+        obs.t = 40.4;
+        obs.mechs.clear();
+        let act_hid = bot.act(&obs);
+        assert_eq!(
+            act_hid.fire.unwrap(),
+            [false, false],
+            "must hold fire once LOS breaks behind cover"
         );
     }
 }
