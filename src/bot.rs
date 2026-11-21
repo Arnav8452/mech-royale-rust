@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m6b".to_string(),
+            name: "rust-bot-m7".to_string(),
             config: hello.config,
             map,
             nav,
@@ -150,19 +150,6 @@ impl Bot {
             && !immediate_kill_avail
             && !actively_taking_fire;
 
-        let enemy_aiming_laser_at_me = obs.mechs.iter().any(|m| {
-            if m.kind != "mech" || !m.charging {
-                return false;
-            }
-            let ray = [m.aim[0].cos(), m.aim[0].sin()];
-            let rel = [me.pos[0] - m.pos[0], me.pos[1] - m.pos[1]];
-            let proj = rel[0] * ray[0] + rel[1] * ray[1];
-            let perp_dist = (rel[0] * ray[1] - rel[1] * ray[0]).abs();
-            proj > 0.0 && proj <= 265.0 && perp_dist <= 8.0
-        });
-        let avoid_laser_slow =
-            enemy_aiming_laser_at_me || (los_mech_count >= 2 && me.hp < 0.55 * me.max_hp);
-
         let (fire, mut reload, chosen_aim, debug_aim_target) = if hold_fire_for_regen {
             ([false, false], false, None, None)
         } else if let Some(ref tgt) = combat_target {
@@ -175,8 +162,6 @@ impl Bot {
                 min_pitch,
                 max_pitch,
                 &mech_cands,
-                los_mech_count,
-                avoid_laser_slow,
                 tgt,
             )
         } else {
@@ -299,7 +284,6 @@ impl Bot {
                     && los_mech_count > 0
                     && me.energy > 25.0)
                 || (self.strategy.tactic == CombatTactic::CornerPeek && me.energy > 35.0)
-                || (self.strategy.tactic == CombatTactic::PackKite && me.energy > 25.0)
                 || (self.strategy.tactic == CombatTactic::AggressivePush
                     && me.energy > 45.0
                     && any_visible_mech
@@ -310,7 +294,9 @@ impl Bot {
                 || (self.strategy.posture == Posture::LootWeapon
                     && slot1_empty
                     && me.energy > 28.0)
-                || (self.strategy.posture == Posture::EarlyFarm && t < 45.0 && me.energy > 50.0));
+                || (self.strategy.posture == Posture::EarlyFarm
+                    && (t < 45.0 || (me.cubes < 10 && t < 120.0))
+                    && me.energy > 48.0));
 
         let boost = ground_boost || air_unstuck_boost;
 
@@ -432,7 +418,6 @@ mod tests {
             com_z: 64.5,
             aim_z: 64.5,
             aim_half_h: 4.5,
-            lead_vel: [0.0, 0.0, 0.0],
             radius: 2.5,
             hp: 1000.0,
             max_hp: 1400.0,
@@ -540,7 +525,6 @@ mod tests {
             com_z: 64.5,
             aim_z: 64.5,
             aim_half_h: 4.5,
-            lead_vel: [0.0, 0.0, 0.0],
             radius: 2.5,
             hp: 1000.0,
             max_hp: 1400.0,
@@ -1537,7 +1521,6 @@ mod tests {
             com_z: 4.5,
             aim_z: 4.5,
             aim_half_h: 4.5,
-            lead_vel: [0.0, 0.0, 0.0],
             radius: 2.5,
             hp: 500.0,
             max_hp: 1400.0,
@@ -1559,7 +1542,6 @@ mod tests {
             com_z: 4.5,
             aim_z: 4.5,
             aim_half_h: 4.5,
-            lead_vel: [0.0, 0.0, 0.0],
             radius: 2.5,
             hp: 1400.0,
             max_hp: 1400.0,
@@ -1625,114 +1607,6 @@ mod tests {
         assert!(
             act.fire.unwrap()[0],
             "should keep shooting enemy while sweeping nearby cube"
-        );
-    }
-
-    #[test]
-    fn backpedal_kites_away_from_multi_enemy_pack() {
-        let (hello, mut obs) = load_sample_hello_and_obs();
-        let mut bot = Bot::new(hello);
-        obs.t = 40.0;
-        let mz = bot.map.ground_height(0.0, 0.0);
-        let e1z = bot.map.ground_height(28.0, 6.0);
-        let e2z = bot.map.ground_height(28.0, -6.0);
-        assert!(bot.map.has_los([0.0, 0.0, mz + 7.0], [28.0, 6.0, e1z + 4.5]));
-        assert!(bot.map.has_los([0.0, 0.0, mz + 7.0], [28.0, -6.0, e2z + 4.5]));
-        obs.self_obs.pos = [0.0, 0.0, mz];
-        obs.self_obs.hp = 1400.0;
-        obs.self_obs.max_hp = 1400.0;
-        obs.self_obs.energy = 100.0;
-        obs.self_obs.in_zone = true;
-        obs.zone.center = [0.0, 0.0];
-        obs.zone.radius = 400.0;
-        obs.zone.next_center = [0.0, 0.0];
-        obs.zone.next_radius = 350.0;
-        obs.zone.shrink_start = 90.0;
-        obs.self_obs.aim = direct_aim([0.0, 0.0, mz + 7.0], [28.0, 6.0, e1z + 4.5]);
-        obs.mechs = vec![
-            ActorObs {
-                id: 4,
-                kind: "mech".into(),
-                pos: [28.0, 6.0, e1z],
-                vel: [0.0, 0.0, 0.0],
-                aim: [PI, 0.0],
-                hp: Some(1100.0),
-                max_hp: Some(1400.0),
-                cubes: Some(0),
-                weapons: vec![WeaponKind::Gun],
-                charging: false,
-            },
-            ActorObs {
-                id: 5,
-                kind: "mech".into(),
-                pos: [28.0, -6.0, e2z],
-                vel: [0.0, 0.0, 0.0],
-                aim: [PI, 0.0],
-                hp: Some(1400.0),
-                max_hp: Some(1400.0),
-                cubes: Some(0),
-                weapons: vec![WeaponKind::Gun],
-                charging: false,
-            },
-        ];
-
-        let act = bot.act(&obs);
-        let mv = act.move_dir.unwrap();
-        assert_eq!(bot.strategy.tactic, CombatTactic::PackKite);
-        assert!(
-            mv[0] < -0.3,
-            "should backpedal West (-x) away from 2-bot East pack, got {mv:?}"
-        );
-        assert!(act.fire.unwrap()[0], "must keep firing while pack-kiting");
-    }
-
-    #[test]
-    fn avoids_laser_self_slow_when_enemy_aiming_charging_laser() {
-        let (hello, mut obs) = load_sample_hello_and_obs();
-        let mut bot = Bot::new(hello);
-        obs.t = 45.0;
-        let mz = bot.map.ground_height(0.0, 0.0);
-        let ez = bot.map.ground_height(40.0, 0.0);
-        obs.self_obs.pos = [0.0, 0.0, mz];
-        obs.self_obs.hp = 1400.0;
-        obs.self_obs.max_hp = 1400.0;
-        obs.self_obs.energy = 100.0;
-        obs.self_obs.aim = direct_aim([0.0, 0.0, mz + 7.0], [40.0, 0.0, ez + 4.5]);
-        obs.self_obs.in_zone = true;
-        obs.zone.center = [0.0, 0.0];
-        obs.zone.radius = 400.0;
-        obs.zone.next_center = [0.0, 0.0];
-        obs.zone.next_radius = 350.0;
-        obs.zone.shrink_start = 90.0;
-
-        let gun = obs.self_obs.weapons[0].clone().unwrap();
-        let laser = WeaponObs {
-            kind: WeaponKind::Laser,
-            cooldown: 0.0,
-            ammo: None,
-            reload: None,
-            charge: Some(0.0),
-            stats: bot.config.weapons.laser.clone(),
-        };
-        obs.self_obs.weapons = vec![Some(gun), Some(laser)];
-        obs.mechs = vec![ActorObs {
-            id: 4,
-            kind: "mech".into(),
-            pos: [40.0, 0.0, ez],
-            vel: [0.0, 0.0, 0.0],
-            aim: [PI, 0.0], // aimed directly at us
-            hp: Some(1200.0),
-            max_hp: Some(1400.0),
-            cubes: Some(0),
-            weapons: vec![WeaponKind::Laser],
-            charging: true,
-        }];
-
-        let act = bot.act(&obs);
-        assert_eq!(
-            act.fire.unwrap(),
-            [true, false],
-            "must fire Gun without starting fresh Laser charge (0.5x self-slow) while enemy aims charging Laser at us"
         );
     }
 
@@ -1840,72 +1714,102 @@ mod tests {
     }
 
     #[test]
-    fn averages_velocity_for_reversing_juking_target() {
+    fn early_farm_explores_unvisited_50m_cells_until_10_cubes() {
         let (hello, mut obs) = load_sample_hello_and_obs();
         let mut bot = Bot::new(hello);
+        obs.t = 15.0;
         let mz = bot.map.ground_height(0.0, 0.0);
-        let ez = bot.map.ground_height(35.0, 0.0);
         obs.self_obs.pos = [0.0, 0.0, mz];
+        obs.self_obs.cubes = 2;
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
         obs.self_obs.in_zone = true;
         obs.zone.center = [0.0, 0.0];
         obs.zone.radius = 400.0;
         obs.zone.next_center = [0.0, 0.0];
         obs.zone.next_radius = 350.0;
         obs.zone.shrink_start = 90.0;
+        obs.mechs.clear();
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.sounds.clear();
 
-        // 1. Alternating A-D reversing target (+12 / -12 m/s every 0.2 s)
-        for i in 0..6u64 {
-            obs.t = 20.0 + (i as f64) * 0.20;
-            let vy = if i % 2 == 0 { 12.0 } else { -12.0 };
-            obs.mechs = vec![ActorObs {
-                id: 5,
-                kind: "mech".into(),
-                pos: [35.0, 0.0, ez],
-                vel: [0.0, vy, 0.0],
-                aim: [PI, 0.0],
-                hp: Some(1400.0),
-                max_hp: Some(1400.0),
-                cubes: Some(0),
-                weapons: vec![WeaponKind::Gun],
-                charging: false,
-            }];
-            bot.act(&obs);
+        // Mark origin and all western 50m cells as already visited
+        for cy in -6..=6 {
+            for cx in -6..=0 {
+                bot.world.visited_cells.insert((cx, cy));
+            }
         }
-        let juker = &bot.world.tracked_enemies[&5];
-        assert!(
-            juker.juke_score > 0.5,
-            "reversing enemy must raise juke_score, got {}",
-            juker.juke_score
-        );
-        let eff_juke = juker.effective_lead_vel();
-        assert!(
-            eff_juke[1].abs() < 8.0,
-            "juker effective lead velocity should damp below raw 12.0, got {:?}",
-            eff_juke
-        );
 
-        // 2. Steady-running enemy keeps full velocity lead
-        for i in 0..6u64 {
-            obs.t = 30.0 + (i as f64) * 0.20;
-            obs.mechs = vec![ActorObs {
-                id: 6,
-                kind: "mech".into(),
-                pos: [35.0, 0.0, ez],
-                vel: [0.0, 12.0, 0.0],
-                aim: [PI, 0.0],
-                hp: Some(1400.0),
-                max_hp: Some(1400.0),
-                cubes: Some(0),
-                weapons: vec![WeaponKind::Gun],
-                charging: false,
-            }];
-            bot.act(&obs);
-        }
-        let steady = &bot.world.tracked_enemies[&6];
-        assert_eq!(steady.juke_score, 0.0);
+        let act = bot.act(&obs);
+        assert_eq!(bot.strategy.posture, Posture::EarlyFarm);
+        let eg = bot
+            .strategy
+            .explore_goal
+            .expect("must select an unvisited 50m exploration goal");
         assert!(
-            (steady.effective_lead_vel()[1] - 12.0).abs() < 1e-9,
-            "steady target must use full 12.0 m/s lead velocity"
+            eg[0] > 20.0,
+            "explore_goal should favor unvisited East cells, got {eg:?}"
+        );
+        assert!(
+            act.move_dir.unwrap()[0] > 0.2,
+            "should move toward unvisited East cell, got {:?}",
+            act.move_dir
+        );
+    }
+
+    #[test]
+    fn pursues_15s_hunt_memory_after_enemy_leaves_tracking() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(0.0, 0.0);
+        let ez = bot.map.ground_height(-150.0, 0.0);
+        obs.t = 20.0;
+        obs.self_obs.pos = [0.0, 0.0, mz];
+        obs.self_obs.cubes = 10;
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [0.0, 0.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 90.0;
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.sounds.clear();
+        obs.mechs = vec![ActorObs {
+            id: 5,
+            kind: "mech".into(),
+            pos: [-150.0, 0.0, ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(900.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+        bot.act(&obs);
+
+        // Advance 5.0 s (past 4.5 s tracking retention, well within 15 s hunt memory)
+        obs.t = 25.0;
+        obs.mechs.clear();
+        let act = bot.act(&obs);
+        assert!(
+            bot.world.last_hunt_pos.is_some(),
+            "expired tracked enemy must populate 15 s last_hunt_pos"
+        );
+        assert_eq!(bot.strategy.posture, Posture::EarlyFarm);
+        assert_eq!(bot.strategy.tactic, CombatTactic::AggressivePush);
+        assert!(
+            act.move_dir.unwrap()[0] < -0.4,
+            "should hunt West (-x) toward last_hunt_pos at [-150, 0], got {:?}",
+            act.move_dir
         );
     }
 }

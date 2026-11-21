@@ -1,5 +1,7 @@
+use std::f64::consts::PI;
+
 use crate::combat::{weapon_desirability, TargetCandidate};
-use crate::geom::{angle_diff, dist2d, is_ground_level, unit2d};
+use crate::geom::{dist2d, is_ground_level, unit2d};
 use crate::map::Map;
 use crate::nav::{NavGrid, NavScratch};
 use crate::protocol::{stat, Config, DropObs, Observation, Offer, SelfObs, WeaponKind};
@@ -36,7 +38,6 @@ pub(crate) enum CombatTactic {
     AggressivePush,
     OpenStrafe,
     CoverAmbush,
-    PackKite,
 }
 
 impl CombatTactic {
@@ -48,7 +49,6 @@ impl CombatTactic {
             CombatTactic::AggressivePush => "PUSH",
             CombatTactic::OpenStrafe => "STRF",
             CombatTactic::CoverAmbush => "AMB",
-            CombatTactic::PackKite => "KITE",
         }
     }
 }
@@ -68,6 +68,8 @@ pub(crate) struct StrategyState {
     pub ambush_anchor: Option<[f64; 2]>,
     pub ambush_anchor_t: f64,
     pub prev_ambush_anchor: Option<[f64; 2]>,
+    pub explore_goal: Option<[f64; 2]>,
+    pub explore_goal_t: f64,
 }
 
 impl StrategyState {
@@ -87,6 +89,8 @@ impl StrategyState {
             ambush_anchor: None,
             ambush_anchor_t: -100.0,
             prev_ambush_anchor: None,
+            explore_goal: None,
+            explore_goal_t: -100.0,
         }
     }
 
@@ -189,7 +193,7 @@ impl StrategyState {
             }
         }
 
-        let Some((prio, _, pk_kind, pid)) = best_pickup else {
+        let Some((prio, _, _pk_kind, pid)) = best_pickup else {
             return (None, None);
         };
 
@@ -209,11 +213,6 @@ impl StrategyState {
         }
 
         let has_gun_upgrades = me.upgrades.iter().any(|u| u.starts_with("gun_"));
-        let holds_s_tier = me
-            .weapons
-            .iter()
-            .flatten()
-            .any(|w| matches!(w.kind, WeaponKind::Laser | WeaponKind::Lightning));
 
         let mut worst: Option<(u8, usize, WeaponKind)> = None;
         for (slot, wopt) in me.weapons.iter().enumerate().take(2) {
@@ -227,16 +226,8 @@ impl StrategyState {
 
         if let Some((worst_prio, worst_slot, worst_kind)) = worst {
             if prio > worst_prio {
-                if worst_kind == WeaponKind::Gun {
-                    if has_gun_upgrades {
-                        return (None, None);
-                    }
-                    let allow_gun_swap = obs.alive <= 13
-                        || (holds_s_tier
-                            && matches!(pk_kind, WeaponKind::Laser | WeaponKind::Lightning));
-                    if !allow_gun_swap {
-                        return (None, None);
-                    }
+                if worst_kind == WeaponKind::Gun && (has_gun_upgrades || obs.alive > 8) {
+                    return (None, None);
                 }
                 return (Some(pid), Some(worst_slot));
             }
@@ -572,96 +563,11 @@ impl StrategyState {
                     }
                 }
 
-                // B. 1v2+ Pack-Centroid Backpedal Kite & Anti-Crossfire Escape
-                if los_mech_count >= 2 {
-                    let (mut sum_x, mut sum_y) = (0.0, 0.0);
-                    for m in los_mechs {
-                        let u = unit2d(m.pos[0] - me.pos[0], m.pos[1] - me.pos[1]);
-                        let w = 1.0 / m.dist.max(15.0);
-                        sum_x += u[0] * w;
-                        sum_y += u[1] * w;
-                    }
-                    let avg_threat = unit2d(sum_x, sum_y);
-                    let primary_dir = if avg_threat[0].hypot(avg_threat[1]) > 0.1 {
-                        avg_threat
-                    } else {
-                        unit2d(
-                            los_mechs[0].pos[0] - me.pos[0],
-                            los_mechs[0].pos[1] - me.pos[1],
-                        )
-                    };
-                    let centroid_ang = primary_dir[1].atan2(primary_dir[0]);
-                    let max_spread = los_mechs
-                        .iter()
-                        .map(|m| {
-                            let b = (m.pos[1] - me.pos[1]).atan2(m.pos[0] - me.pos[0]);
-                            angle_diff(centroid_ang, b).abs()
-                        })
-                        .fold(0.0_f64, f64::max)
-                        * 2.0;
-
-                    if !immediate_kill_avail
-                        && (no_weapon_can_shoot_now
-                            || enemy_laser_duck
-                            || (me.hp < 0.62 * me.max_hp && max_spread > 2.0))
-                    {
-                        let threats: Vec<[f64; 3]> = los_mechs
-                            .iter()
-                            .map(|m| [m.pos[0], m.pos[1], m.pos[2] + 7.5])
-                            .collect();
-                        if let Some(cp) = nav.find_cover_point_within(
-                            map,
-                            me.pos,
-                            eye_h,
-                            &threats,
-                            obs.zone.center,
-                            obs.zone.radius,
-                            obs.zone.next_center,
-                            obs.zone.next_radius,
-                            42.0,
-                            None,
-                        ) {
-                            self.combat_cover_target = Some(cp);
-                            self.combat_cover_t = obs.t;
-                            self.tactic = CombatTactic::CoverDuck;
-                            let wp = self.follow_astar(nav, scratch, me_xy, cp, obs.t);
-                            return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), cp);
-                        }
-                    }
-
-                    // Active PackKite: backpedal away from threat centroid, dragging pack into single cone
-                    self.tactic = CombatTactic::PackKite;
-                    let away = [-primary_dir[0], -primary_dir[1]];
-                    let perp = [-away[1] * world.strafe_sign, away[0] * world.strafe_sign];
-                    let mut gx = away[0] * 0.90 + perp[0] * 0.45;
-                    let mut gy = away[1] * 0.90 + perp[1] * 0.45;
-                    if dist_next > safe_r * 0.85 {
-                        let zdir = unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]);
-                        gx += zdir[0] * 0.55;
-                        gy += zdir[1] * 0.55;
-                    }
-                    if let Some(corner) = nav.find_cover_anchor(
-                        me.pos,
-                        obs.zone.center,
-                        obs.zone.radius,
-                        nc,
-                        obs.zone.next_radius,
-                        None,
-                        28.0,
-                    ) {
-                        let cdir = unit2d(corner[0] - me.pos[0], corner[1] - me.pos[1]);
-                        if cdir[0] * primary_dir[0] + cdir[1] * primary_dir[1] < 0.25 {
-                            gx += cdir[0] * 0.25;
-                            gy += cdir[1] * 0.25;
-                        }
-                    }
-                    let dir = unit2d(gx, gy);
-                    let goal_pt = [me.pos[0] + dir[0] * 20.0, me.pos[1] + dir[1] * 20.0];
-                    return (dir, goal_pt);
-                }
-
-                // 1. CoverDuck (0/1 LOS): dry/reloading or enemy charging laser
-                if (no_weapon_can_shoot_now && !immediate_kill_avail) || enemy_laser_duck {
+                // 1. CoverDuck: outnumbered (2+ LOS), dry/reloading, or enemy charging laser
+                if (los_mech_count >= 2 && !immediate_kill_avail)
+                    || (no_weapon_can_shoot_now && !immediate_kill_avail)
+                    || enemy_laser_duck
+                {
                     if los_mech_count == 0
                         && (near_cover_14
                             || self.combat_cover_target.is_some_and(|cp| {
@@ -857,7 +763,7 @@ impl StrategyState {
             Posture::EarlyFarm => {}
         }
 
-        // EarlyFarm / fallback: cubes -> farm_target -> crates (if not regenerating) -> zone -> sound hunt -> active sweep
+        // EarlyFarm / fallback: cubes -> farm_target -> crates -> zone -> near sounds -> 50 m unvisited snowball -> 15 s hunt -> mid/far sounds -> sweep
         let regen_delay = stat(&me.stats, "regen_delay", 5.0);
         let protecting_regen = me.hp < 0.72 * me.max_hp
             && (obs.t - world.last_combat_t) >= 2.0
@@ -868,7 +774,7 @@ impl StrategyState {
             .iter()
             .filter(|c| {
                 is_ground_level(map, c.pos)
-                    && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 75.0
+                    && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 85.0
                     && dist2d(c.pos[0], c.pos[1], nc[0], nc[1]) <= obs.zone.next_radius - 5.0
             })
             .min_by(|a, b| {
@@ -902,7 +808,7 @@ impl StrategyState {
                 .iter()
                 .filter(|c| {
                     is_ground_level(map, c.pos)
-                        && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 95.0
+                        && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 115.0
                         && dist2d(c.pos[0], c.pos[1], nc[0], nc[1]) <= obs.zone.next_radius - 5.0
                 })
                 .min_by(|a, b| {
@@ -924,7 +830,99 @@ impl StrategyState {
             return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), nc);
         }
 
-        // Sound Hunting: proactively close toward gunfire/laser/footsteps when healthy
+        let clamp_next_safe = |mut px: f64, mut py: f64| -> [f64; 2] {
+            let hunt_safe_r = (obs.zone.next_radius - 18.0).max(0.0);
+            let dh_nc = dist2d(px, py, nc[0], nc[1]);
+            if dh_nc > hunt_safe_r {
+                if hunt_safe_r > 1.0 {
+                    let s = hunt_safe_r / dh_nc;
+                    px = nc[0] + (px - nc[0]) * s;
+                    py = nc[1] + (py - nc[1]) * s;
+                } else {
+                    px = nc[0];
+                    py = nc[1];
+                }
+            }
+            [px, py]
+        };
+
+        // Near sound hunt (< 60 m): immediate push while healthy
+        if world.is_huntable_sound(obs.t) && world.last_sound_is_near && me.hp >= 0.60 * me.max_hp
+        {
+            if let Some(b) = world.last_sound_bearing {
+                let goal = clamp_next_safe(me.pos[0] + b.cos() * 75.0, me.pos[1] + b.sin() * 75.0);
+                self.tactic = CombatTactic::AggressivePush;
+                let wp = self.follow_astar(nav, scratch, me_xy, goal, obs.t);
+                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), goal);
+            }
+        }
+
+        // Early-game 50 m unvisited-grid cube snowball until 10 cubes (or t >= 200 s)
+        if me.cubes < 10 && obs.t < 200.0 {
+            let explore_invalid = self.explore_goal.is_none_or(|g| {
+                obs.zone.next_radius > 24.0
+                    && dist2d(g[0], g[1], nc[0], nc[1]) > (obs.zone.next_radius - 16.0).max(0.0)
+            });
+            let arrived_explore = self
+                .explore_goal
+                .is_some_and(|g| dist2d(me.pos[0], me.pos[1], g[0], g[1]) <= 22.0);
+            let timed_explore = obs.t - self.explore_goal_t >= 10.0;
+
+            if explore_invalid || arrived_explore || timed_explore {
+                let safe_ex_r = (obs.zone.next_radius - 20.0).max(0.0);
+                let base_ang = ((obs.tick % 64) as f64) * 0.37;
+                let mut best_ex: Option<(f64, [f64; 2])> = None;
+
+                for k in 0..16 {
+                    let theta = base_ang + (k as f64) * (2.0 * PI / 16.0);
+                    let rad = if k % 2 == 0 { 85.0 } else { 150.0 };
+                    let px = me.pos[0] + theta.cos() * rad;
+                    let py = me.pos[1] + theta.sin() * rad;
+                    if obs.zone.next_radius > 24.0 && dist2d(px, py, nc[0], nc[1]) > safe_ex_r {
+                        continue;
+                    }
+                    let (cx, cy) = nav.world_to_cell(px, py);
+                    if !nav.walkable[cy * nav.nx + cx] {
+                        continue;
+                    }
+                    let cell = ((px / 50.0).floor() as i32, (py / 50.0).floor() as i32);
+                    let mut score = if !world.visited_cells.contains(&cell) {
+                        120.0
+                    } else {
+                        0.0
+                    };
+                    for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                        if !world.visited_cells.contains(&(cell.0 + dx, cell.1 + dy)) {
+                            score += 25.0;
+                        }
+                    }
+                    score -= 0.12 * rad;
+                    if best_ex.is_none_or(|(bs, _)| score > bs) {
+                        best_ex = Some((score, [px, py]));
+                    }
+                }
+
+                self.explore_goal = best_ex.map(|(_, pt)| pt);
+                self.explore_goal_t = obs.t;
+            }
+
+            if let Some(eg) = self.explore_goal {
+                let wp = self.follow_astar(nav, scratch, me_xy, eg, obs.t);
+                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), eg);
+            }
+        }
+
+        // 15 s hunt memory after enemy leaves 4.5 s tracking
+        if me.hp >= 0.62 * me.max_hp {
+            if let Some((hpos, _)) = world.last_hunt_pos {
+                let goal = clamp_next_safe(hpos[0], hpos[1]);
+                self.tactic = CombatTactic::AggressivePush;
+                let wp = self.follow_astar(nav, scratch, me_xy, goal, obs.t);
+                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), goal);
+            }
+        }
+
+        // Mid/far sound hunting when healthy
         if world.is_huntable_sound(obs.t) && me.hp >= 0.62 * me.max_hp {
             if let Some(b) = world.last_sound_bearing {
                 let hunt_d = match world.last_sound_dist.as_str() {
@@ -932,22 +930,8 @@ impl StrategyState {
                     "mid" => 125.0,
                     _ => 145.0,
                 };
-                let mut hx = me.pos[0] + b.cos() * hunt_d;
-                let mut hy = me.pos[1] + b.sin() * hunt_d;
-                let hunt_safe_r = (obs.zone.next_radius - 18.0).max(0.0);
-                let dh_nc = dist2d(hx, hy, nc[0], nc[1]);
-                if dh_nc > hunt_safe_r {
-                    if hunt_safe_r > 1.0 {
-                        let s = hunt_safe_r / dh_nc;
-                        hx = nc[0] + (hx - nc[0]) * s;
-                        hy = nc[1] + (hy - nc[1]) * s;
-                    } else {
-                        hx = nc[0];
-                        hy = nc[1];
-                    }
-                }
+                let goal = clamp_next_safe(me.pos[0] + b.cos() * hunt_d, me.pos[1] + b.sin() * hunt_d);
                 self.tactic = CombatTactic::AggressivePush;
-                let goal = [hx, hy];
                 let wp = self.follow_astar(nav, scratch, me_xy, goal, obs.t);
                 return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), goal);
             }
@@ -1083,11 +1067,6 @@ impl StrategyState {
         let me = &obs.self_obs;
         let slot1_empty = me.weapons.get(1).and_then(|w| w.as_ref()).is_none();
         let has_gun_upgrades = me.upgrades.iter().any(|u| u.starts_with("gun_"));
-        let holds_s_tier = me
-            .weapons
-            .iter()
-            .flatten()
-            .any(|w| matches!(w.kind, WeaponKind::Laser | WeaponKind::Lightning));
 
         let worst_held = me
             .weapons
@@ -1134,16 +1113,8 @@ impl StrategyState {
                 if prio <= worst_prio || any_los_enemy {
                     continue;
                 }
-                if worst_kind == WeaponKind::Gun {
-                    if has_gun_upgrades {
-                        continue;
-                    }
-                    let allow_gun_swap = obs.alive <= 13
-                        || (holds_s_tier
-                            && matches!(kind, WeaponKind::Laser | WeaponKind::Lightning));
-                    if !allow_gun_swap {
-                        continue;
-                    }
+                if worst_kind == WeaponKind::Gun && (has_gun_upgrades || obs.alive > 8) {
+                    continue;
                 }
             }
 

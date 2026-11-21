@@ -15,7 +15,6 @@ pub(crate) struct TargetCandidate {
     pub id: u64,
     pub kind: TargetKind,
     pub pos: [f64; 3],
-    #[allow(dead_code)]
     pub vel: [f64; 3],
     pub est_accel_z: f64,
     pub aim: [f64; 2],
@@ -23,7 +22,6 @@ pub(crate) struct TargetCandidate {
     pub com_z: f64,
     pub aim_z: f64,
     pub aim_half_h: f64,
-    pub lead_vel: [f64; 3],
     pub radius: f64,
     pub hp: f64,
     pub max_hp: f64,
@@ -81,7 +79,6 @@ pub(crate) fn select_targets(
             let radius = base_mech_r * scale;
             let tracked = world.tracked_enemies.get(&actor.id);
             let est_az = tracked.map(|e| e.est_accel_z).unwrap_or(0.0);
-            let lead_vel = tracked.map(|e| e.effective_lead_vel()).unwrap_or(actor.vel);
             let is_reloading = tracked.is_some_and(|e| e.is_reloading(obs.t));
             let is_laser_on_cd = tracked.is_some_and(|e| e.is_laser_on_cd(obs.t));
             let is_vulnerable = tracked.is_some_and(|e| e.is_vulnerable(obs.t));
@@ -96,7 +93,6 @@ pub(crate) fn select_targets(
                 com_z,
                 aim_z,
                 aim_half_h,
-                lead_vel,
                 radius,
                 hp: actor.hp.unwrap_or(1400.0),
                 max_hp: actor.max_hp.unwrap_or(1400.0),
@@ -109,7 +105,7 @@ pub(crate) fn select_targets(
                 is_vulnerable,
             });
         } else if actor.kind == "npc"
-            && d <= 110.0
+            && d <= 125.0
             && me.hp > 0.45 * me.max_hp
             && obs.t - world.last_damage_t > 2.5
             && !protecting_regen
@@ -126,7 +122,6 @@ pub(crate) fn select_targets(
                     com_z,
                     aim_z: com_z,
                     aim_half_h: (com_z - actor.pos[2]).max(1.0),
-                    lead_vel: actor.vel,
                     radius: npc_r,
                     hp: actor.hp.unwrap_or(350.0),
                     max_hp: actor.max_hp.unwrap_or(350.0),
@@ -153,7 +148,7 @@ pub(crate) fn select_targets(
     {
         for c in &obs.crates {
             let d = dist3d(muzzle, c.pos);
-            if d > 85.0 {
+            if d > 110.0 {
                 continue;
             }
             let com_z = c.pos[2] + 0.5 * crate_h;
@@ -168,7 +163,6 @@ pub(crate) fn select_targets(
                     com_z,
                     aim_z: com_z,
                     aim_half_h: (com_z - c.pos[2]).max(1.0),
-                    lead_vel: [0.0, 0.0, 0.0],
                     radius: crate_r,
                     hp: c.hp.unwrap_or(300.0),
                     max_hp: 300.0,
@@ -217,14 +211,14 @@ pub(crate) fn pick_best_mech_target(
             continue;
         }
         let mut score = 150.0 - c.dist;
-        score += (c.max_hp - c.hp).max(0.0) * 0.38;
-        if c.hp <= 280.0 {
-            score += 260.0;
+        score += (c.max_hp - c.hp).max(0.0) * 0.35;
+        if c.hp <= 320.0 {
+            score += 200.0;
         } else if c.hp <= 520.0 {
-            score += 160.0;
+            score += 120.0;
         }
         if last_target_id == Some(c.id) && c.hp < 0.90 * c.max_hp {
-            score += 45.0;
+            score += 35.0;
         }
         if c.is_reloading {
             score += 55.0;
@@ -275,8 +269,6 @@ pub(crate) fn eval_combat(
     min_pitch: f64,
     max_pitch: f64,
     mech_cands: &[TargetCandidate],
-    los_mech_count: usize,
-    avoid_laser_slow: bool,
     tgt: &TargetCandidate,
 ) -> ([bool; 2], bool, Option<[f64; 2]>, Option<[f64; 3]>) {
     let me = &obs.self_obs;
@@ -345,7 +337,7 @@ pub(crate) fn eval_combat(
             eval_laser(map, config, me.aim, muzzle, me.cubes, w, tgt, min_pitch, max_pitch);
         fire[ls] = should_hold;
 
-        if should_hold && charge < full_charge - 0.22 {
+        if should_hold && charge < full_charge - 0.20 {
             if let Some(gs) = gun_slot {
                 let (g_aim, g_fire, g_rel, g_ready) = eval_gun_slot(gs);
                 if g_ready {
@@ -405,33 +397,31 @@ pub(crate) fn eval_combat(
             fire[lts] = lt_fire;
             chosen_aim = Some(lt_aim);
 
-            // Simultaneous Lightning + Laser charge at <= 45 m when Laser is off cooldown (unless avoiding self-slow)
-            if !avoid_laser_slow && los_mech_count == 1 {
-                if let Some(ls) = laser_slot {
-                    let lw = me.weapons[ls].as_ref().unwrap();
-                    let l_range = stat(&lw.stats, "range", 280.0);
-                    let allow_laser_farm = matches!(tgt.kind, TargetKind::Npc | TargetKind::Crate)
-                        && me.hp > 0.6 * me.max_hp;
-                    if tgt.dist <= l_range - 2.0
-                        && lw.cooldown <= 0.08
-                        && (matches!(tgt.kind, TargetKind::Mech) || allow_laser_farm)
-                        && me.hp > 0.45 * me.max_hp
-                        && !tgt.charging
-                    {
-                        let (l_aim, should_hold) = eval_laser(
-                            map,
-                            config,
-                            me.aim,
-                            muzzle,
-                            me.cubes,
-                            lw,
-                            tgt,
-                            min_pitch,
-                            max_pitch,
-                        );
-                        fire[ls] = should_hold;
-                        chosen_aim = Some(l_aim);
-                    }
+            // Simultaneous Lightning + Laser charge at <= 45 m when Laser is off cooldown
+            if let Some(ls) = laser_slot {
+                let lw = me.weapons[ls].as_ref().unwrap();
+                let l_range = stat(&lw.stats, "range", 280.0);
+                let allow_laser_farm = matches!(tgt.kind, TargetKind::Npc | TargetKind::Crate)
+                    && me.hp > 0.55 * me.max_hp;
+                if tgt.dist <= l_range - 2.0
+                    && lw.cooldown <= 0.08
+                    && (matches!(tgt.kind, TargetKind::Mech) || allow_laser_farm)
+                    && me.hp > 0.35 * me.max_hp
+                    && !tgt.charging
+                {
+                    let (l_aim, should_hold) = eval_laser(
+                        map,
+                        config,
+                        me.aim,
+                        muzzle,
+                        me.cubes,
+                        lw,
+                        tgt,
+                        min_pitch,
+                        max_pitch,
+                    );
+                    fire[ls] = should_hold;
+                    chosen_aim = Some(l_aim);
                 }
             }
 
@@ -439,35 +429,33 @@ pub(crate) fn eval_combat(
         }
     }
 
-    // 3. Laser ready check (avoid 0.5x speed self-slow while dodging laser beam or kiting 2+ low HP)
-    if !avoid_laser_slow {
-        if let Some(ls) = laser_slot {
-            let w = me.weapons[ls].as_ref().unwrap();
-            let l_range = stat(&w.stats, "range", 280.0);
-            let allow_laser_farm =
-                matches!(tgt.kind, TargetKind::Npc | TargetKind::Crate) && me.hp > 0.6 * me.max_hp;
-            if tgt.has_los
-                && tgt.dist <= l_range - 2.0
-                && w.cooldown <= 0.08
-                && (matches!(tgt.kind, TargetKind::Mech) || allow_laser_farm)
-            {
-                let (l_aim, should_hold) =
-                    eval_laser(map, config, me.aim, muzzle, me.cubes, w, tgt, min_pitch, max_pitch);
-                fire[ls] = should_hold;
-                if let Some(gs) = gun_slot {
-                    let (g_aim, g_fire, g_rel, g_ready) = eval_gun_slot(gs);
-                    reload = g_rel;
-                    if g_ready {
-                        chosen_aim = Some(g_aim);
-                        fire[gs] = g_fire;
-                    } else {
-                        chosen_aim = Some(l_aim);
-                    }
+    // 3. Laser ready check
+    if let Some(ls) = laser_slot {
+        let w = me.weapons[ls].as_ref().unwrap();
+        let l_range = stat(&w.stats, "range", 280.0);
+        let allow_laser_farm =
+            matches!(tgt.kind, TargetKind::Npc | TargetKind::Crate) && me.hp > 0.55 * me.max_hp;
+        if tgt.has_los
+            && tgt.dist <= l_range - 2.0
+            && w.cooldown <= 0.08
+            && (matches!(tgt.kind, TargetKind::Mech) || allow_laser_farm)
+        {
+            let (l_aim, should_hold) =
+                eval_laser(map, config, me.aim, muzzle, me.cubes, w, tgt, min_pitch, max_pitch);
+            fire[ls] = should_hold;
+            if let Some(gs) = gun_slot {
+                let (g_aim, g_fire, g_rel, g_ready) = eval_gun_slot(gs);
+                reload = g_rel;
+                if g_ready {
+                    chosen_aim = Some(g_aim);
+                    fire[gs] = g_fire;
                 } else {
                     chosen_aim = Some(l_aim);
                 }
-                return (fire, reload, chosen_aim, debug_pt);
+            } else {
+                chosen_aim = Some(l_aim);
             }
+            return (fire, reload, chosen_aim, debug_pt);
         }
     }
 
@@ -605,7 +593,7 @@ fn eval_gun(
         map,
         muzzle,
         tgt.pos,
-        tgt.lead_vel,
+        tgt.vel,
         tgt.est_accel_z,
         tgt.aim_z - tgt.pos[2],
         gravity,
@@ -673,10 +661,10 @@ pub(crate) fn eval_laser(
     max_pitch: f64,
 ) -> ([f64; 2], bool) {
     let aim_off = tgt.aim_z - tgt.pos[2];
-    let hit_x = tgt.pos[0] + tgt.lead_vel[0] * 0.05;
-    let hit_y = tgt.pos[1] + tgt.lead_vel[1] * 0.05;
+    let hit_x = tgt.pos[0] + tgt.vel[0] * 0.05;
+    let hit_y = tgt.pos[1] + tgt.vel[1] * 0.05;
     let surf_hit = map.surface_height(hit_x, hit_y, tgt.pos[2]) + aim_off;
-    let hit_z = (tgt.aim_z + tgt.lead_vel[2] * 0.05).max(surf_hit);
+    let hit_z = (tgt.aim_z + tgt.vel[2] * 0.05).max(surf_hit);
     let hit_pt = [hit_x, hit_y, hit_z];
     let mut aim = direct_aim(muzzle, hit_pt);
     aim[1] = aim[1].clamp(min_pitch, max_pitch);
@@ -721,8 +709,8 @@ pub(crate) fn eval_laser(
     let expected_dmg = damage * frac * cube_mult * cookoff_mult * rear_mult;
 
     let future_pt = [
-        tgt.pos[0] + tgt.lead_vel[0] * 0.25,
-        tgt.pos[1] + tgt.lead_vel[1] * 0.25,
+        tgt.pos[0] + tgt.vel[0] * 0.25,
+        tgt.pos[1] + tgt.vel[1] * 0.25,
         tgt.aim_z,
     ];
     let losing_los = tgt.has_los && !map.has_los(muzzle, future_pt);
@@ -770,7 +758,8 @@ fn lightning_energy_ok(
 #[inline]
 pub(crate) fn weapon_desirability(kind: WeaponKind) -> u8 {
     match kind {
-        WeaponKind::Laser | WeaponKind::Lightning => 4,
+        WeaponKind::Lightning => 4,
+        WeaponKind::Laser => 3,
         WeaponKind::Gun => 2,
         WeaponKind::Mortar => 0,
     }

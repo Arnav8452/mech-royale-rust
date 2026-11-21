@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::geom::{angle_diff, dist2d, dist3d, is_ground_level};
 use crate::map::Map;
@@ -8,8 +8,6 @@ use crate::protocol::{stat, Config, GameEvent, Observation, WeaponKind};
 pub(crate) struct TrackedEnemy {
     pub pos: [f64; 3],
     pub vel: [f64; 3],
-    pub ema_vel: [f64; 2],
-    pub juke_score: f64,
     pub est_accel_z: f64,
     pub aim: [f64; 2],
     #[allow(dead_code)]
@@ -54,20 +52,12 @@ impl TrackedEnemy {
         let has_laser = self.weapons.contains(&WeaponKind::Laser);
         (has_gun && self.is_reloading(t)) || (has_laser && self.is_laser_on_cd(t) && !self.charging)
     }
-
-    #[inline]
-    pub fn effective_lead_vel(&self) -> [f64; 3] {
-        let blend = (self.juke_score * 0.75).clamp(0.0, 0.75);
-        [
-            self.vel[0] * (1.0 - blend) + self.ema_vel[0] * blend,
-            self.vel[1] * (1.0 - blend) + self.ema_vel[1] * blend,
-            self.vel[2],
-        ]
-    }
 }
 
 pub(crate) struct WorldState {
     pub tracked_enemies: HashMap<u64, TrackedEnemy>,
+    pub visited_cells: HashSet<(i32, i32)>,
+    pub last_hunt_pos: Option<([f64; 2], f64)>,
     pub seen_proj_ids: HashMap<u64, f64>,
     pub last_pickup_seen: HashMap<u64, (WeaponKind, [f64; 3], f64)>,
     pub blacklisted_pickups: HashMap<u64, f64>,
@@ -99,6 +89,8 @@ impl WorldState {
         let strafe_sign = if seed % 2 == 0 { 1.0 } else { -1.0 };
         Self {
             tracked_enemies: HashMap::new(),
+            visited_cells: HashSet::new(),
+            last_hunt_pos: None,
             seen_proj_ids: HashMap::new(),
             last_pickup_seen: HashMap::new(),
             blacklisted_pickups: HashMap::new(),
@@ -135,6 +127,16 @@ impl WorldState {
         let gun_reload_s = stat(&config.weapons.gun, "reload", 2.4);
         let gun_mag = stat(&config.weapons.gun, "mag", 12.0).round().max(1.0) as u8;
         let laser_cd_s = stat(&config.weapons.laser, "cooldown", 1.65);
+
+        self.visited_cells.insert((
+            (me.pos[0] / 50.0).floor() as i32,
+            (me.pos[1] / 50.0).floor() as i32,
+        ));
+        if let Some((hpos, ht)) = self.last_hunt_pos {
+            if t - ht > 15.0 || dist2d(me.pos[0], me.pos[1], hpos[0], hpos[1]) <= 22.0 {
+                self.last_hunt_pos = None;
+            }
+        }
 
         self.blacklisted_pickups.retain(|_, exp_t| t - *exp_t <= 15.0);
 
@@ -176,6 +178,9 @@ impl WorldState {
                     if self.last_target_id == Some(*target) {
                         self.last_target_id = None;
                     }
+                    if self.tracked_enemies.is_empty() {
+                        self.last_hunt_pos = None;
+                    }
                 }
                 _ => {}
             }
@@ -186,68 +191,28 @@ impl WorldState {
             if actor.kind != "mech" {
                 continue;
             }
-            let (
-                est_az,
-                ema_vel,
-                juke_score,
-                mut gun_reload_until,
-                mut laser_cd_until,
-                est_gun_shots,
-                last_gun_shot_t,
-            ) = if let Some(prev) = self.tracked_enemies.get(&actor.id) {
-                let dt = t - prev.last_seen_t;
-                let in_win = (0.04..=0.5).contains(&dt);
-                let az = if in_win {
-                    0.5 * prev.est_accel_z + 0.5 * ((actor.vel[2] - prev.vel[2]) / dt)
-                } else {
-                    0.0
-                };
-                let (ema, juke) = if in_win {
-                    let alpha = 0.28;
-                    let ema = [
-                        prev.ema_vel[0] * (1.0 - alpha) + actor.vel[0] * alpha,
-                        prev.ema_vel[1] * (1.0 - alpha) + actor.vel[1] * alpha,
-                    ];
-                    let mut j = prev.juke_score * (-dt / 1.2).exp();
-                    let ps = prev.vel[0].hypot(prev.vel[1]);
-                    let cs = actor.vel[0].hypot(actor.vel[1]);
-                    let dv = (actor.vel[0] - prev.vel[0]).hypot(actor.vel[1] - prev.vel[1]);
-                    let sharp_turn = ps > 3.5
-                        && cs > 3.5
-                        && ((prev.vel[0] * actor.vel[0] + prev.vel[1] * actor.vel[1]) / (ps * cs))
-                            < 0.45;
-                    let strong_snap = dv / dt > 25.0;
-                    if sharp_turn || strong_snap {
-                        j = (j + 0.55).min(1.0);
+            let (est_az, mut gun_reload_until, mut laser_cd_until, est_gun_shots, last_gun_shot_t) =
+                if let Some(prev) = self.tracked_enemies.get(&actor.id) {
+                    let dt = t - prev.last_seen_t;
+                    let az = if (0.04..=0.5).contains(&dt) {
+                        0.5 * prev.est_accel_z + 0.5 * ((actor.vel[2] - prev.vel[2]) / dt)
+                    } else {
+                        0.0
+                    };
+                    let mut lcd = prev.laser_cd_until;
+                    if prev.charging && !actor.charging && dt <= 0.35 {
+                        lcd = lcd.max(t + laser_cd_s);
                     }
-                    (ema, j)
+                    (
+                        az,
+                        prev.gun_reload_until,
+                        lcd,
+                        prev.est_gun_shots,
+                        prev.last_gun_shot_t,
+                    )
                 } else {
-                    ([actor.vel[0], actor.vel[1]], 0.0)
+                    (0.0, -100.0, -100.0, 0, -100.0)
                 };
-                let mut lcd = prev.laser_cd_until;
-                if prev.charging && !actor.charging && dt <= 0.35 {
-                    lcd = lcd.max(t + laser_cd_s);
-                }
-                (
-                    az,
-                    ema,
-                    juke,
-                    prev.gun_reload_until,
-                    lcd,
-                    prev.est_gun_shots,
-                    prev.last_gun_shot_t,
-                )
-            } else {
-                (
-                    0.0,
-                    [actor.vel[0], actor.vel[1]],
-                    0.0,
-                    -100.0,
-                    -100.0,
-                    0,
-                    -100.0,
-                )
-            };
 
             if !actor.weapons.contains(&WeaponKind::Gun) {
                 gun_reload_until = -100.0;
@@ -261,8 +226,6 @@ impl WorldState {
                 TrackedEnemy {
                     pos: actor.pos,
                     vel: actor.vel,
-                    ema_vel,
-                    juke_score,
                     est_accel_z: est_az,
                     aim: actor.aim,
                     hp: actor.hp.unwrap_or(1400.0),
@@ -277,7 +240,20 @@ impl WorldState {
                 },
             );
         }
+        for e in self.tracked_enemies.values() {
+            if t - e.last_seen_t > 4.5 {
+                let dominated = self
+                    .last_hunt_pos
+                    .is_some_and(|(_, ht)| ht >= e.last_seen_t);
+                if !dominated {
+                    self.last_hunt_pos = Some(([e.pos[0], e.pos[1]], e.last_seen_t));
+                }
+            }
+        }
         self.tracked_enemies.retain(|_, e| t - e.last_seen_t <= 4.5);
+        if !self.tracked_enemies.is_empty() {
+            self.last_hunt_pos = None;
+        }
         if let Some(tid) = self.last_target_id {
             if !self.tracked_enemies.contains_key(&tid) {
                 self.last_target_id = None;
