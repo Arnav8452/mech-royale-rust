@@ -109,7 +109,7 @@ impl WorldState {
             last_strafe_flip_t: -100.0,
             next_strafe_flip_t: -100.0,
             juke_boost_until: -100.0,
-            rng_state: (seed ^ 0x9E37_79B9_7F4A_7C15).max(1),
+            rng_state: (seed ^ 0x2545_F491_4F6C_DD1D).max(1),
             pos_history: VecDeque::with_capacity(7),
             cmd_move_streak: 0,
             unstuck_air_boost_until: -100.0,
