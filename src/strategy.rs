@@ -777,22 +777,22 @@ impl StrategyState {
                         && me.hp > 0.30 * me.max_hp
                         && (!have_laser || e.dist <= 80.0 || e.charging)
                     {
-                        30.0
+                        36.0
                     } else if enemy_has_lightning && !has_lightning {
-                        54.0
+                        62.0
                     } else if enemy_has_laser && !have_laser {
-                        42.0
+                        48.0
                     } else if me.hp < 0.40 * me.max_hp {
-                        68.0
+                        74.0
                     } else {
-                        44.0
+                        62.0
                     };
 
                     let d2 = dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]);
                     let (pref_dist, push_w) = if e.is_vulnerable || e.hp <= 480.0 {
                         self.tactic = CombatTactic::AggressivePush;
                         ((base_pref_dist - 10.0).max(22.0), 0.78)
-                    } else if has_lightning && me.energy > 20.0 && d2 > 42.0 && base_pref_dist <= 32.0
+                    } else if has_lightning && me.energy > 20.0 && d2 > 42.0 && base_pref_dist <= 38.0
                     {
                         self.tactic = CombatTactic::AggressivePush;
                         (base_pref_dist, 0.80)

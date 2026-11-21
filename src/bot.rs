@@ -39,7 +39,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m10-boost".to_string(),
+            name: "rust-bot-m10-orb62".to_string(),
             config: hello.config,
             map,
             nav,
@@ -2094,6 +2094,67 @@ mod tests {
             act_lt.boost,
             Some(false),
             "must save energy for Lightning DPS inside range"
+        );
+    }
+
+    #[test]
+    fn orbits_at_62m_with_gun_to_outrun_bullets() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let p_me = [-45.0, 0.0];
+        let p_44 = [-89.0, 0.0];
+        let mz = bot.map.ground_height(p_me[0], p_me[1]);
+        let ez44 = bot.map.ground_height(p_44[0], p_44[1]);
+        obs.t = 30.0;
+        obs.self_obs.pos = [p_me[0], p_me[1], mz];
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 100.0;
+        obs.self_obs.grounded = true;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [0.0, 0.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 120.0;
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.mechs = vec![ActorObs {
+            id: 5,
+            kind: "mech".into(),
+            pos: [p_44[0], p_44[1], ez44],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1200.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+
+        // At 44 m with Gun only: must kite outward toward 62 m while orbiting tangentially
+        let act_44 = bot.act(&obs);
+        let mv_44 = act_44.move_dir.unwrap();
+        let to_e = [-1.0_f64, 0.0];
+        let radial_dot = to_e[0] * mv_44[0] + to_e[1] * mv_44[1];
+        assert!(
+            radial_dot < -0.25 && mv_44[1].abs() > 0.5,
+            "at 44 m with Gun must back out toward 62 m while orbiting, got {mv_44:?}"
+        );
+
+        // At 62 m: purely tangential orbit in sweet spot
+        obs.t = 30.2;
+        let p_62 = [-107.0, 0.0];
+        let ez62 = bot.map.ground_height(p_62[0], p_62[1]);
+        obs.mechs[0].pos = [p_62[0], p_62[1], ez62];
+        let act_62 = bot.act(&obs);
+        let mv_62 = act_62.move_dir.unwrap();
+        let radial_dot_62 = to_e[0] * mv_62[0] + to_e[1] * mv_62[1];
+        assert!(
+            radial_dot_62.abs() < 0.15 && mv_62[1].abs() > 0.90,
+            "at 62 m must hold pure tangential orbit, got {mv_62:?}"
         );
     }
 }
