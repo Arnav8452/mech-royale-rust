@@ -490,6 +490,7 @@ impl Map {
         true
     }
 
+    #[allow(dead_code)]
     pub fn has_mortar_arc_clearance(
         &self,
         start: [f64; 3],
