@@ -15,7 +15,8 @@ pub(crate) fn steer(
     last_move: [f64; 2],
     mech_radius: f64,
     mech_height: f64,
-) -> ([f64; 2], bool, bool) {
+    strafe_sign: f64,
+) -> ([f64; 2], bool, bool, bool) {
     let me = &obs.self_obs;
     let step_up = stat(&me.stats, "step_up", 1.2);
     let max_slope_rad = stat(&me.stats, "max_slope_deg", 50.0).to_radians();
@@ -24,14 +25,48 @@ pub(crate) fn steer(
     let splash_r = stat(&config.weapons.mortar, "splash_radius", 7.0);
 
     let mut mortar_threats: Vec<[f64; 2]> = Vec::new();
+    let mut bullet_escapes: Vec<([f64; 2], f64)> = Vec::new();
     for proj in &obs.projectiles {
-        if proj.kind != "mortar" {
-            continue;
-        }
-        if let Some(impact) = predict_mortar_impact(map, proj.pos, proj.vel, mortar_g) {
-            if dist2d(me.pos[0], me.pos[1], impact[0], impact[1]) <= splash_r + 10.0 {
-                mortar_threats.push(impact);
+        if proj.kind == "mortar" {
+            if let Some(impact) = predict_mortar_impact(map, proj.pos, proj.vel, mortar_g) {
+                if dist2d(me.pos[0], me.pos[1], impact[0], impact[1]) <= splash_r + 10.0 {
+                    mortar_threats.push(impact);
+                }
             }
+        } else if proj.kind == "gun" || proj.kind == "npc" {
+            let speed_xy = proj.vel[0].hypot(proj.vel[1]);
+            if speed_xy <= 30.0 {
+                continue;
+            }
+            let dir_p = [proj.vel[0] / speed_xy, proj.vel[1] / speed_xy];
+            let rel = [me.pos[0] - proj.pos[0], me.pos[1] - proj.pos[1]];
+            let along = rel[0] * dir_p[0] + rel[1] * dir_p[1];
+            if along <= 0.0 {
+                continue;
+            }
+            let t_hit = along / speed_xy;
+            if !(0.06..=0.65).contains(&t_hit) {
+                continue;
+            }
+            let bz = proj.pos[2] + proj.vel[2] * t_hit;
+            if bz < me.pos[2] - 1.0 || bz > me.pos[2] + mech_height + 1.5 {
+                continue;
+            }
+            let perp_left = [-dir_p[1], dir_p[0]];
+            let signed_perp = rel[0] * perp_left[0] + rel[1] * perp_left[1];
+            if signed_perp.abs() > mech_radius + 2.2 {
+                continue;
+            }
+            let sign = if signed_perp.abs() < 0.25 {
+                strafe_sign
+            } else if signed_perp > 0.0 {
+                1.0
+            } else {
+                -1.0
+            };
+            let esc = [perp_left[0] * sign, perp_left[1] * sign];
+            let urgency = 2.0 * (1.0 - (t_hit / 0.65).clamp(0.0, 0.7));
+            bullet_escapes.push((esc, urgency));
         }
     }
 
@@ -51,9 +86,10 @@ pub(crate) fn steer(
 
     let aimed_laser_dodge = !laser_threats.is_empty();
     let dodged_hazard = !mortar_threats.is_empty() || aimed_laser_dodge;
+    let dodged_bullet = !bullet_escapes.is_empty();
 
-    if goal_dir[0].hypot(goal_dir[1]) < 0.05 && !dodged_hazard {
-        return ([0.0, 0.0], false, false);
+    if goal_dir[0].hypot(goal_dir[1]) < 0.05 && !dodged_hazard && !dodged_bullet {
+        return ([0.0, 0.0], false, false, false);
     }
 
     let on_ground_here =
@@ -117,6 +153,10 @@ pub(crate) fn steer(
             score += 3.5 * cross;
         }
 
+        for &(esc, w) in &bullet_escapes {
+            score += w * (dir[0] * esc[0] + dir[1] * esc[1]);
+        }
+
         if aimed_laser_dodge && ok_near {
             let nx3 = me.pos[0] + dir[0] * 3.5;
             let ny3 = me.pos[1] + dir[1] * 3.5;
@@ -132,7 +172,7 @@ pub(crate) fn steer(
         }
     }
 
-    (best_dir, dodged_hazard, aimed_laser_dodge)
+    (best_dir, dodged_hazard, aimed_laser_dodge, dodged_bullet)
 }
 
 fn predict_mortar_impact(map: &Map, pos: [f64; 3], vel: [f64; 3], g: f64) -> Option<[f64; 2]> {

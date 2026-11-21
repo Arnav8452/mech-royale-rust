@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m5".to_string(),
+            name: "rust-bot-m5b".to_string(),
             config: hello.config,
             map,
             nav,
@@ -193,7 +193,7 @@ impl Bot {
         }
 
         // Context Steering
-        let (move_dir, dodged_hazard, aimed_laser_dodge) = steering::steer(
+        let (move_dir, dodged_hazard, aimed_laser_dodge, dodged_bullet) = steering::steer(
             &self.map,
             &self.nav,
             &self.config,
@@ -202,6 +202,7 @@ impl Bot {
             self.world.last_move,
             mech_radius,
             mech_height,
+            self.world.strafe_sign,
         );
         self.world.last_move = move_dir;
 
@@ -254,11 +255,22 @@ impl Bot {
             && self.world.cmd_move_streak >= 8
             && me.energy > 40.0;
 
+        let saving_for_lightning = me
+            .weapons
+            .iter()
+            .flatten()
+            .any(|w| w.kind == crate::protocol::WeaponKind::Lightning)
+            && los_mechs.iter().any(|m| m.dist <= 45.0);
+        let juke_boost = ((t <= self.world.juke_boost_until) || dodged_bullet)
+            && me.energy > 45.0
+            && !saving_for_lightning;
+
         let ground_boost = me.grounded
             && moving
             && ((!me.in_zone && me.energy > 5.0)
                 || (aimed_laser_dodge && me.energy > 25.0)
                 || (dodged_hazard && me.energy > 15.0)
+                || juke_boost
                 || (self.strategy.posture == Posture::EmergencyRegen
                     && los_mech_count > 0
                     && me.energy > 18.0)
@@ -1360,6 +1372,126 @@ mod tests {
             act.fire.unwrap(),
             [false, false],
             "must not shoot crates and reset 5s regen delay while recovering at 55% HP"
+        );
+    }
+
+    #[test]
+    fn strafe_reverses_fast_on_jitter_and_gun_damage() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        obs.t = 10.0;
+        obs.events.clear();
+        bot.act(&obs);
+        let initial_sign = bot.world.strafe_sign;
+
+        // Auto jittered reversal must happen within <= 1.1 s
+        let mut flipped_auto = false;
+        for step in 1..=12 {
+            obs.t = 10.0 + (step as f64) * 0.1;
+            bot.act(&obs);
+            if bot.world.strafe_sign != initial_sign {
+                flipped_auto = true;
+                break;
+            }
+        }
+        assert!(
+            flipped_auto,
+            "strafe_sign must automatically reverse within 1.1 s"
+        );
+
+        // Wait >= 0.4 s since last flip, then incoming gun hit triggers immediate reverse + juke boost
+        let flip_t = bot.world.last_strafe_flip_t;
+        let pre_hit_sign = bot.world.strafe_sign;
+        obs.t = flip_t + 0.40;
+        obs.events = vec![GameEvent::Damaged {
+            amount: 45.0,
+            weapon: "gun".into(),
+            bearing: Some(0.0),
+            by: Some(5),
+            rear: false,
+        }];
+        bot.act(&obs);
+        assert_eq!(
+            bot.world.strafe_sign, -pre_hit_sign,
+            "gun damage >= 0.35 s after last flip must immediately reverse strafe"
+        );
+        assert!(
+            bot.world.juke_boost_until > obs.t,
+            "damage-triggered flip must arm brief juke boost"
+        );
+
+        // Another gun hit 0.1 s later must NOT double-flip back (0.35 s debounce)
+        let after_hit_sign = bot.world.strafe_sign;
+        obs.t += 0.10;
+        bot.act(&obs);
+        assert_eq!(
+            bot.world.strafe_sign, after_hit_sign,
+            "gun damage within 0.35 s must not double-flip"
+        );
+    }
+
+    #[test]
+    fn sidesteps_perpendicular_away_from_incoming_gun_bullet() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let bot = Bot::new(hello);
+        let mz = bot.map.ground_height(0.0, 1.2);
+        obs.t = 20.0;
+        obs.self_obs.pos = [0.0, 1.2, mz];
+        obs.self_obs.grounded = true;
+        obs.projectiles = vec![ProjectileObs {
+            id: 4001,
+            kind: "gun".into(),
+            pos: [-60.0, 0.0, mz + 4.5],
+            vel: [252.0, 0.0, 0.0],
+        }];
+
+        let (mv, _, _, dodged_bullet) = steering::steer(
+            &bot.map,
+            &bot.nav,
+            &bot.config,
+            &obs,
+            [1.0, 0.0],
+            [0.0, 0.0],
+            2.5,
+            9.0,
+            1.0,
+        );
+        assert!(dodged_bullet, "must detect incoming gun bullet threat");
+        assert!(
+            mv[1] > 0.5,
+            "must sidestep +y perpendicular away from bullet ray at y=0 (me at y=1.2), got {mv:?}"
+        );
+    }
+
+    #[test]
+    fn ignores_gun_bullet_flying_high_overhead() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let bot = Bot::new(hello);
+        let mz = bot.map.ground_height(0.0, 1.2);
+        obs.t = 20.0;
+        obs.self_obs.pos = [0.0, 1.2, mz];
+        obs.self_obs.grounded = true;
+        obs.projectiles = vec![ProjectileObs {
+            id: 4002,
+            kind: "gun".into(),
+            pos: [-60.0, 0.0, mz + 25.0],
+            vel: [252.0, 0.0, 0.0],
+        }];
+
+        let (_, _, _, dodged_bullet) = steering::steer(
+            &bot.map,
+            &bot.nav,
+            &bot.config,
+            &obs,
+            [1.0, 0.0],
+            [0.0, 0.0],
+            2.5,
+            9.0,
+            1.0,
+        );
+        assert!(
+            !dodged_bullet,
+            "must ignore bullets flying high overhead (mz + 25 m)"
         );
     }
 }

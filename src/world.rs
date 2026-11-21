@@ -71,6 +71,9 @@ pub(crate) struct WorldState {
     pub last_move: [f64; 2],
     pub strafe_sign: f64,
     pub last_strafe_flip_t: f64,
+    pub next_strafe_flip_t: f64,
+    pub juke_boost_until: f64,
+    rng_state: u64,
     pub pos_history: VecDeque<[f64; 2]>,
     pub cmd_move_streak: u32,
     pub unstuck_air_boost_until: f64,
@@ -98,6 +101,9 @@ impl WorldState {
             last_move: [0.0, 0.0],
             strafe_sign,
             last_strafe_flip_t: -100.0,
+            next_strafe_flip_t: -100.0,
+            juke_boost_until: -100.0,
+            rng_state: (seed ^ 0x9E37_79B9_7F4A_7C15).max(1),
             pos_history: VecDeque::with_capacity(7),
             cmd_move_streak: 0,
             unstuck_air_boost_until: -100.0,
@@ -120,12 +126,23 @@ impl WorldState {
 
         for ev in &obs.events {
             match ev {
-                GameEvent::Damaged { bearing, by, .. } => {
+                GameEvent::Damaged {
+                    weapon,
+                    bearing,
+                    by,
+                    ..
+                } => {
                     self.last_combat_t = t;
                     if let Some(b) = bearing {
                         self.last_damage_bearing = Some(*b);
                         self.last_damage_t = t;
                         self.last_damage_by = *by;
+                    }
+                    if (weapon == "gun" || weapon == "npc") && t - self.last_strafe_flip_t >= 0.35 {
+                        self.strafe_sign = -self.strafe_sign;
+                        self.last_strafe_flip_t = t;
+                        self.next_strafe_flip_t = t + 0.65 + 0.40 * self.next_unit_f64();
+                        self.juke_boost_until = t + 0.22;
                     }
                 }
                 GameEvent::Hit { .. } => {
@@ -361,13 +378,25 @@ impl WorldState {
             false
         };
 
-        // Periodic strafe flip
-        if t - self.last_strafe_flip_t > 2.4 {
-            self.strafe_sign = -self.strafe_sign;
+        // Jittered fast A-D strafe reversals (0.65-1.05 s) to break linear Gun lead prediction
+        if t >= self.next_strafe_flip_t {
+            if self.next_strafe_flip_t > -50.0 {
+                self.strafe_sign = -self.strafe_sign;
+            }
             self.last_strafe_flip_t = t;
+            self.next_strafe_flip_t = t + 0.65 + 0.40 * self.next_unit_f64();
         }
 
         stuck_active
+    }
+
+    fn next_unit_f64(&mut self) -> f64 {
+        let mut x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng_state = x.max(1);
+        ((x >> 11) as f64) / ((1u64 << 53) as f64)
     }
 
     pub fn closest_tracked_enemy_within(
