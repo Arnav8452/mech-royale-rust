@@ -79,6 +79,7 @@ pub(crate) struct WorldState {
     pub orbit_active_1v1: bool,
     pub orbit_sign: f64,
     pub last_orbit_flip_t: f64,
+    pub orbit_boost_latched: bool,
     rng_state: u64,
     pub pos_history: VecDeque<[f64; 2]>,
     pub cmd_move_streak: u32,
@@ -115,6 +116,7 @@ impl WorldState {
             orbit_active_1v1: false,
             orbit_sign: strafe_sign,
             last_orbit_flip_t: -100.0,
+            orbit_boost_latched: false,
             rng_state: (seed ^ 0x9E37_79B9_7F4A_7C15).max(1),
             pos_history: VecDeque::with_capacity(7),
             cmd_move_streak: 0,
@@ -133,6 +135,18 @@ impl WorldState {
         let gun_reload_s = stat(&config.weapons.gun, "reload", 2.4);
         let gun_mag = stat(&config.weapons.gun, "mag", 12.0).round().max(1.0) as u8;
         let laser_cd_s = stat(&config.weapons.laser, "cooldown", 1.65);
+
+        let have_lt = me
+            .weapons
+            .iter()
+            .flatten()
+            .any(|w| w.kind == WeaponKind::Lightning);
+        let (boost_hi, boost_lo) = if have_lt { (76.0, 48.0) } else { (68.0, 28.0) };
+        if me.energy >= boost_hi {
+            self.orbit_boost_latched = true;
+        } else if me.energy <= boost_lo {
+            self.orbit_boost_latched = false;
+        }
 
         self.visited_cells.insert((
             (me.pos[0] / 50.0).floor() as i32,

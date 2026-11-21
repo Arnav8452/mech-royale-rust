@@ -4,7 +4,9 @@ use crate::combat::{
 use crate::geom::{dist2d, wrap_angle};
 use crate::map::Map;
 use crate::nav::{NavGrid, NavScratch};
-use crate::protocol::{stat, Action, Config, DebugDraw, DebugLine, DebugPoint, Hello, Observation};
+use crate::protocol::{
+    stat, Action, Config, DebugDraw, DebugLine, DebugPoint, Hello, Observation, WeaponKind,
+};
 use crate::steering;
 use crate::strategy::{CombatTactic, Posture, StrategyState};
 use crate::world::WorldState;
@@ -37,7 +39,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m10-orbzz".to_string(),
+            name: "rust-bot-m10-boost".to_string(),
             config: hello.config,
             map,
             nav,
@@ -264,10 +266,13 @@ impl Bot {
             .weapons
             .iter()
             .flatten()
-            .any(|w| w.kind == crate::protocol::WeaponKind::Lightning)
+            .any(|w| w.kind == WeaponKind::Lightning)
             && los_mechs.iter().any(|m| m.dist <= 45.0);
         let juke_boost = ((t <= self.world.juke_boost_until) || dodged_bullet)
             && me.energy > 45.0
+            && !saving_for_lightning;
+        let orbit_boost = self.world.orbit_active_1v1
+            && self.world.orbit_boost_latched
             && !saving_for_lightning;
 
         let ground_boost = me.grounded
@@ -276,6 +281,7 @@ impl Bot {
                 || (aimed_laser_dodge && me.energy > 25.0)
                 || (dodged_hazard && me.energy > 15.0)
                 || juke_boost
+                || orbit_boost
                 || (self.strategy.posture == Posture::EmergencyRegen
                     && los_mech_count > 0
                     && me.energy > 18.0)
@@ -1984,6 +1990,110 @@ mod tests {
             act_hid.fire.unwrap(),
             [false, false],
             "must hold fire once LOS breaks behind cover"
+        );
+    }
+
+    #[test]
+    fn boost_orbits_with_hysteresis_on_any_single_los_enemy() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let p_me = [-45.0, 0.0];
+        let p_en = [-90.0, 0.0];
+        let mz = bot.map.ground_height(p_me[0], p_me[1]);
+        let ez = bot.map.ground_height(p_en[0], p_en[1]);
+        obs.t = 30.0;
+        obs.self_obs.pos = [p_me[0], p_me[1], mz];
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.grounded = true;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [0.0, 0.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 120.0;
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.mechs = vec![ActorObs {
+            id: 5,
+            kind: "mech".into(),
+            pos: [p_en[0], p_en[1], ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1200.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+        // Add a second recently-tracked occluded hunter within 150 m
+        bot.world.tracked_enemies.insert(
+            6,
+            crate::world::TrackedEnemy {
+                pos: [60.0, 0.0, mz],
+                vel: [0.0, 0.0, 0.0],
+                est_accel_z: 0.0,
+                aim: [PI, 0.0],
+                hp: 1200.0,
+                max_hp: 1400.0,
+                weapons: vec![WeaponKind::Gun],
+                charging: false,
+                last_seen_t: 29.0,
+                gun_reload_until: -100.0,
+                laser_cd_until: -100.0,
+                est_gun_shots: 0,
+                last_gun_shot_t: -100.0,
+            },
+        );
+
+        // 1. High energy (70 >= 68): latches orbit boost ON even with hidden nearby hunter
+        obs.self_obs.energy = 70.0;
+        let act_hi = bot.act(&obs);
+        assert!(
+            bot.world.orbit_active_1v1,
+            "must orbit on any single LOS enemy even when another tracked hunter is within 180 m"
+        );
+        assert_eq!(act_hi.boost, Some(true));
+
+        // 2. Hysteresis hold at energy = 35 (> 28): keeps orbit boost latched ON
+        obs.t = 30.2;
+        obs.self_obs.energy = 35.0;
+        let act_mid = bot.act(&obs);
+        assert_eq!(act_mid.boost, Some(true));
+
+        // 3. Drops below low threshold (25 <= 28): unlatches boost OFF
+        obs.t = 30.4;
+        obs.self_obs.energy = 25.0;
+        let act_lo = bot.act(&obs);
+        assert_eq!(act_lo.boost, Some(false));
+
+        // 4. Stays OFF at intermediate energy (55 < 68) until recovered
+        obs.t = 30.6;
+        obs.self_obs.energy = 55.0;
+        let act_rec = bot.act(&obs);
+        assert_eq!(act_rec.boost, Some(false));
+
+        // 5. With Lightning inside range (< 45 m), saving_for_lightning suppresses orbit boost even at energy = 90
+        let lt = WeaponObs {
+            kind: WeaponKind::Lightning,
+            cooldown: 0.0,
+            ammo: None,
+            reload: None,
+            charge: None,
+            stats: bot.config.weapons.lightning.clone(),
+        };
+        obs.self_obs.weapons = vec![Some(obs.self_obs.weapons[0].clone().unwrap()), Some(lt)];
+        let close_z = bot.map.ground_height(-80.0, 0.0);
+        obs.mechs[0].pos = [-80.0, 0.0, close_z];
+        obs.t = 30.8;
+        obs.self_obs.energy = 90.0;
+        let act_lt = bot.act(&obs);
+        assert_eq!(
+            act_lt.boost,
+            Some(false),
+            "must save energy for Lightning DPS inside range"
         );
     }
 }

@@ -690,14 +690,9 @@ impl StrategyState {
                         return ([0.0, 0.0], me_xy);
                     }
 
-                    // 3. Direct engagement: Swing 3 continuous 1v1 orbit (or M7 strafing when 2+ enemies)
+                    // 3. Direct engagement: continuous 1v1 orbit on any single LOS enemy (exposes_other bounces away from hidden neighbors)
                     let to_e = unit2d(e.pos[0] - me.pos[0], e.pos[1] - me.pos[1]);
-                    let known_nearby_180 = world
-                        .tracked_enemies
-                        .values()
-                        .filter(|te| dist2d(me.pos[0], me.pos[1], te.pos[0], te.pos[1]) <= 180.0)
-                        .count();
-                    let is_1v1 = los_mech_count == 1 && known_nearby_180 <= 1;
+                    let is_1v1 = los_mech_count == 1;
 
                     let (perp, radial_band, tang_w) = if is_1v1 {
                         world.orbit_active_1v1 = true;
