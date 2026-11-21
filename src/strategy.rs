@@ -102,32 +102,32 @@ impl StrategyState {
                 let mut max_eff = 10.0_f64;
                 for eff in &def.effects {
                     let base = match eff.path.as_str() {
-                        "mech.regen_per_s" | "mech.regen_delay" => 106.0,
-                        "mech.armor" => 100.0,
-                        "mech.hp" => 95.0,
-                        "weapons.laser.damage" | "weapons.laser.charge" | "weapons.laser.pierce" => {
-                            92.0
-                        }
+                        "mech.regen_per_s" | "mech.regen_delay" => 108.0,
+                        "mech.armor" => 104.0,
+                        "mech.hp" => 100.0,
                         "weapons.lightning.damage"
                         | "weapons.lightning.energy"
                         | "weapons.lightning.range"
-                        | "weapons.lightning.chain"
-                        | "weapons.lightning.cone_deg" => 90.0,
-                        "weapons.gun.cooldown" | "weapons.gun.damage" => 88.0,
+                        | "weapons.lightning.cone_deg" => 98.0,
+                        "weapons.laser.damage" | "weapons.laser.charge" | "weapons.laser.pierce" => {
+                            97.0
+                        }
+                        "weapons.gun.mag" | "weapons.gun.reload" => 95.0,
+                        "weapons.gun.cooldown" | "weapons.gun.damage" => 92.0,
+                        "weapons.lightning.chain" => 90.0,
                         "mech.near_range_bonus" | "mech.vision_bonus" | "mech.hearing" => {
                             if existing_stacks == 0 {
-                                86.0
+                                88.0
                             } else {
                                 72.0
                             }
                         }
-                        "weapons.gun.mag" | "weapons.gun.reload" => 80.0,
-                        "mech.walk_speed" | "mech.boost_speed" => 78.0,
-                        "mech.energy_regen" | "mech.boost_drain" | "mech.jet_drain" => 72.0,
-                        "weapons.gun.speed" | "weapons.gun.range" => 70.0,
-                        "mech.turn_rate" | "mech.pitch_rate" => 68.0,
-                        "mech.energy" => 62.0,
-                        p if p.starts_with("weapons.mortar.") => 35.0,
+                        "weapons.gun.speed" | "weapons.gun.range" => 84.0,
+                        "mech.walk_speed" | "mech.boost_speed" => 82.0,
+                        "mech.energy_regen" | "mech.boost_drain" | "mech.jet_drain" => 76.0,
+                        "mech.turn_rate" | "mech.pitch_rate" => 70.0,
+                        "mech.energy" => 64.0,
+                        p if p.starts_with("weapons.mortar.") => 30.0,
                         _ => 25.0,
                     };
                     let mag_bonus = if let Some(m) = eff.mul {
@@ -317,14 +317,18 @@ impl StrategyState {
             return;
         }
 
+        let winning_or_even_1v1 = los_count == 1 && los_mechs[0].hp <= me.hp + 180.0;
+        let enemy_in_face = los_mechs.iter().any(|m| m.dist < 32.0);
         let want_regen = if self.posture == Posture::EmergencyRegen {
             !immediate_kill_avail
-                && me.hp < 0.80 * me.max_hp
-                && !(me.hp >= 0.72 * me.max_hp && near_mechs == 0)
+                && !enemy_in_face
+                && me.hp < 0.72 * me.max_hp
+                && !(me.hp >= 0.65 * me.max_hp && near_mechs == 0)
         } else {
             !immediate_kill_avail
-                && ((me.hp < 0.42 * me.max_hp && near_mechs > 0)
-                    || (me.hp < 0.58 * me.max_hp && los_count >= 2))
+                && !enemy_in_face
+                && ((me.hp < 0.50 * me.max_hp && los_count >= 2)
+                    || (me.hp < 0.30 * me.max_hp && near_mechs > 0 && !winning_or_even_1v1))
         };
         if want_regen
             && (self
@@ -520,26 +524,12 @@ impl StrategyState {
                     && our_laser_charge_frac < 0.65
                     && los_mechs.iter().any(|e| e.charging);
 
-                let our_gun_low = me.weapons.iter().flatten().any(|w| {
-                    w.kind == WeaponKind::Gun
-                        && (w.reload.unwrap_or(0.0) > 0.0 || w.ammo.unwrap_or(12.0) <= 5.0)
-                });
-                let our_laser_on_cd = me.weapons.iter().flatten().any(|w| {
-                    w.kind == WeaponKind::Laser && w.charge.unwrap_or(0.0) <= 0.0 && w.cooldown > 0.35
-                });
                 let near_cover_14 = nav.has_near_cover_within(me.pos, 14.0);
-                let wait_enemy_reload_duck = !immediate_kill_avail
-                    && combat_enemy.is_some_and(|e| {
-                        !e.is_vulnerable && (me.hp < 0.72 * me.max_hp || e.hp > me.hp + 200.0)
-                    })
-                    && (los_mech_count == 0 || near_cover_14)
-                    && (our_gun_low || our_laser_on_cd);
 
-                // 1. CoverDuck: outnumbered (2+ LOS), dry/reloading, enemy charging laser, or waiting behind cover for enemy reload
-                if los_mech_count >= 2
-                    || no_weapon_can_shoot_now
+                // 1. CoverDuck: outnumbered (2+ LOS), dry/reloading, or enemy charging laser
+                if (los_mech_count >= 2 && !immediate_kill_avail)
+                    || (no_weapon_can_shoot_now && !immediate_kill_avail)
                     || enemy_laser_duck
-                    || wait_enemy_reload_duck
                 {
                     if los_mech_count == 0
                         && (near_cover_14
@@ -605,43 +595,42 @@ impl StrategyState {
                 }
 
                 if let Some(e) = combat_enemy {
-                    // 2. Enemy behind wall (!e.has_los): slice-the-pie corner peek or hold cover ambush
+                    // 2. Enemy behind wall (!e.has_los): slice-the-pie corner peek or aggressive chase
                     if !e.has_los {
-                        let other_threats: Vec<[f64; 3]> = world
+                        let close_other_threats: Vec<[f64; 3]> = world
                             .tracked_enemies
                             .iter()
                             .filter(|(&id, te)| {
                                 id != e.id
-                                    && dist2d(me.pos[0], me.pos[1], te.pos[0], te.pos[1]) <= 200.0
+                                    && dist2d(me.pos[0], me.pos[1], te.pos[0], te.pos[1]) <= 75.0
                             })
                             .map(|(_, te)| [te.pos[0], te.pos[1], te.pos[2] + 7.5])
                             .collect();
 
-                        if e.is_vulnerable || (e.dist <= 135.0 && !e.charging) {
-                            let target_eye = [e.pos[0], e.pos[1], e.pos[2] + 7.5];
-                            if let Some(pp) = nav.find_peek_point(
-                                map,
-                                me.pos,
-                                eye_h,
-                                target_eye,
-                                &other_threats,
-                                obs.zone.center,
-                                obs.zone.radius,
-                                18.0,
-                            ) {
-                                self.tactic = CombatTactic::CornerPeek;
-                                self.peek_target = Some(pp);
-                                let wp = self.follow_astar(nav, scratch, me_xy, pp, obs.t);
-                                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), pp);
-                            } else if other_threats.is_empty()
-                                && e.dist > 35.0
-                                && me.hp > 0.55 * me.max_hp
-                            {
-                                self.tactic = CombatTactic::AggressivePush;
-                                let goal = [e.pos[0], e.pos[1]];
-                                let wp = self.follow_astar(nav, scratch, me_xy, goal, obs.t);
-                                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), goal);
-                            }
+                        let target_eye = [e.pos[0], e.pos[1], e.pos[2] + 7.5];
+                        if let Some(pp) = nav.find_peek_point(
+                            map,
+                            me.pos,
+                            eye_h,
+                            target_eye,
+                            &close_other_threats,
+                            obs.zone.center,
+                            obs.zone.radius,
+                            18.0,
+                        ) {
+                            self.tactic = CombatTactic::CornerPeek;
+                            self.peek_target = Some(pp);
+                            let wp = self.follow_astar(nav, scratch, me_xy, pp, obs.t);
+                            return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), pp);
+                        } else if close_other_threats.is_empty()
+                            || e.hp <= 550.0
+                            || e.is_vulnerable
+                            || me.hp >= 0.60 * me.max_hp
+                        {
+                            self.tactic = CombatTactic::AggressivePush;
+                            let goal = [e.pos[0], e.pos[1]];
+                            let wp = self.follow_astar(nav, scratch, me_xy, goal, obs.t);
+                            return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), goal);
                         }
 
                         self.tactic = CombatTactic::CoverAmbush;
@@ -652,7 +641,7 @@ impl StrategyState {
                         return ([0.0, 0.0], me_xy);
                     }
 
-                    // 3. Direct 1v1 engagement: AggressivePush when enemy is vulnerable, else cover-edged OpenStrafe
+                    // 3. Direct 1v1 engagement: lethal weapon-matched ranges & AggressivePush when diving or punishing
                     let to_e = unit2d(e.pos[0] - me.pos[0], e.pos[1] - me.pos[1]);
                     let perp = [-to_e[1] * world.strafe_sign, to_e[0] * world.strafe_sign];
                     let has_lightning = me
@@ -660,30 +649,45 @@ impl StrategyState {
                         .iter()
                         .flatten()
                         .any(|w| w.kind == WeaponKind::Lightning);
+                    let enemy_has_lightning = e.weapons.contains(&WeaponKind::Lightning);
                     let enemy_has_laser = e.weapons.contains(&WeaponKind::Laser);
-                    let base_pref_dist: f64 =
-                        if has_lightning && me.energy > 30.0 && (e.charging || e.dist < 52.0) {
-                            30.0
-                        } else if enemy_has_laser && !have_laser {
-                            if has_lightning { 30.0 } else { 45.0 }
-                        } else if me.hp < 0.50 * me.max_hp {
-                            92.0
-                        } else {
-                            64.0
-                        };
-
-                    let (pref_dist, push_w) = if e.is_vulnerable {
-                        self.tactic = CombatTactic::AggressivePush;
-                        ((base_pref_dist - 15.0).max(20.0), 0.70)
+                    let base_pref_dist: f64 = if has_lightning
+                        && me.energy > 20.0
+                        && los_mech_count == 1
+                        && me.hp > 0.30 * me.max_hp
+                        && (!have_laser || e.dist <= 80.0 || e.charging)
+                    {
+                        30.0
+                    } else if enemy_has_lightning && !has_lightning {
+                        54.0
+                    } else if enemy_has_laser && !have_laser {
+                        42.0
+                    } else if me.hp < 0.40 * me.max_hp {
+                        68.0
                     } else {
-                        self.tactic = CombatTactic::OpenStrafe;
-                        (base_pref_dist, 0.55)
+                        44.0
                     };
 
                     let d2 = dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]);
-                    let radial_w = if d2 < pref_dist - 12.0 {
+                    let (pref_dist, push_w) = if e.is_vulnerable || e.hp <= 480.0 {
+                        self.tactic = CombatTactic::AggressivePush;
+                        ((base_pref_dist - 10.0).max(22.0), 0.78)
+                    } else if has_lightning && me.energy > 20.0 && d2 > 42.0 && base_pref_dist <= 32.0
+                    {
+                        self.tactic = CombatTactic::AggressivePush;
+                        (base_pref_dist, 0.80)
+                    } else {
+                        self.tactic = CombatTactic::OpenStrafe;
+                        (base_pref_dist, 0.65)
+                    };
+
+                    let radial_w = if d2 < pref_dist - 10.0 {
                         -0.65
-                    } else if d2 > pref_dist + if e.is_vulnerable { 8.0 } else { 18.0 } {
+                    } else if d2 > pref_dist + if self.tactic == CombatTactic::AggressivePush {
+                        8.0
+                    } else {
+                        14.0
+                    } {
                         push_w
                     } else {
                         0.0
@@ -691,7 +695,7 @@ impl StrategyState {
                     let mut gx = to_e[0] * radial_w + perp[0] * 0.85;
                     let mut gy = to_e[1] * radial_w + perp[1] * 0.85;
 
-                    if !e.is_vulnerable {
+                    if !e.is_vulnerable && (los_mech_count >= 2 || me.hp < 0.55 * me.max_hp) {
                         if let Some(corner) = nav.find_cover_anchor(
                             me.pos,
                             obs.zone.center,
@@ -703,8 +707,8 @@ impl StrategyState {
                         ) {
                             if dist2d(me.pos[0], me.pos[1], corner[0], corner[1]) > 12.0 {
                                 let cdir = unit2d(corner[0] - me.pos[0], corner[1] - me.pos[1]);
-                                gx += cdir[0] * 0.25;
-                                gy += cdir[1] * 0.25;
+                                gx += cdir[0] * 0.18;
+                                gy += cdir[1] * 0.18;
                             }
                         }
                     }
@@ -722,13 +726,18 @@ impl StrategyState {
             Posture::EarlyFarm => {}
         }
 
-        // EarlyFarm / fallback: ground cubes -> NPCs -> ground crates -> safe interior -> CoverAmbush anchor
+        // EarlyFarm / fallback: cubes -> farm_target -> crates (if not regenerating) -> zone -> sound hunt -> active sweep
+        let regen_delay = stat(&me.stats, "regen_delay", 5.0);
+        let protecting_regen = me.hp < 0.72 * me.max_hp
+            && (obs.t - world.last_combat_t) >= 2.0
+            && (obs.t - world.last_combat_t) <= regen_delay + 12.0;
+
         if let Some(cube) = obs
             .cubes
             .iter()
             .filter(|c| {
                 is_ground_level(map, c.pos)
-                    && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 65.0
+                    && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 75.0
                     && dist2d(c.pos[0], c.pos[1], nc[0], nc[1]) <= obs.zone.next_radius - 5.0
             })
             .min_by(|a, b| {
@@ -756,13 +765,13 @@ impl StrategyState {
             }
         }
 
-        if me.hp > 0.45 * me.max_hp && obs.t - world.last_damage_t > 2.5 {
+        if me.hp > 0.45 * me.max_hp && obs.t - world.last_damage_t > 2.5 && !protecting_regen {
             if let Some(cr) = obs
                 .crates
                 .iter()
                 .filter(|c| {
                     is_ground_level(map, c.pos)
-                        && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 85.0
+                        && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 95.0
                         && dist2d(c.pos[0], c.pos[1], nc[0], nc[1]) <= obs.zone.next_radius - 5.0
                 })
                 .min_by(|a, b| {
@@ -784,16 +793,46 @@ impl StrategyState {
             return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), nc);
         }
 
-        // Cover-Anchored 360° scan: hold/rotate between building corners inside next_zone instead of exposed fields
-        let slot1_empty = me.weapons.get(1).and_then(|w| w.as_ref()).is_none();
+        // Sound Hunting: proactively close toward gunfire/laser/footsteps when healthy
+        if world.is_huntable_sound(obs.t) && me.hp >= 0.62 * me.max_hp {
+            if let Some(b) = world.last_sound_bearing {
+                let hunt_d = match world.last_sound_dist.as_str() {
+                    "near" => 75.0,
+                    "mid" => 125.0,
+                    _ => 145.0,
+                };
+                let mut hx = me.pos[0] + b.cos() * hunt_d;
+                let mut hy = me.pos[1] + b.sin() * hunt_d;
+                let hunt_safe_r = (obs.zone.next_radius - 18.0).max(0.0);
+                let dh_nc = dist2d(hx, hy, nc[0], nc[1]);
+                if dh_nc > hunt_safe_r {
+                    if hunt_safe_r > 1.0 {
+                        let s = hunt_safe_r / dh_nc;
+                        hx = nc[0] + (hx - nc[0]) * s;
+                        hy = nc[1] + (hy - nc[1]) * s;
+                    } else {
+                        hx = nc[0];
+                        hy = nc[1];
+                    }
+                }
+                self.tactic = CombatTactic::AggressivePush;
+                let goal = [hx, hy];
+                let wp = self.follow_astar(nav, scratch, me_xy, goal, obs.t);
+                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), goal);
+            }
+        }
+
+        // Active sweep patrol across corners inside next_zone (never camp stationary in EarlyFarm)
         let anchor_invalid = self.ambush_anchor.is_none_or(|a| {
             obs.zone.next_radius > 24.0
                 && dist2d(a[0], a[1], nc[0], nc[1]) > (obs.zone.next_radius - 14.0).max(0.0)
         });
-        let explore_refresh = slot1_empty && obs.t < 45.0 && (obs.t - self.ambush_anchor_t >= 8.0);
-        let periodic_refresh = obs.t - self.ambush_anchor_t >= 20.0;
+        let arrived_anchor = self
+            .ambush_anchor
+            .is_some_and(|a| dist2d(me.pos[0], me.pos[1], a[0], a[1]) <= 18.0);
+        let timed_refresh = obs.t - self.ambush_anchor_t >= 10.0;
 
-        if anchor_invalid || explore_refresh || periodic_refresh {
+        if anchor_invalid || arrived_anchor || timed_refresh {
             self.prev_ambush_anchor = self.ambush_anchor;
             self.ambush_anchor = nav.find_cover_anchor(
                 me.pos,
@@ -801,27 +840,21 @@ impl StrategyState {
                 obs.zone.radius,
                 nc,
                 obs.zone.next_radius,
-                if explore_refresh {
-                    self.prev_ambush_anchor
-                } else {
-                    None
-                },
+                self.prev_ambush_anchor,
                 180.0,
             );
             self.ambush_anchor_t = obs.t;
         }
 
         if let Some(anchor) = self.ambush_anchor {
-            self.tactic = CombatTactic::CoverAmbush;
-            if dist2d(me.pos[0], me.pos[1], anchor[0], anchor[1]) <= 4.5 {
-                return ([0.0, 0.0], anchor);
+            if dist2d(me.pos[0], me.pos[1], anchor[0], anchor[1]) > 6.0 {
+                let wp = self.follow_astar(nav, scratch, me_xy, anchor, obs.t);
+                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), anchor);
             }
-            let wp = self.follow_astar(nav, scratch, me_xy, anchor, obs.t);
-            return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), anchor);
         }
 
         let ang = (obs.t * 0.25) + (world.strafe_sign * 0.5);
-        let patrol_r = (safe_r * 0.40).min(110.0);
+        let patrol_r = (safe_r * 0.45).min(110.0);
         let patrol_pt = [nc[0] + patrol_r * ang.cos(), nc[1] + patrol_r * ang.sin()];
         let wp = self.follow_astar(nav, scratch, me_xy, patrol_pt, obs.t);
         (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), patrol_pt)
@@ -930,7 +963,7 @@ impl StrategyState {
 
         let close_los_enemy = los_mechs.iter().any(|m| m.dist < 60.0);
         let any_los_enemy = !los_mechs.is_empty();
-        let max_seek_d = if slot1_empty { 185.0 } else { 65.0 };
+        let max_seek_d = if slot1_empty { 210.0 } else { 65.0 };
         let mut best: Option<(f64, [f64; 2])> = None;
 
         for (id, &(kind, pos, _)) in &world.last_pickup_seen {

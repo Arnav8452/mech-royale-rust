@@ -46,6 +46,10 @@ pub(crate) fn select_targets(
     let npc_h = stat(&config.npc, "height", 3.5);
     let crate_r = stat(&config.crates, "radius", 1.4);
     let crate_h = stat(&config.crates, "height", 2.4);
+    let regen_delay = stat(&me.stats, "regen_delay", 5.0);
+    let protecting_regen = me.hp < 0.72 * me.max_hp
+        && (obs.t - world.last_combat_t) >= 2.0
+        && (obs.t - world.last_combat_t) <= regen_delay + 12.0;
 
     let mut mech_cands = Vec::new();
     let mut best_farm: Option<(f64, TargetCandidate)> = None;
@@ -86,6 +90,7 @@ pub(crate) fn select_targets(
             && d <= 110.0
             && me.hp > 0.45 * me.max_hp
             && obs.t - world.last_damage_t > 2.5
+            && !protecting_regen
         {
             let com_z = actor.pos[2] + 0.5 * npc_h;
             if map.has_los(muzzle, [actor.pos[0], actor.pos[1], com_z]) {
@@ -116,7 +121,11 @@ pub(crate) fn select_targets(
         }
     }
 
-    if best_farm.is_none() && me.hp > 0.45 * me.max_hp && obs.t - world.last_damage_t > 2.5 {
+    if best_farm.is_none()
+        && me.hp > 0.45 * me.max_hp
+        && obs.t - world.last_damage_t > 2.5
+        && !protecting_regen
+    {
         for c in &obs.crates {
             let d = dist3d(muzzle, c.pos);
             if d > 85.0 {
@@ -707,10 +716,10 @@ fn lightning_energy_ok(
     match tgt.kind {
         TargetKind::Crate | TargetKind::Npc => energy >= 30.0_f64.max(e_cost),
         TargetKind::Mech => {
-            if tgt.charging || tgt.hp < 320.0 || cluster_count >= 2 {
-                energy >= 10.0_f64.max(e_cost)
+            if tgt.charging || tgt.hp < 480.0 || cluster_count >= 2 {
+                energy >= 6.0_f64.max(e_cost)
             } else {
-                energy >= 25.0_f64.max(e_cost)
+                energy >= 12.0_f64.max(e_cost)
             }
         }
     }

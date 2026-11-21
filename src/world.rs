@@ -66,6 +66,8 @@ pub(crate) struct WorldState {
     pub last_sound_t: f64,
     pub last_sound_priority: f64,
     pub last_sound_is_near: bool,
+    pub last_sound_kind: String,
+    pub last_sound_dist: String,
     pub last_move: [f64; 2],
     pub strafe_sign: f64,
     pub last_strafe_flip_t: f64,
@@ -91,6 +93,8 @@ impl WorldState {
             last_sound_t: -100.0,
             last_sound_priority: 0.0,
             last_sound_is_near: false,
+            last_sound_kind: String::new(),
+            last_sound_dist: String::new(),
             last_move: [0.0, 0.0],
             strafe_sign,
             last_strafe_flip_t: -100.0,
@@ -331,6 +335,8 @@ impl WorldState {
                 self.last_sound_t = s_time;
                 self.last_sound_priority = prio;
                 self.last_sound_is_near = is_near;
+                self.last_sound_kind = s.kind.clone();
+                self.last_sound_dist = s.dist.clone();
             }
         }
 
@@ -378,5 +384,24 @@ impl WorldState {
                     .unwrap()
             })
             .map(|(&id, e)| (id, e))
+    }
+
+    pub fn is_huntable_sound(&self, t: f64) -> bool {
+        self.last_sound_bearing.is_some()
+            && t - self.last_sound_t <= 4.0
+            && matches!(
+                self.last_sound_kind.as_str(),
+                "gun"
+                    | "laser"
+                    | "laser_charge"
+                    | "lightning"
+                    | "mortar"
+                    | "explosion"
+                    | "crate"
+                    | "npc_gun"
+                    | "step"
+                    | "boost"
+                    | "reload"
+            )
     }
 }

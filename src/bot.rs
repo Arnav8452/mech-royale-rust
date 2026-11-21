@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m4".to_string(),
+            name: "rust-bot-m5".to_string(),
             config: hello.config,
             map,
             nav,
@@ -95,7 +95,7 @@ impl Bot {
             }
         }
 
-        let immediate_kill_avail = me.hp > 220.0 && los_mechs.iter().any(|m| m.hp <= 420.0);
+        let immediate_kill_avail = me.hp > 200.0 && los_mechs.iter().any(|m| m.hp <= 480.0);
 
         self.strategy.update_posture(
             &self.map,
@@ -261,17 +261,22 @@ impl Bot {
                 || (dodged_hazard && me.energy > 15.0)
                 || (self.strategy.posture == Posture::EmergencyRegen
                     && los_mech_count > 0
-                    && me.energy > 22.0)
+                    && me.energy > 18.0)
                 || (self.strategy.tactic == CombatTactic::CoverDuck
                     && los_mech_count > 0
                     && me.energy > 25.0)
                 || (self.strategy.tactic == CombatTactic::CornerPeek && me.energy > 35.0)
+                || (self.strategy.tactic == CombatTactic::AggressivePush
+                    && me.energy > 45.0
+                    && any_visible_mech
+                        .as_ref()
+                        .is_none_or(|m| !m.has_los || m.dist > 38.0))
                 || (self.strategy.posture == Posture::ZoneRotate && me.energy > 25.0)
                 || (self.strategy.posture == Posture::SupplyDrop && me.energy > 45.0)
                 || (self.strategy.posture == Posture::LootWeapon
                     && slot1_empty
-                    && me.energy > 35.0)
-                || (self.strategy.posture == Posture::EarlyFarm && t < 35.0 && me.energy > 55.0));
+                    && me.energy > 28.0)
+                || (self.strategy.posture == Posture::EarlyFarm && t < 45.0 && me.energy > 50.0));
 
         let boost = ground_boost || air_unstuck_boost;
 
@@ -338,8 +343,8 @@ mod tests {
     use crate::combat::{eval_laser, slew_aligned, solve_gun_lead_airborne, TargetKind};
     use crate::geom::{angle_diff, direct_aim};
     use crate::protocol::{
-        ActorObs, BeamObs, GameEvent, Offer, OfferChoice, PickupObs, ProjectileObs, ServerMessage,
-        SoundObs, WeaponKind, WeaponObs,
+        ActorObs, BeamObs, GameEvent, ItemObs, Offer, OfferChoice, PickupObs, ProjectileObs,
+        ServerMessage, SoundObs, WeaponKind, WeaponObs,
     };
 
     fn load_sample_hello_and_obs() -> (Hello, Observation) {
@@ -717,7 +722,7 @@ mod tests {
         obs.t = 40.0;
         let mz = bot.map.ground_height(86.0, -110.0);
         obs.self_obs.pos = [86.0, -110.0, mz];
-        obs.self_obs.hp = 500.0;
+        obs.self_obs.hp = 380.0;
         obs.self_obs.max_hp = 1400.0;
         obs.self_obs.in_zone = true;
         obs.zone.center = [0.0, 0.0];
@@ -772,7 +777,7 @@ mod tests {
         obs.t = 40.0;
         let mz = bot.map.ground_height(86.0, -110.0);
         obs.self_obs.pos = [86.0, -110.0, mz];
-        obs.self_obs.hp = 500.0;
+        obs.self_obs.hp = 380.0;
         obs.self_obs.max_hp = 1400.0;
         obs.self_obs.in_zone = true;
         obs.zone.center = [0.0, 0.0];
@@ -1187,6 +1192,174 @@ mod tests {
         assert!(
             angle_diff(act.aim.unwrap()[0], -1.25).abs() < 1e-6,
             "bot should orient torso toward attacker damage bearing"
+        );
+    }
+
+    #[test]
+    fn stays_aggressive_in_winning_1v1_instead_of_fleeing() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        obs.t = 40.0;
+        let mz = bot.map.ground_height(0.0, 0.0);
+        let ez = bot.map.ground_height(35.0, 0.0);
+        obs.self_obs.pos = [0.0, 0.0, mz];
+        obs.self_obs.hp = 500.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [0.0, 0.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 90.0;
+        obs.self_obs.aim = direct_aim([0.0, 0.0, mz + 7.0], [35.0, 0.0, ez + 4.5]);
+        obs.mechs = vec![ActorObs {
+            id: 5,
+            kind: "mech".into(),
+            pos: [35.0, 0.0, ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [PI, 0.0],
+            hp: Some(500.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+
+        let act = bot.act(&obs);
+        assert_eq!(
+            bot.strategy.posture,
+            Posture::Combat,
+            "winning/even 1v1 at 500 HP vs 500 HP must stay in Combat rather than fleeing"
+        );
+        assert!(
+            act.fire.unwrap()[0],
+            "must actively fire in winnable 1v1 duel"
+        );
+    }
+
+    #[test]
+    fn dives_into_lightning_range_when_holding_lightning() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        obs.t = 45.0;
+        let mz = bot.map.ground_height(0.0, 0.0);
+        obs.self_obs.pos = [0.0, 0.0, mz];
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 100.0;
+        obs.self_obs.aim = [0.0, 0.0];
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [0.0, 0.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 90.0;
+
+        let gun = obs.self_obs.weapons[0].clone().unwrap();
+        let lt = WeaponObs {
+            kind: WeaponKind::Lightning,
+            cooldown: 0.0,
+            ammo: None,
+            reload: None,
+            charge: None,
+            stats: bot.config.weapons.lightning.clone(),
+        };
+        obs.self_obs.weapons = vec![Some(gun), Some(lt)];
+
+        let ez = bot.map.ground_height(55.0, 0.0);
+        obs.mechs = vec![ActorObs {
+            id: 4,
+            kind: "mech".into(),
+            pos: [55.0, 0.0, ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [PI, 0.0],
+            hp: Some(1200.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+
+        let act = bot.act(&obs);
+        let mv = act.move_dir.unwrap();
+        assert_eq!(bot.strategy.tactic, CombatTactic::AggressivePush);
+        assert!(
+            mv[0] > 0.3,
+            "holding Gun+Lightning at 55 m should push toward enemy into 30-45 m range, got {mv:?}"
+        );
+    }
+
+    #[test]
+    fn hunts_by_sound_when_no_mech_visible() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        obs.t = 40.0;
+        let mz = bot.map.ground_height(0.0, 0.0);
+        obs.self_obs.pos = [0.0, 0.0, mz];
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 100.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [0.0, 0.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 90.0;
+        obs.mechs.clear();
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.sounds = vec![SoundObs {
+            kind: "gun".into(),
+            bearing: 0.0,
+            dist: "near".into(),
+            age: 0.1,
+        }];
+
+        let act = bot.act(&obs);
+        let mv = act.move_dir.unwrap();
+        assert_eq!(bot.strategy.posture, Posture::EarlyFarm);
+        assert_eq!(bot.strategy.tactic, CombatTactic::AggressivePush);
+        assert!(
+            mv[0] > 0.4,
+            "must actively hunt toward nearby gunfire sound, got {mv:?}"
+        );
+    }
+
+    #[test]
+    fn post_kill_regen_skips_crates_until_healed() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        bot.world.last_combat_t = 37.0;
+        obs.t = 40.0;
+        let mz = bot.map.ground_height(0.0, 0.0);
+        let cz = bot.map.ground_height(15.0, 0.0);
+        obs.self_obs.pos = [0.0, 0.0, mz];
+        obs.self_obs.hp = 770.0; // 55% HP
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.aim = [0.0, 0.0];
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [0.0, 0.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 90.0;
+        obs.mechs.clear();
+        obs.pickups.clear();
+        obs.cubes.clear();
+        obs.drops.clear();
+        obs.crates = vec![ItemObs {
+            id: 1001,
+            pos: [15.0, 0.0, cz],
+            hp: Some(300.0),
+        }];
+
+        let act = bot.act(&obs);
+        assert_eq!(
+            act.fire.unwrap(),
+            [false, false],
+            "must not shoot crates and reset 5s regen delay while recovering at 55% HP"
         );
     }
 }
