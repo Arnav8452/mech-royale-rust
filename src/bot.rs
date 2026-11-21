@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m7".to_string(),
+            name: "rust-bot-m9-1v1".to_string(),
             config: hello.config,
             map,
             nav,
@@ -1810,6 +1810,108 @@ mod tests {
             act.move_dir.unwrap()[0] < -0.4,
             "should hunt West (-x) toward last_hunt_pos at [-150, 0], got {:?}",
             act.move_dir
+        );
+    }
+
+    #[test]
+    fn isolates_or_ducks_proactively_when_two_enemies_known_within_120m() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        // Player just north of prism 49 wall (x=170, y=-96): enemy 5 in open East at (215, -96),
+        // enemy 6 approaches from NE sound bearing at (170, -10) -> only 1 in LOS now, 2 known <= 120 m!
+        let p_me = [170.0, -96.0];
+        let p_e5 = [215.0, -96.0];
+        let mz = bot.map.ground_height(p_me[0], p_me[1]);
+        let ez = bot.map.ground_height(p_e5[0], p_e5[1]);
+        obs.t = 40.0;
+        obs.self_obs.pos = [p_me[0], p_me[1], mz];
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [0.0, 0.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 120.0;
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.mechs = vec![ActorObs {
+            id: 5,
+            kind: "mech".into(),
+            pos: [p_e5[0], p_e5[1], ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [PI, 0.0],
+            hp: Some(1200.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+        obs.sounds = vec![SoundObs {
+            kind: "gun".into(),
+            bearing: PI * 0.5, // North (unmatched with East enemy 5)
+            dist: "near".into(),
+            age: 0.1,
+        }];
+
+        bot.act(&obs);
+        assert_eq!(bot.strategy.posture, Posture::Combat);
+        assert_ne!(
+            bot.strategy.tactic,
+            CombatTactic::OpenStrafe,
+            "with 2 known enemies <= 120 m, must NOT fight openly in OpenStrafe; got {:?}",
+            bot.strategy.tactic
+        );
+    }
+
+    #[test]
+    fn defers_open_weapon_loot_after_kill_when_another_enemy_known_within_150m() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        // Open Oval: enemy 6 at [0, 0] has direct LOS to exposed pickup at [55, 0] (85 m from player at [120, 0])
+        let p_me = [120.0, 0.0];
+        let mz = bot.map.ground_height(p_me[0], p_me[1]);
+        let pkz = bot.map.ground_height(55.0, 0.0);
+        let e6z = bot.map.ground_height(0.0, 0.0);
+        obs.t = 40.0;
+        obs.self_obs.pos = [p_me[0], p_me[1], mz];
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [0.0, 0.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 120.0;
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.drops.clear();
+        obs.sounds.clear();
+        obs.mechs = vec![ActorObs {
+            id: 6,
+            kind: "mech".into(),
+            pos: [0.0, 0.0, e6z],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1200.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+        obs.pickups = vec![PickupObs {
+            id: 8200,
+            kind: WeaponKind::Laser,
+            pos: [55.0, 0.0, pkz],
+        }];
+
+        bot.act(&obs);
+        assert_ne!(
+            bot.strategy.posture,
+            Posture::LootWeapon,
+            "must NOT rush into open weapon loot within LOS of tracked enemy 6 <= 150 m"
         );
     }
 }

@@ -742,6 +742,87 @@ impl NavGrid {
         best_pt
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_isolated_peek_point(
+        &self,
+        map: &Map,
+        me_pos: [f64; 3],
+        eye_h: f64,
+        target_eye: [f64; 3],
+        other_threats: &[[f64; 3]],
+        zone_center: [f64; 2],
+        zone_radius: f64,
+        max_dist: f64,
+    ) -> Option<[f64; 2]> {
+        let (me_cx, me_cy) = self.world_to_cell(me_pos[0], me_pos[1]);
+        let r_cells: isize = ((max_dist / self.cell).ceil() as isize).clamp(2, 8);
+        let x0 = (me_cx as isize - r_cells).max(0) as usize;
+        let x1 = (me_cx as isize + r_cells).min((self.nx - 1) as isize) as usize;
+        let y0 = (me_cy as isize - r_cells).max(0) as usize;
+        let y1 = (me_cy as isize + r_cells).min((self.ny - 1) as isize) as usize;
+
+        let safe_zone_r = (zone_radius - 6.0).max(0.0);
+        let mut cands: Vec<(f64, [f64; 3], f64, bool)> = Vec::with_capacity(96);
+
+        for cy in y0..=y1 {
+            for cx in x0..=x1 {
+                let idx = cy * self.nx + cx;
+                if !self.walkable[idx] {
+                    continue;
+                }
+                let cz = self.ground_z[idx] as f64;
+                if (cz - me_pos[2]).abs() > 14.0 {
+                    continue;
+                }
+                let w = self.cell_to_world(cx, cy);
+                let d_me = (w[0] - me_pos[0]).hypot(w[1] - me_pos[1]);
+                if d_me > max_dist {
+                    continue;
+                }
+                if (w[0] - zone_center[0]).hypot(w[1] - zone_center[1]) > safe_zone_r {
+                    continue;
+                }
+                let near_cov = self.near_cover[idx];
+                let pre = d_me - if near_cov { 5.0 } else { 0.0 };
+                cands.push((pre, [w[0], w[1], cz], d_me, near_cov));
+            }
+        }
+
+        if cands.is_empty() {
+            return None;
+        }
+        cands.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+        cands.truncate(28);
+
+        let mut near_others: Vec<[f64; 3]> = other_threats.to_vec();
+        near_others.sort_unstable_by(|a, b| {
+            let da = (a[0] - me_pos[0]).hypot(a[1] - me_pos[1]);
+            let db = (b[0] - me_pos[0]).hypot(b[1] - me_pos[1]);
+            da.partial_cmp(&db).unwrap_or(Ordering::Equal)
+        });
+        near_others.truncate(4);
+
+        let mut best_pt: Option<[f64; 2]> = None;
+        let mut best_score = f64::NEG_INFINITY;
+
+        for (_, pt, d_me, near_cov) in cands {
+            let eye = [pt[0], pt[1], pt[2] + eye_h];
+            if !map.has_los(eye, target_eye) {
+                continue;
+            }
+            if near_others.iter().any(|ot| map.has_los(eye, *ot)) {
+                continue;
+            }
+            let score = -1.5 * d_me + if near_cov { 24.0 } else { 0.0 };
+            if score > best_score {
+                best_score = score;
+                best_pt = Some([pt[0], pt[1]]);
+            }
+        }
+
+        best_pt
+    }
+
     pub fn has_near_cover_within(&self, pos: [f64; 3], max_dist: f64) -> bool {
         let (cx0, cy0) = self.world_to_cell(pos[0], pos[1]);
         let r: isize = ((max_dist / self.cell).ceil() as isize).clamp(1, 8);

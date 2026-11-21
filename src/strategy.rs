@@ -519,13 +519,21 @@ impl StrategyState {
                     && los_mechs.iter().any(|e| e.charging);
 
                 let near_cover_14 = nav.has_near_cover_within(me.pos, 14.0);
+                let known_120 = world.known_enemy_count_within(me.pos, obs.t, 120.0);
+                let post_kill_cube_grab = obs.t - world.last_kill_t <= 4.0 && me.cubes < 10;
 
-                // A. Mid-Combat Power Cube Magnet: free +4% max HP heal & +4% dmg mid-fight
+                // A. Post-kill / Mid-Combat Power Cube Magnet: free +4% max HP heal & +4% dmg
                 if !enemy_laser_duck
                     && los_mech_count <= 1
                     && !(no_weapon_can_shoot_now && los_mech_count >= 1)
                 {
-                    let cube_pull_r = if los_mech_count == 0 { 24.0 } else { 16.0 };
+                    let cube_pull_r = if los_mech_count == 0 {
+                        24.0
+                    } else if post_kill_cube_grab {
+                        20.0
+                    } else {
+                        16.0
+                    };
                     let have_lt_ready = me
                         .weapons
                         .iter()
@@ -541,6 +549,7 @@ impl StrategyState {
                                 && dist2d(c.pos[0], c.pos[1], nc[0], nc[1])
                                     <= obs.zone.next_radius - 5.0
                                 && !(los_mech_count == 1
+                                    && !post_kill_cube_grab
                                     && !have_lt_ready
                                     && los_mechs[0].hp > 480.0
                                     && dist2d(
@@ -563,12 +572,52 @@ impl StrategyState {
                     }
                 }
 
-                // 1. CoverDuck: outnumbered (2+ LOS), dry/reloading, or enemy charging laser
-                if (los_mech_count >= 2 && !immediate_kill_avail)
+                // B. Proactive 2+ enemy isolation (Swing 4): fight from a 1v1-isolating corner first
+                if known_120 >= 2
+                    && !immediate_kill_avail
+                    && !no_weapon_can_shoot_now
+                    && !enemy_laser_duck
+                {
+                    if let Some(e) = combat_enemy {
+                        let mut other_threats =
+                            world.sorted_tracked_threats_within(me.pos, 180.0, Some(e.id));
+                        if let Some(st) = world.unmatched_sound_threat(me.pos, obs.t, 120.0) {
+                            other_threats.push(st);
+                        }
+                        if !other_threats.is_empty() {
+                            if let Some(pp) = nav.find_isolated_peek_point(
+                                map,
+                                me.pos,
+                                eye_h,
+                                [e.pos[0], e.pos[1], e.aim_z],
+                                &other_threats,
+                                obs.zone.center,
+                                obs.zone.radius,
+                                26.0,
+                            ) {
+                                self.tactic = CombatTactic::CornerPeek;
+                                self.peek_target = Some(pp);
+                                if e.has_los
+                                    && los_mech_count == 1
+                                    && dist2d(me.pos[0], me.pos[1], pp[0], pp[1]) <= 4.5
+                                {
+                                    return ([0.0, 0.0], pp);
+                                }
+                                let wp = self.follow_astar(nav, scratch, me_xy, pp, obs.t);
+                                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), pp);
+                            }
+                        }
+                    }
+                }
+
+                // 1. CoverDuck: outnumbered (2+ known or LOS), dry/reloading, or enemy charging laser
+                if (known_120 >= 2 && !immediate_kill_avail)
+                    || (los_mech_count >= 2 && !immediate_kill_avail)
                     || (no_weapon_can_shoot_now && !immediate_kill_avail)
                     || enemy_laser_duck
                 {
                     if los_mech_count == 0
+                        && known_120 <= 1
                         && (near_cover_14
                             || self.combat_cover_target.is_some_and(|cp| {
                                 dist2d(me.pos[0], me.pos[1], cp[0], cp[1]) <= 6.5
@@ -584,13 +633,16 @@ impl StrategyState {
                         .filter(|m| m.has_los)
                         .map(|m| [m.pos[0], m.pos[1], m.pos[2] + 7.5])
                         .collect();
-                    if threats.is_empty() {
-                        threats = world
-                            .tracked_enemies
-                            .values()
-                            .filter(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 220.0)
-                            .map(|e| [e.pos[0], e.pos[1], e.pos[2] + 7.5])
-                            .collect();
+                    if threats.is_empty() || known_120 >= 2 {
+                        let extra = world.sorted_tracked_threats_within(me.pos, 220.0, None);
+                        for th in extra {
+                            if !threats.iter().any(|x| dist2d(x[0], x[1], th[0], th[1]) < 1.0) {
+                                threats.push(th);
+                            }
+                        }
+                        if let Some(st) = world.unmatched_sound_threat(me.pos, obs.t, 120.0) {
+                            threats.push(st);
+                        }
                     }
 
                     if !threats.is_empty() {
@@ -604,7 +656,7 @@ impl StrategyState {
                             .combat_cover_target
                             .is_some_and(|_| obs.t - self.combat_cover_t < 1.2);
                         if !keep {
-                            self.combat_cover_target = nav.find_cover_point_within(
+                            let mut cp = nav.find_cover_point_within(
                                 map,
                                 me.pos,
                                 eye_h,
@@ -616,6 +668,21 @@ impl StrategyState {
                                 48.0,
                                 None,
                             );
+                            if cp.is_none() && (known_120 >= 2 || los_mech_count >= 2) {
+                                cp = nav.find_cover_point_within(
+                                    map,
+                                    me.pos,
+                                    eye_h,
+                                    &threats,
+                                    obs.zone.center,
+                                    obs.zone.radius,
+                                    obs.zone.next_center,
+                                    obs.zone.next_radius,
+                                    80.0,
+                                    None,
+                                );
+                            }
+                            self.combat_cover_target = cp;
                             self.combat_cover_t = obs.t;
                         }
                         if let Some(cp) = self.combat_cover_target {
@@ -627,6 +694,29 @@ impl StrategyState {
                             }
                             let wp = self.follow_astar(nav, scratch, me_xy, cp, obs.t);
                             return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), cp);
+                        }
+                        if (known_120 >= 2 || los_mech_count >= 2) && !immediate_kill_avail {
+                            self.tactic = CombatTactic::CoverDuck;
+                            let mut ax = 0.0_f64;
+                            let mut ay = 0.0_f64;
+                            let primary_xy = combat_enemy.map(|e| [e.pos[0], e.pos[1]]);
+                            for th in &threats {
+                                let is_primary = primary_xy
+                                    .is_some_and(|p| dist2d(p[0], p[1], th[0], th[1]) < 2.0);
+                                let w = if is_primary && threats.len() >= 2 { 0.4 } else { 1.0 };
+                                let u = unit2d(me.pos[0] - th[0], me.pos[1] - th[1]);
+                                ax += u[0] * w;
+                                ay += u[1] * w;
+                            }
+                            if dist_next > safe_r * 0.85 {
+                                let zdir = unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]);
+                                ax += zdir[0] * 0.55;
+                                ay += zdir[1] * 0.55;
+                            }
+                            let esc = unit2d(ax, ay);
+                            let goal = [me.pos[0] + esc[0] * 45.0, me.pos[1] + esc[1] * 45.0];
+                            let wp = self.follow_astar(nav, scratch, me_xy, goal, obs.t);
+                            return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), goal);
                         }
                     }
                 }
@@ -1078,6 +1168,7 @@ impl StrategyState {
 
         let close_los_enemy = los_mechs.iter().any(|m| m.dist < 60.0);
         let any_los_enemy = !los_mechs.is_empty();
+        let known_150 = world.known_enemy_count_within(me.pos, obs.t, 150.0);
         let max_seek_d = if slot1_empty { 210.0 } else { 65.0 };
         let mut best: Option<(f64, [f64; 2])> = None;
 
@@ -1099,6 +1190,20 @@ impl StrategyState {
             let d = dist2d(me.pos[0], me.pos[1], pos[0], pos[1]);
             if d > max_seek_d {
                 continue;
+            }
+            if known_150 > 0 && d > 5.0 {
+                let pickup_eye = [pos[0], pos[1], pos[2] + 7.5];
+                let nearby_threats = world.sorted_tracked_threats_within(me.pos, 150.0, None);
+                let exposed_loot = if nearby_threats.is_empty() {
+                    d > 18.0
+                } else {
+                    nearby_threats
+                        .iter()
+                        .any(|th| map.has_los(pickup_eye, *th))
+                };
+                if exposed_loot {
+                    continue;
+                }
             }
 
             let prio = weapon_desirability(kind);

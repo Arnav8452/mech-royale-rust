@@ -81,6 +81,7 @@ pub(crate) struct WorldState {
     pub cmd_move_streak: u32,
     pub unstuck_air_boost_until: f64,
     pub last_combat_t: f64,
+    pub last_kill_t: f64,
     pub last_scan_dir: f64,
 }
 
@@ -114,6 +115,7 @@ impl WorldState {
             cmd_move_streak: 0,
             unstuck_air_boost_until: -100.0,
             last_combat_t: -100.0,
+            last_kill_t: -100.0,
             last_scan_dir: 1.0,
         }
     }
@@ -174,6 +176,7 @@ impl WorldState {
                     }
                 }
                 GameEvent::Kill { target } => {
+                    self.last_kill_t = t;
                     self.tracked_enemies.remove(target);
                     if self.last_target_id == Some(*target) {
                         self.last_target_id = None;
@@ -472,5 +475,76 @@ impl WorldState {
                     | "boost"
                     | "reload"
             )
+    }
+
+    pub fn unmatched_sound_threat(&self, me_pos: [f64; 3], t: f64, radius: f64) -> Option<[f64; 3]> {
+        if !self.is_huntable_sound(t) || t - self.last_sound_t > 3.0 {
+            return None;
+        }
+        let b = self.last_sound_bearing?;
+        let in_radius = match self.last_sound_dist.as_str() {
+            "near" => radius >= 60.0,
+            "mid" => radius >= 120.0,
+            _ => false,
+        };
+        if !in_radius {
+            return None;
+        }
+        let matches_tracked = self.tracked_enemies.values().any(|e| {
+            if dist2d(me_pos[0], me_pos[1], e.pos[0], e.pos[1]) > radius + 40.0 {
+                return false;
+            }
+            let eb = (e.pos[1] - me_pos[1]).atan2(e.pos[0] - me_pos[0]);
+            angle_diff(b, eb).abs() <= 0.45
+        });
+        if matches_tracked {
+            return None;
+        }
+        Some([
+            me_pos[0] + b.cos() * 60.0,
+            me_pos[1] + b.sin() * 60.0,
+            me_pos[2] + 7.5,
+        ])
+    }
+
+    pub fn known_enemy_count_within(&self, me_pos: [f64; 3], t: f64, radius: f64) -> usize {
+        let mut count = self
+            .tracked_enemies
+            .values()
+            .filter(|e| dist2d(me_pos[0], me_pos[1], e.pos[0], e.pos[1]) <= radius)
+            .count();
+        if let Some((hpos, _)) = self.last_hunt_pos {
+            if dist2d(me_pos[0], me_pos[1], hpos[0], hpos[1]) <= radius
+                && self
+                    .tracked_enemies
+                    .values()
+                    .all(|e| dist2d(hpos[0], hpos[1], e.pos[0], e.pos[1]) > 25.0)
+            {
+                count += 1;
+            }
+        }
+        if self.unmatched_sound_threat(me_pos, t, radius).is_some() {
+            count += 1;
+        }
+        count
+    }
+
+    pub fn sorted_tracked_threats_within(
+        &self,
+        me_pos: [f64; 3],
+        max_d: f64,
+        exclude_id: Option<u64>,
+    ) -> Vec<[f64; 3]> {
+        let mut items: Vec<(u64, [f64; 3])> = self
+            .tracked_enemies
+            .iter()
+            .filter(|(&id, e)| {
+                Some(id) != exclude_id
+                    && dist2d(me_pos[0], me_pos[1], e.pos[0], e.pos[1]) <= max_d
+            })
+            .map(|(&id, e)| (id, [e.pos[0], e.pos[1], e.pos[2] + 7.5]))
+            .collect();
+        items.sort_unstable_by_key(|&(id, _)| id);
+        items.into_iter().map(|(_, p)| p).collect()
     }
 }
