@@ -66,6 +66,7 @@ pub struct NavGrid {
     pub walkable: Vec<bool>,
     pub near_cover: Vec<bool>,
     pub ground_z: Vec<f32>,
+    pub openness: Vec<f32>,
     step_up: f64,
     max_slope_tan: f64,
 }
@@ -77,6 +78,7 @@ impl NavGrid {
         height: f64,
         step_up: f64,
         max_slope_deg: f64,
+        canopy_blocks: bool,
     ) -> Self {
         let cell = 4.0;
         let origin_x = map.min_x;
@@ -88,6 +90,8 @@ impl NavGrid {
         let mut walkable = vec![false; total];
         let mut near_cover = vec![false; total];
         let mut ground_z = vec![0.0_f32; total];
+        let mut solid_top = vec![0.0_f32; total];
+        let mut canopy_at_eye = vec![false; total];
 
         for cy in 0..ny {
             let wy = origin_y + (cy as f64 + 0.5) * cell;
@@ -99,6 +103,11 @@ impl NavGrid {
                 let idx = cy * nx + cx;
                 walkable[idx] = ok;
                 ground_z[idx] = surf_z as f32;
+                let ray_ref = gz + 8.5;
+                solid_top[idx] = map.solid_top_at(wx, wy, ray_ref) as f32;
+                if canopy_blocks {
+                    canopy_at_eye[idx] = map.point_in_canopy(wx, wy, ray_ref);
+                }
             }
         }
 
@@ -131,6 +140,85 @@ impl NavGrid {
             }
         }
 
+        // Swing 5: precompute openness on 2x2 (8 m) blocks by casting 16 horizontal rays
+        let mut openness = vec![1.0_f32; total];
+        let mut dirs16 = [(0.0_f64, 0.0_f64); 16];
+        for (k, d) in dirs16.iter_mut().enumerate() {
+            let theta = (k as f64) * (2.0 * std::f64::consts::PI / 16.0);
+            *d = (theta.cos(), theta.sin());
+        }
+        let step_m = 4.0_f64;
+        let max_steps = 30usize; // 4 m steps out to 120 m
+        let canopy_thresh = map.canopy_block_m;
+
+        for cy0 in (0..ny).step_by(2) {
+            let cy1 = (cy0 + 2).min(ny);
+            for cx0 in (0..nx).step_by(2) {
+                let cx1 = (cx0 + 2).min(nx);
+                let mut sample_cell = None;
+                'pick: for cy in cy0..cy1 {
+                    for cx in cx0..cx1 {
+                        if walkable[cy * nx + cx] {
+                            sample_cell = Some((cx, cy));
+                            break 'pick;
+                        }
+                    }
+                }
+                let Some((scx, scy)) = sample_cell else {
+                    continue;
+                };
+                let sidx = scy * nx + scx;
+                let wx = origin_x + (scx as f64 + 0.5) * cell;
+                let wy = origin_y + (scy as f64 + 0.5) * cell;
+                let ray_z = (ground_z[sidx] as f64) + 8.5;
+
+                let mut reached_60 = 0usize;
+                for &(dx, dy) in &dirs16 {
+                    let mut canopy_m = 0.0_f64;
+                    let mut dist_reached = 0.0_f64;
+                    for s in 1..=max_steps {
+                        let d = (s as f64) * step_m;
+                        let rx = wx + dx * d;
+                        let ry = wy + dy * d;
+                        if rx < map.min_x || rx > map.max_x || ry < map.min_y || ry > map.max_y {
+                            break;
+                        }
+                        let rcx = (((rx - origin_x) / cell).floor() as isize)
+                            .clamp(0, (nx - 1) as isize) as usize;
+                        let rcy = (((ry - origin_y) / cell).floor() as isize)
+                            .clamp(0, (ny - 1) as isize) as usize;
+                        let ridx = rcy * nx + rcx;
+                        if (solid_top[ridx] as f64) >= ray_z {
+                            break;
+                        }
+                        if d > 45.0 && canopy_at_eye[ridx] {
+                            canopy_m += step_m;
+                            if canopy_m >= canopy_thresh {
+                                break;
+                            }
+                        }
+                        dist_reached = d;
+                        if dist_reached >= 60.0 {
+                            break;
+                        }
+                    }
+                    if dist_reached >= 60.0 {
+                        reached_60 += 1;
+                    }
+                }
+
+                let val = (reached_60 as f32) / 16.0;
+                for cy in cy0..cy1 {
+                    for cx in cx0..cx1 {
+                        let idx = cy * nx + cx;
+                        if walkable[idx] {
+                            openness[idx] = val;
+                        }
+                    }
+                }
+            }
+        }
+
         Self {
             cell,
             origin_x,
@@ -140,9 +228,17 @@ impl NavGrid {
             walkable,
             near_cover,
             ground_z,
+            openness,
             step_up,
             max_slope_tan: max_slope_deg.to_radians().tan(),
         }
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn openness_at(&self, x: f64, y: f64) -> f32 {
+        let (cx, cy) = self.world_to_cell(x, y);
+        self.openness[cy * self.nx + cx]
     }
 
     pub fn len(&self) -> usize {
@@ -310,7 +406,9 @@ impl NavGrid {
                     continue;
                 }
 
-                let ng = cur_g.saturating_add(cost);
+                let weighted_cost =
+                    ((cost as f64) * (1.0 + 2.5 * (self.openness[nidx] as f64))).round() as u32;
+                let ng = cur_g.saturating_add(weighted_cost);
                 let is_unseen = scratch.seen[nidx] != stamp;
                 if is_unseen || ng < scratch.g[nidx] {
                     scratch.seen[nidx] = stamp;
@@ -384,6 +482,7 @@ impl NavGrid {
         let steps = ((dist / (self.cell * 0.4)).ceil() as usize).max(1);
         let mut prev_z = self.ground_z[a.1 * self.nx + a.0] as f64;
         let step_len = dist / steps as f64;
+        let mut sum_open = 0.0_f64;
 
         for s in 1..=steps {
             let t = s as f64 / steps as f64;
@@ -399,7 +498,11 @@ impl NavGrid {
             if dz > self.step_up && dz / step_len.max(0.5) > self.max_slope_tan {
                 return false;
             }
+            sum_open += self.openness[idx] as f64;
             prev_z = z;
+        }
+        if dist > 20.0 && (sum_open / (steps as f64)) > 0.45 {
+            return false;
         }
         true
     }
@@ -640,7 +743,10 @@ impl NavGrid {
                     0.0
                 };
 
-                let mut score = corner_bonus - 0.7 * d_me - 0.15 * d_next;
+                let mut score = corner_bonus
+                    - 0.7 * d_me
+                    - 0.15 * d_next
+                    - 45.0 * (self.openness[idx] as f64);
                 if let Some(prev) = avoid_prev {
                     if (w[0] - prev[0]).hypot(w[1] - prev[1]) < 35.0 {
                         score -= 90.0;
@@ -788,7 +894,7 @@ mod tests {
         )
         .expect("arena should load");
         let t0 = Instant::now();
-        let nav = NavGrid::build(&map, 2.5, 9.0, 1.2, 50.0);
+        let nav = NavGrid::build(&map, 2.5, 9.0, 1.2, 50.0, true);
         let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
         assert!(build_ms < 500.0, "NavGrid build took {build_ms:.1} ms");
 
@@ -834,7 +940,7 @@ mod tests {
             &["v2/world.json".into(), "v2/terrain.i16".into()],
         )
         .expect("arena should load");
-        let nav = NavGrid::build(&map, 2.5, 9.0, 1.2, 50.0);
+        let nav = NavGrid::build(&map, 2.5, 9.0, 1.2, 50.0, true);
 
         let me_z = map.ground_height(86.0, -110.0);
         let next_center = [50.0, -100.0];
@@ -891,6 +997,23 @@ mod tests {
         assert!(
             map.has_los([peek[0], peek[1], pz + 8.0], threat),
             "peek point {peek:?} must have 3D LOS to threat"
+        );
+    }
+
+    #[test]
+    fn openness_map_prefers_sheltered_route_and_low_exposure_corners() {
+        let map = Map::load(
+            "mechfight-kit/arena",
+            &["v2/world.json".into(), "v2/terrain.i16".into()],
+        )
+        .expect("arena should load");
+        let nav = NavGrid::build(&map, 2.5, 9.0, 1.2, 50.0, true);
+
+        let open_oval = nav.openness_at(-50.0, 0.0);
+        let wall_corner = nav.openness_at(170.0, -96.0);
+        assert!(
+            open_oval > wall_corner + 0.15,
+            "open Oval ({open_oval:.2}) must have higher openness than wall-sheltered spot ({wall_corner:.2})"
         );
     }
 }

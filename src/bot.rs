@@ -32,12 +32,19 @@ impl Bot {
         let height = stat(&hello.config.mech, "height", 9.0);
         let step_up = stat(&hello.config.mech, "step_up", 1.2);
         let max_slope_deg = stat(&hello.config.mech, "max_slope_deg", 50.0);
-        let nav = NavGrid::build(&map, radius, height, step_up, max_slope_deg);
+        let nav = NavGrid::build(
+            &map,
+            radius,
+            height,
+            step_up,
+            max_slope_deg,
+            hello.config.vision.canopy_blocks,
+        );
         let nav_scratch = NavScratch::new(nav.len());
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m7".to_string(),
+            name: "rust-bot-m9-exposure".to_string(),
             config: hello.config,
             map,
             nav,

@@ -8,6 +8,34 @@ struct RawWorld {
     bounds: RawBounds,
     terrain: RawTerrain,
     prisms: Vec<RawPrism>,
+    #[serde(default)]
+    rules: RawRules,
+    #[serde(default)]
+    trees: RawTrees,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RawRules {
+    canopy_density: Option<f64>,
+    canopy_block_t: Option<f64>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawTrees {
+    #[serde(default)]
+    fields: Vec<String>,
+    #[serde(default)]
+    data: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Tree {
+    pub crown_x: f64,
+    pub crown_y: f64,
+    pub crown_base_z: f64,
+    pub crown_top_z: f64,
+    pub crown_r: f64,
 }
 
 #[derive(Deserialize)]
@@ -67,12 +95,15 @@ pub struct Map {
     t_ny: usize,
     heights: Vec<f32>,
     pub prisms: Vec<Prism>,
+    pub trees: Vec<Tree>,
+    pub canopy_block_m: f64,
     grid_cell: f64,
     grid_nx: usize,
     grid_ny: usize,
     grid_origin_x: f64,
     grid_origin_y: f64,
     grid: Vec<Vec<usize>>,
+    tree_grid: Vec<Vec<usize>>,
 }
 
 impl Map {
@@ -169,6 +200,71 @@ impl Map {
             }
         }
 
+        let canopy_density = raw.rules.canopy_density.unwrap_or(0.35).max(0.05);
+        let canopy_block_t = raw.rules.canopy_block_t.unwrap_or(0.25).clamp(0.01, 0.99);
+        let canopy_block_m = (-canopy_block_t.ln() / canopy_density).clamp(2.0, 8.0);
+
+        let mut trees = Vec::new();
+        let mut tree_grid = vec![Vec::new(); grid_nx * grid_ny];
+        let nf = raw.trees.fields.len();
+        if nf > 0 && !raw.trees.data.is_empty() {
+            let fidx = |name: &str| raw.trees.fields.iter().position(|f| f == name);
+            if let (Some(iz), Some(ih), Some(icb), Some(icr)) = (
+                fidx("z"),
+                fidx("height"),
+                fidx("crownBase"),
+                fidx("crownR"),
+            ) {
+                let icx = fidx("crownX").or_else(|| fidx("x"));
+                let icy = fidx("crownY").or_else(|| fidx("y"));
+                if let (Some(icx), Some(icy)) = (icx, icy) {
+                    for row in raw.trees.data.chunks_exact(nf) {
+                        let crown_x = row[icx];
+                        let crown_y = row[icy];
+                        let z = row[iz];
+                        let crown_r = row[icr];
+                        let crown_base_z = z + row[icb];
+                        let crown_top_z = z + row[ih];
+                        if crown_r > 0.0
+                            && crown_top_z > crown_base_z
+                            && crown_x.is_finite()
+                            && crown_y.is_finite()
+                        {
+                            let tidx = trees.len();
+                            let cx0 = (((crown_x - crown_r - grid_origin_x) / grid_cell).floor()
+                                as isize)
+                                .clamp(0, (grid_nx - 1) as isize)
+                                as usize;
+                            let cx1 = (((crown_x + crown_r - grid_origin_x) / grid_cell).floor()
+                                as isize)
+                                .clamp(0, (grid_nx - 1) as isize)
+                                as usize;
+                            let cy0 = (((crown_y - crown_r - grid_origin_y) / grid_cell).floor()
+                                as isize)
+                                .clamp(0, (grid_ny - 1) as isize)
+                                as usize;
+                            let cy1 = (((crown_y + crown_r - grid_origin_y) / grid_cell).floor()
+                                as isize)
+                                .clamp(0, (grid_ny - 1) as isize)
+                                as usize;
+                            for cy in cy0..=cy1 {
+                                for cx in cx0..=cx1 {
+                                    tree_grid[cy * grid_nx + cx].push(tidx);
+                                }
+                            }
+                            trees.push(Tree {
+                                crown_x,
+                                crown_y,
+                                crown_base_z,
+                                crown_top_z,
+                                crown_r,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             min_x: raw.bounds.min_x,
             max_x: raw.bounds.max_x,
@@ -181,12 +277,15 @@ impl Map {
             t_ny: raw.terrain.ny,
             heights,
             prisms,
+            trees,
+            canopy_block_m,
             grid_cell,
             grid_nx,
             grid_ny,
             grid_origin_x,
             grid_origin_y,
             grid,
+            tree_grid,
         })
     }
 
@@ -203,12 +302,15 @@ impl Map {
             t_ny: 3,
             heights: vec![0.0; 9],
             prisms: Vec::new(),
+            trees: Vec::new(),
+            canopy_block_m: 3.96,
             grid_cell: 64.0,
             grid_nx: 1,
             grid_ny: 1,
             grid_origin_x: -600.0,
             grid_origin_y: -600.0,
             grid: vec![Vec::new()],
+            tree_grid: vec![Vec::new()],
         }
     }
 
@@ -352,6 +454,39 @@ impl Map {
             true
         });
         h
+    }
+
+    pub fn solid_top_at(&self, x: f64, y: f64, ray_ref_z: f64) -> f64 {
+        let mut h = self.ground_height(x, y);
+        self.for_each_prism_in_aabb(x, x, y, y, |idx| {
+            let p = &self.prisms[idx];
+            if p.base <= ray_ref_z && self.point_in_prism_2d(idx, x, y) {
+                h = h.max(p.top);
+            }
+            true
+        });
+        h
+    }
+
+    pub fn point_in_canopy(&self, x: f64, y: f64, z: f64) -> bool {
+        if self.trees.is_empty() {
+            return false;
+        }
+        let cx = (((x - self.grid_origin_x) / self.grid_cell).floor() as isize)
+            .clamp(0, (self.grid_nx - 1) as isize) as usize;
+        let cy = (((y - self.grid_origin_y) / self.grid_cell).floor() as isize)
+            .clamp(0, (self.grid_ny - 1) as isize) as usize;
+        for &tidx in &self.tree_grid[cy * self.grid_nx + cx] {
+            let tr = &self.trees[tidx];
+            if z >= tr.crown_base_z && z <= tr.crown_top_z {
+                let dx = x - tr.crown_x;
+                let dy = y - tr.crown_y;
+                if dx * dx + dy * dy <= tr.crown_r * tr.crown_r {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn has_tall_prism_near(&self, x: f64, y: f64, ground_z: f64, probe_r: f64) -> bool {
@@ -745,6 +880,12 @@ mod tests {
         assert_eq!(map.t_nx, 1070);
         assert_eq!(map.t_ny, 724);
         assert_eq!(map.prisms.len(), 259);
+        assert_eq!(map.trees.len(), 1560);
+        assert!((map.canopy_block_m - 3.96).abs() < 0.2);
+        assert!(map
+            .trees
+            .iter()
+            .all(|t| t.crown_top_z > t.crown_base_z && t.crown_r > 0.0));
 
         let h0 = map.ground_height(0.0, 0.0);
         assert!(h0.is_finite());
