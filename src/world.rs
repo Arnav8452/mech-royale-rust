@@ -21,12 +21,19 @@ pub(crate) struct TrackedEnemy {
     pub laser_cd_until: f64,
     pub est_gun_shots: u8,
     pub last_gun_shot_t: f64,
+    pub prev_vel_xy: [f64; 2],
+    pub last_reverse_t: f64,
 }
 
 impl TrackedEnemy {
     #[inline]
     pub fn is_reloading(&self, t: f64) -> bool {
         t < self.gun_reload_until - 0.15
+    }
+
+    #[inline]
+    pub fn is_reversing(&self, t: f64) -> bool {
+        t - self.last_reverse_t <= 2.2
     }
 
     #[inline]
@@ -191,28 +198,48 @@ impl WorldState {
             if actor.kind != "mech" {
                 continue;
             }
-            let (est_az, mut gun_reload_until, mut laser_cd_until, est_gun_shots, last_gun_shot_t) =
-                if let Some(prev) = self.tracked_enemies.get(&actor.id) {
-                    let dt = t - prev.last_seen_t;
-                    let az = if (0.04..=0.5).contains(&dt) {
-                        0.5 * prev.est_accel_z + 0.5 * ((actor.vel[2] - prev.vel[2]) / dt)
-                    } else {
-                        0.0
-                    };
-                    let mut lcd = prev.laser_cd_until;
-                    if prev.charging && !actor.charging && dt <= 0.35 {
-                        lcd = lcd.max(t + laser_cd_s);
-                    }
-                    (
-                        az,
-                        prev.gun_reload_until,
-                        lcd,
-                        prev.est_gun_shots,
-                        prev.last_gun_shot_t,
-                    )
+            let (
+                est_az,
+                mut gun_reload_until,
+                mut laser_cd_until,
+                est_gun_shots,
+                last_gun_shot_t,
+                last_reverse_t,
+            ) = if let Some(prev) = self.tracked_enemies.get(&actor.id) {
+                let dt = t - prev.last_seen_t;
+                let az = if (0.04..=0.5).contains(&dt) {
+                    0.5 * prev.est_accel_z + 0.5 * ((actor.vel[2] - prev.vel[2]) / dt)
                 } else {
-                    (0.0, -100.0, -100.0, 0, -100.0)
+                    0.0
                 };
+                let mut lcd = prev.laser_cd_until;
+                if prev.charging && !actor.charging && dt <= 0.35 {
+                    lcd = lcd.max(t + laser_cd_s);
+                }
+                let mut rev_t = prev.last_reverse_t;
+                if (0.04..=0.5).contains(&dt) {
+                    let to_e = crate::geom::unit2d(
+                        actor.pos[0] - me.pos[0],
+                        actor.pos[1] - me.pos[1],
+                    );
+                    let perp = [-to_e[1], to_e[0]];
+                    let lat_prev = prev.prev_vel_xy[0] * perp[0] + prev.prev_vel_xy[1] * perp[1];
+                    let lat_cur = actor.vel[0] * perp[0] + actor.vel[1] * perp[1];
+                    if lat_prev * lat_cur < -4.0 {
+                        rev_t = t;
+                    }
+                }
+                (
+                    az,
+                    prev.gun_reload_until,
+                    lcd,
+                    prev.est_gun_shots,
+                    prev.last_gun_shot_t,
+                    rev_t,
+                )
+            } else {
+                (0.0, -100.0, -100.0, 0, -100.0, -100.0)
+            };
 
             if !actor.weapons.contains(&WeaponKind::Gun) {
                 gun_reload_until = -100.0;
@@ -237,6 +264,8 @@ impl WorldState {
                     laser_cd_until,
                     est_gun_shots,
                     last_gun_shot_t,
+                    prev_vel_xy: [actor.vel[0], actor.vel[1]],
+                    last_reverse_t,
                 },
             );
         }

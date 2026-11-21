@@ -4,7 +4,9 @@ use crate::combat::{
 use crate::geom::{dist2d, wrap_angle};
 use crate::map::Map;
 use crate::nav::{NavGrid, NavScratch};
-use crate::protocol::{stat, Action, Config, DebugDraw, DebugLine, DebugPoint, Hello, Observation};
+use crate::protocol::{
+    stat, Action, Config, DebugDraw, DebugLine, DebugPoint, Hello, Observation, WeaponKind,
+};
 use crate::steering;
 use crate::strategy::{CombatTactic, Posture, StrategyState};
 use crate::world::WorldState;
@@ -37,7 +39,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m7".to_string(),
+            name: "rust-bot-m9-fire".to_string(),
             config: hello.config,
             map,
             nav,
@@ -182,7 +184,7 @@ impl Bot {
             self.world.last_combat_t = t;
         }
 
-        // Cover-reload discipline & safe open reload
+        // Cover-reload discipline & Swing 2 gap reload
         let near_mech_100 = self
             .world
             .tracked_enemies
@@ -193,7 +195,25 @@ impl Bot {
             && any_visible_mech
                 .as_ref()
                 .is_some_and(|m| m.hp <= 420.0 || m.is_vulnerable);
-        if !reload && combat::should_cover_reload(me, near_mech_100, los_mech_count, rushing_kill_peek)
+        let gun_fired = me
+            .weapons
+            .iter()
+            .enumerate()
+            .take(2)
+            .any(|(i, w)| fire[i] && w.as_ref().is_some_and(|wo| wo.kind == WeaponKind::Gun));
+        let closest_los_dist = los_mechs
+            .iter()
+            .map(|m| m.dist)
+            .fold(f64::INFINITY, f64::min);
+        if !reload
+            && combat::should_cover_reload(
+                me,
+                near_mech_100,
+                los_mech_count,
+                rushing_kill_peek,
+                gun_fired,
+                closest_los_dist,
+            )
         {
             reload = true;
         }
@@ -428,6 +448,7 @@ mod tests {
             is_reloading: false,
             is_laser_on_cd: false,
             is_vulnerable: false,
+            is_reversing: false,
         };
         let muzzle = [0.0, 0.0, 67.0];
         assert!(bot.map.has_los(muzzle, [100.0, 0.0, 64.5]));
@@ -535,6 +556,7 @@ mod tests {
             is_reloading: false,
             is_laser_on_cd: false,
             is_vulnerable: false,
+            is_reversing: false,
         };
         let muzzle = [0.0, 0.0, 67.0];
         // 0.15 rad (~8.6 deg) off target at 100 m must NOT release!
@@ -1531,6 +1553,7 @@ mod tests {
             is_reloading: false,
             is_laser_on_cd: false,
             is_vulnerable: false,
+            is_reversing: false,
         };
         let full_flanker = TargetCandidate {
             id: 6,
@@ -1552,6 +1575,7 @@ mod tests {
             is_reloading: false,
             is_laser_on_cd: false,
             is_vulnerable: false,
+            is_reversing: false,
         };
         let picked = pick_best_mech_target(&[full_flanker, wounded_sticky], me, None, Some(5))
             .expect("must pick a target");
@@ -1810,6 +1834,155 @@ mod tests {
             act.move_dir.unwrap()[0] < -0.4,
             "should hunt West (-x) toward last_hunt_pos at [-150, 0], got {:?}",
             act.move_dir
+        );
+    }
+
+    #[test]
+    fn fire_control_holds_against_reversing_strafer_at_155m_but_fires_at_steady() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        // Flat open Oval corridor [-155, 0] -> [0, 0] (155 m)
+        let p0 = [-155.0, 0.0];
+        let p1 = [0.0, 0.0];
+        let mz = bot.map.ground_height(p0[0], p0[1]);
+        let ez = bot.map.ground_height(p1[0], p1[1]);
+        assert!(
+            bot.map
+                .has_los([p0[0], p0[1], mz + 7.0], [p1[0], p1[1], ez + 4.5]),
+            "test corridor across Oval should have clear LOS"
+        );
+        obs.self_obs.pos = [p0[0], p0[1], mz];
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [0.0, 0.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 120.0;
+
+        // 1. Steady non-reversing strafer moving +y at 11.7 m/s at 155 m: lead aimed -> FIRES!
+        obs.t = 30.0;
+        let steady_lead_aim = direct_aim(
+            [p0[0], p0[1], mz + 7.0],
+            [p1[0], p1[1] + 11.7 * (155.0 / 252.0), ez + 4.5],
+        );
+        obs.self_obs.aim = steady_lead_aim;
+        obs.mechs = vec![ActorObs {
+            id: 5,
+            kind: "mech".into(),
+            pos: [p1[0], p1[1], ez],
+            vel: [0.0, 11.7, 0.0],
+            aim: [PI, 0.0],
+            hp: Some(1200.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+        let act_steady = bot.act(&obs);
+        assert!(
+            act_steady.fire.unwrap()[0],
+            "steady mover at 155 m should meet P>=0.50 and fire"
+        );
+
+        // 2. Enemy reverses sideways (-11.7 m/s) 0.1 s later -> detected as reversing -> HOLDS fire at 155 m!
+        obs.t = 30.1;
+        let rev_lead_aim = direct_aim(
+            [p0[0], p0[1], mz + 7.0],
+            [p1[0], p1[1] - 11.7 * (155.0 / 252.0), ez + 4.5],
+        );
+        obs.self_obs.aim = rev_lead_aim;
+        obs.mechs[0].vel = [0.0, -11.7, 0.0];
+        let act_rev_far = bot.act(&obs);
+        assert!(bot.world.tracked_enemies[&5].is_reversing(obs.t));
+        assert!(
+            !act_rev_far.fire.unwrap()[0],
+            "must hold Gun ammo at 155 m against recently reversing strafer (P < 0.50)"
+        );
+
+        // 3. Same reversing strafer moved closer to 75 m ([-155, 0] vs [-80, 0]): P >= 0.50 -> FIRES!
+        let close_p1 = [-80.0, 0.0];
+        let cz = bot.map.ground_height(close_p1[0], close_p1[1]);
+        obs.t = 30.2;
+        obs.mechs[0].pos = [close_p1[0], close_p1[1], cz];
+        obs.self_obs.aim = direct_aim(
+            [p0[0], p0[1], mz + 7.0],
+            [close_p1[0], close_p1[1] - 11.7 * (75.0 / 252.0), cz + 4.5],
+        );
+        let act_rev_close = bot.act(&obs);
+        assert!(
+            act_rev_close.fire.unwrap()[0],
+            "must resume firing on reversing strafer once inside 75 m"
+        );
+    }
+
+    #[test]
+    fn fire_control_reloads_in_gap_at_4_ammo_but_not_during_good_shot() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let p0 = [-155.0, 0.0];
+        let p1 = [0.0, 0.0];
+        let mz = bot.map.ground_height(p0[0], p0[1]);
+        let ez = bot.map.ground_height(p1[0], p1[1]);
+        obs.self_obs.pos = [p0[0], p0[1], mz];
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [0.0, 0.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 120.0;
+        if let Some(Some(w)) = obs.self_obs.weapons.get_mut(0) {
+            w.ammo = Some(4.0);
+            w.reload = Some(0.0);
+        }
+
+        // First tick at 30.0 moving +y; second tick at 30.1 reverses to -y so P < 0.65 (no good shot window!)
+        obs.t = 30.0;
+        obs.mechs = vec![ActorObs {
+            id: 5,
+            kind: "mech".into(),
+            pos: [p1[0], p1[1], ez],
+            vel: [0.0, 11.7, 0.0],
+            aim: [PI, 0.0],
+            hp: Some(1200.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+        bot.act(&obs);
+
+        obs.t = 30.1;
+        obs.mechs[0].vel = [0.0, -11.7, 0.0];
+        obs.self_obs.aim = direct_aim(
+            [p0[0], p0[1], mz + 7.0],
+            [p1[0], p1[1] - 11.7 * (155.0 / 252.0), ez + 4.5],
+        );
+        let act_gap = bot.act(&obs);
+        assert!(!act_gap.fire.unwrap()[0]);
+        assert_eq!(
+            act_gap.reload,
+            Some(true),
+            "at 4 ammo with no good shot at 155 m, must reload during the gap"
+        );
+
+        // Inside good close-range shot window (75 m, slow target): MUST shoot instead of reloading at 4 ammo!
+        obs.t = 30.2;
+        obs.mechs[0].pos = [-80.0, 0.0, bot.map.ground_height(-80.0, 0.0)];
+        obs.mechs[0].vel = [0.0, 0.0, 0.0];
+        obs.self_obs.aim = direct_aim(
+            [p0[0], p0[1], mz + 7.0],
+            [-80.0, 0.0, bot.map.ground_height(-80.0, 0.0) + 4.5],
+        );
+        let act_window = bot.act(&obs);
+        assert!(act_window.fire.unwrap()[0]);
+        assert_ne!(
+            act_window.reload,
+            Some(true),
+            "must NOT reload in the middle of a high-hit-chance shot window"
         );
     }
 }

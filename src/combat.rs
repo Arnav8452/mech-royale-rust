@@ -32,6 +32,7 @@ pub(crate) struct TargetCandidate {
     pub is_reloading: bool,
     pub is_laser_on_cd: bool,
     pub is_vulnerable: bool,
+    pub is_reversing: bool,
 }
 
 pub(crate) fn select_targets(
@@ -82,6 +83,7 @@ pub(crate) fn select_targets(
             let is_reloading = tracked.is_some_and(|e| e.is_reloading(obs.t));
             let is_laser_on_cd = tracked.is_some_and(|e| e.is_laser_on_cd(obs.t));
             let is_vulnerable = tracked.is_some_and(|e| e.is_vulnerable(obs.t));
+            let is_reversing = tracked.is_some_and(|e| e.is_reversing(obs.t));
 
             mech_cands.push(TargetCandidate {
                 id: actor.id,
@@ -103,6 +105,7 @@ pub(crate) fn select_targets(
                 is_reloading,
                 is_laser_on_cd,
                 is_vulnerable,
+                is_reversing,
             });
         } else if actor.kind == "npc"
             && d <= 125.0
@@ -132,6 +135,7 @@ pub(crate) fn select_targets(
                     is_reloading: false,
                     is_laser_on_cd: false,
                     is_vulnerable: false,
+                    is_reversing: false,
                 };
                 let score = 200.0 - d;
                 if best_farm.as_ref().is_none_or(|(bs, _)| score > *bs) {
@@ -173,6 +177,7 @@ pub(crate) fn select_targets(
                     is_reloading: false,
                     is_laser_on_cd: false,
                     is_vulnerable: false,
+                    is_reversing: false,
                 };
                 let score = 100.0 - d;
                 if best_farm.as_ref().is_none_or(|(bs, _)| score > *bs) {
@@ -298,6 +303,16 @@ pub(crate) fn eval_combat(
             .is_some_and(|w| w.charge.unwrap_or(0.0) > 0.0)
     });
 
+    let other_weapon_ready = laser_slot.is_some_and(|ls| {
+        let lw = me.weapons[ls].as_ref().unwrap();
+        let lr = stat(&lw.stats, "range", 280.0);
+        tgt.has_los && tgt.dist <= lr - 2.0 && (lw.charge.unwrap_or(0.0) > 0.0 || lw.cooldown <= 0.15)
+    }) || lightning_slot.is_some_and(|lts| {
+        let lt = me.weapons[lts].as_ref().unwrap();
+        let ltr = stat(&lt.stats, "range", 45.0);
+        tgt.has_los && tgt.dist <= ltr - 0.5 && me.energy >= 12.0
+    });
+
     let eval_gun_slot = |slot: usize| -> ([f64; 2], bool, bool, bool) {
         let w = me.weapons[slot].as_ref().unwrap();
         eval_gun(
@@ -310,6 +325,7 @@ pub(crate) fn eval_combat(
             tgt,
             min_pitch,
             max_pitch,
+            other_weapon_ready,
         )
     };
 
@@ -540,6 +556,8 @@ pub(crate) fn should_cover_reload(
     near_mech_100: usize,
     los_mech_count: usize,
     rushing_kill_peek: bool,
+    gun_fired_this_tick: bool,
+    closest_los_dist: f64,
 ) -> bool {
     let laser_charging = me
         .weapons
@@ -556,6 +574,13 @@ pub(crate) fn should_cover_reload(
             let ammo = wopt.ammo.unwrap_or(mag);
             if ammo < mag {
                 if near_mech_100 == 0 && ammo <= 4.0 {
+                    return true;
+                }
+                if ammo <= 4.0
+                    && !gun_fired_this_tick
+                    && !rushing_kill_peek
+                    && (los_mech_count == 0 || closest_los_dist > 55.0)
+                {
                     return true;
                 }
                 if los_mech_count == 0
@@ -581,9 +606,11 @@ fn eval_gun(
     tgt: &TargetCandidate,
     min_pitch: f64,
     max_pitch: f64,
+    other_weapon_ready: bool,
 ) -> ([f64; 2], bool, bool, bool) {
     let speed = stat(&w.stats, "speed", 252.0);
     let range = stat(&w.stats, "range", 230.0);
+    let spread_deg = stat(&w.stats, "spread_deg", 0.6);
     let mag = stat(&w.stats, "mag", 12.0);
     let ammo = w.ammo.unwrap_or(mag);
     let reload_left = w.reload.unwrap_or(0.0);
@@ -607,18 +634,72 @@ fn eval_gun(
     let dist = dist3d(muzzle, lead_pos);
     // Never gate trigger on cooldown <= 0.12: holding trigger fires cleanly every 0.24 s!
     let ready = reload_left <= 0.0 && ammo > 0.0 && dist <= range;
-    let slew_ok = slew_aligned(
+    let hit_ok = gun_hit_chance_ok(
         cur_aim,
         aim,
-        tgt.radius,
-        tgt.aim_half_h,
-        dist.max(4.0),
-        1.25,
-        0.012,
+        dist,
+        speed,
+        spread_deg,
+        ammo,
+        other_weapon_ready,
+        tgt,
     );
     let los_ok = tgt.has_los && map.has_los(muzzle, lead_pos);
 
-    (aim, ready && slew_ok && los_ok, need_reload, ready)
+    (aim, ready && hit_ok && los_ok, need_reload, ready && hit_ok)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gun_hit_chance_ok(
+    cur_aim: [f64; 2],
+    aim: [f64; 2],
+    dist: f64,
+    speed: f64,
+    spread_deg: f64,
+    ammo: f64,
+    other_weapon_ready: bool,
+    tgt: &TargetCandidate,
+) -> bool {
+    let pitch_err = (cur_aim[1] - aim[1]).abs();
+    let pitch_tol = (tgt.aim_half_h * 1.35 / dist.max(4.0))
+        .atan()
+        .clamp(0.02, 0.35);
+    if pitch_err > pitch_tol {
+        return false;
+    }
+
+    let t = (dist / speed.max(1.0)).min(2.0);
+    let sigma_spread = dist * spread_deg.to_radians().tan();
+    let tgt_speed_xy = tgt.vel[0].hypot(tgt.vel[1]);
+    let sigma_move = if matches!(tgt.kind, TargetKind::Mech) {
+        if tgt.is_reversing {
+            15.0 * t * t
+        } else if tgt.charging || tgt_speed_xy < 1.5 {
+            0.35
+        } else {
+            0.65
+        }
+    } else {
+        0.30
+    };
+    let eff_r = if (tgt.aim_z - tgt.com_z).abs() > 0.5 {
+        tgt.radius * 0.80
+    } else {
+        tgt.radius
+    };
+    let yaw_err = angle_diff(cur_aim[0], aim[0]);
+    let scaled_pitch = pitch_err * (eff_r / tgt.aim_half_h.max(1.0));
+    let sigma_aim = yaw_err.hypot(scaled_pitch) * dist;
+    let sigma =
+        (sigma_spread * sigma_spread + sigma_move * sigma_move + sigma_aim * sigma_aim).sqrt();
+    let mult = if tgt.hp <= 300.0 {
+        2.60
+    } else if ammo <= 4.0 && !other_weapon_ready {
+        1.07
+    } else {
+        1.48
+    };
+    sigma <= mult * eff_r
 }
 
 #[allow(clippy::too_many_arguments)]
