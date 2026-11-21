@@ -1389,17 +1389,12 @@ impl StrategyState {
             .iter()
             .flatten()
             .any(|w| w.kind == WeaponKind::Lightning);
-        let have_laser = me
-            .weapons
-            .iter()
-            .flatten()
-            .any(|w| w.kind == WeaponKind::Laser);
 
         let close_los_enemy = los_mechs.iter().any(|m| m.dist < 60.0);
         let any_los_enemy = !los_mechs.is_empty();
         let max_seek_d = if slot1_empty {
             210.0
-        } else if !have_lightning || (!have_laser && obs.alive <= 12) {
+        } else if !have_lightning {
             115.0
         } else {
             65.0
@@ -1445,8 +1440,8 @@ impl StrategyState {
     }
 }
 
-/// Preferred loadout [Laser, Lightning] for corner peek-trades and anti-laser shorting.
-fn swap_slot_for(me: &SelfObs, new_kind: WeaponKind, alive: u64) -> Option<usize> {
+/// Preferred loadout [Gun, Lightning] for continuous 427.5 DPS melt with zero Laser charge slow.
+fn swap_slot_for(me: &SelfObs, new_kind: WeaponKind, _alive: u64) -> Option<usize> {
     if new_kind == WeaponKind::Mortar {
         return None;
     }
@@ -1458,43 +1453,32 @@ fn swap_slot_for(me: &SelfObs, new_kind: WeaponKind, alive: u64) -> Option<usize
     {
         return Some(m_slot);
     }
-    let has_gun_upgrades = me.upgrades.iter().any(|u| u.starts_with("gun_"));
-    let has_laser_upgrades = me.upgrades.iter().any(|u| u.starts_with("laser_"));
-    let laser_slot = me
-        .weapons
-        .iter()
-        .take(2)
-        .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Laser));
-    let gun_slot = me
-        .weapons
-        .iter()
-        .take(2)
-        .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Gun));
-
-    match new_kind {
-        WeaponKind::Lightning => {
-            if let Some(gs) = gun_slot {
-                if !has_gun_upgrades || has_laser_upgrades {
-                    return Some(gs);
-                }
+    if new_kind == WeaponKind::Lightning {
+        let has_gun_upgrades = me.upgrades.iter().any(|u| u.starts_with("gun_"));
+        let has_laser_upgrades = me.upgrades.iter().any(|u| u.starts_with("laser_"));
+        let laser_slot = me
+            .weapons
+            .iter()
+            .take(2)
+            .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Laser));
+        let gun_slot = me
+            .weapons
+            .iter()
+            .take(2)
+            .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Gun));
+        if let Some(ls) = laser_slot {
+            if !has_laser_upgrades || has_gun_upgrades {
+                return Some(ls);
             }
-            if let Some(ls) = laser_slot {
-                if !has_laser_upgrades {
-                    return Some(ls);
-                }
-            }
-            gun_slot.or(laser_slot)
         }
-        WeaponKind::Laser => {
-            if let Some(gs) = gun_slot {
-                if !has_gun_upgrades && alive <= 12 {
-                    return Some(gs);
-                }
+        if let Some(gs) = gun_slot {
+            if !has_gun_upgrades {
+                return Some(gs);
             }
-            None
         }
-        _ => None,
+        return laser_slot.or(gun_slot);
     }
+    None
 }
 
 #[inline]

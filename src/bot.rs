@@ -39,7 +39,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m11-corlas".to_string(),
+            name: "rust-bot-m11-corglt".to_string(),
             config: hello.config,
             map,
             nav,
@@ -2284,5 +2284,67 @@ mod tests {
             "with ready Laser 24 m from block 14 corner, corner tether must pull toward corner (+x), got {:?}",
             act_ready.move_dir
         );
+    }
+
+    #[test]
+    fn prefers_gun_plus_lightning_over_dropping_gun_for_laser() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(-45.0, 0.0);
+        obs.t = 35.0;
+        obs.alive = 6;
+        obs.self_obs.pos = [-45.0, 0.0, mz];
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [0.0, 0.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 120.0;
+        obs.mechs.clear();
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.drops.clear();
+
+        let gun = obs.self_obs.weapons[0].clone().unwrap();
+        let laser = WeaponObs {
+            kind: WeaponKind::Laser,
+            cooldown: 0.0,
+            ammo: None,
+            reload: None,
+            charge: Some(0.0),
+            stats: bot.config.weapons.laser.clone(),
+        };
+        let lt = WeaponObs {
+            kind: WeaponKind::Lightning,
+            cooldown: 0.0,
+            ammo: None,
+            reload: None,
+            charge: None,
+            stats: bot.config.weapons.lightning.clone(),
+        };
+
+        // 1. Holding [Gun, Laser] over Lightning pickup -> drops slot 1 (Laser) to form [Gun, Lightning]
+        obs.self_obs.weapons = vec![Some(gun.clone()), Some(laser)];
+        obs.pickups = vec![PickupObs {
+            id: 8100,
+            kind: WeaponKind::Lightning,
+            pos: [-45.0, 0.0, mz],
+        }];
+        let act1 = bot.act(&obs);
+        assert_eq!(act1.take, Some(8100));
+        assert_eq!(act1.drop, Some(1));
+
+        // 2. Holding [Gun, Lightning] over Laser pickup even at alive=6 -> keeps [Gun, Lightning]
+        obs.t = 35.2;
+        obs.self_obs.weapons = vec![Some(gun), Some(lt)];
+        obs.pickups = vec![PickupObs {
+            id: 8101,
+            kind: WeaponKind::Laser,
+            pos: [-45.0, 0.0, mz],
+        }];
+        let act2 = bot.act(&obs);
+        assert_eq!(act2.take, None);
     }
 }
