@@ -362,7 +362,7 @@ impl StrategyState {
         map: &Map,
         nav: &NavGrid,
         scratch: &mut NavScratch,
-        world: &WorldState,
+        world: &mut WorldState,
         obs: &Observation,
         eye_h: f64,
         mech_cands: &[TargetCandidate],
@@ -370,9 +370,12 @@ impl StrategyState {
         combat_enemy: Option<&TargetCandidate>,
         farm_target: Option<&TargetCandidate>,
         immediate_kill_avail: bool,
+        stuck_active: bool,
     ) -> ([f64; 2], [f64; 2]) {
         self.tactic = CombatTactic::None;
         self.peek_target = None;
+        let was_orbiting = world.orbit_active_1v1;
+        world.orbit_active_1v1 = false;
 
         let me = &obs.self_obs;
         let los_mech_count = los_mechs.len();
@@ -678,9 +681,85 @@ impl StrategyState {
                         return ([0.0, 0.0], me_xy);
                     }
 
-                    // 3. Direct 1v1 engagement: lethal weapon-matched ranges & AggressivePush when diving or punishing
+                    // 3. Direct engagement: Swing 3 continuous 1v1 orbit (or M7 strafing when 2+ enemies)
                     let to_e = unit2d(e.pos[0] - me.pos[0], e.pos[1] - me.pos[1]);
-                    let perp = [-to_e[1] * world.strafe_sign, to_e[0] * world.strafe_sign];
+                    let known_nearby_180 = world
+                        .tracked_enemies
+                        .values()
+                        .filter(|te| dist2d(me.pos[0], me.pos[1], te.pos[0], te.pos[1]) <= 180.0)
+                        .count();
+                    let is_1v1 = los_mech_count == 1 && known_nearby_180 <= 1;
+
+                    let (perp, radial_band, tang_w) = if is_1v1 {
+                        world.orbit_active_1v1 = true;
+                        let orbit_blocked_for = |sign: f64| -> bool {
+                            let p = [-to_e[1] * sign, to_e[0] * sign];
+                            let mut blocked = stuck_active;
+                            for step_m in [8.0_f64, 13.0_f64] {
+                                let px = me.pos[0] + p[0] * step_m;
+                                let py = me.pos[1] + p[1] * step_m;
+                                let (cx, cy) = nav.world_to_cell(px, py);
+                                if !nav.walkable[cy * nav.nx + cx] {
+                                    blocked = true;
+                                    break;
+                                }
+                            }
+                            let p12 = [me.pos[0] + p[0] * 12.0, me.pos[1] + p[1] * 12.0];
+                            let d_p12_nc = dist2d(p12[0], p12[1], nc[0], nc[1]);
+                            let leaves_zone = obs.zone.next_radius > 20.0
+                                && d_p12_nc > (obs.zone.next_radius - 14.0).max(0.0)
+                                && d_p12_nc > dist_next;
+                            let probe_eye = [
+                                me.pos[0] + p[0] * 10.0,
+                                me.pos[1] + p[1] * 10.0,
+                                me.pos[2] + eye_h,
+                            ];
+                            let exposes_other = world.tracked_enemies.iter().any(|(&id, te)| {
+                                id != e.id
+                                    && map.has_los(
+                                        probe_eye,
+                                        [te.pos[0], te.pos[1], te.pos[2] + eye_h],
+                                    )
+                            });
+                            blocked || leaves_zone || exposes_other
+                        };
+
+                        if !was_orbiting {
+                            let perp_pos = [-to_e[1], to_e[0]];
+                            let pref_dir = if let Some((hpos, _)) = world.last_hunt_pos {
+                                unit2d(me.pos[0] - hpos[0], me.pos[1] - hpos[1])
+                            } else {
+                                unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1])
+                            };
+                            let mut init_sign =
+                                if perp_pos[0] * pref_dir[0] + perp_pos[1] * pref_dir[1] >= 0.0 {
+                                    1.0
+                                } else {
+                                    -1.0
+                                };
+                            if orbit_blocked_for(init_sign) && !orbit_blocked_for(-init_sign) {
+                                init_sign = -init_sign;
+                            }
+                            world.orbit_sign = init_sign;
+                        } else if orbit_blocked_for(world.orbit_sign)
+                            && !orbit_blocked_for(-world.orbit_sign)
+                            && obs.t - world.last_orbit_flip_t >= 0.45
+                        {
+                            world.orbit_sign = -world.orbit_sign;
+                            world.last_orbit_flip_t = obs.t;
+                        }
+                        (
+                            [-to_e[1] * world.orbit_sign, to_e[0] * world.orbit_sign],
+                            6.0_f64,
+                            1.0_f64,
+                        )
+                    } else {
+                        (
+                            [-to_e[1] * world.strafe_sign, to_e[0] * world.strafe_sign],
+                            14.0_f64,
+                            0.85_f64,
+                        )
+                    };
                     let has_lightning = me
                         .weapons
                         .iter()
@@ -718,19 +797,20 @@ impl StrategyState {
                         (base_pref_dist, 0.65)
                     };
 
-                    let radial_w = if d2 < pref_dist - 10.0 {
+                    let in_band_neg = if is_1v1 { 6.0 } else { 10.0 };
+                    let radial_w = if d2 < pref_dist - in_band_neg {
                         -0.65
                     } else if d2 > pref_dist + if self.tactic == CombatTactic::AggressivePush {
                         8.0
                     } else {
-                        14.0
+                        radial_band
                     } {
                         push_w
                     } else {
                         0.0
                     };
-                    let mut gx = to_e[0] * radial_w + perp[0] * 0.85;
-                    let mut gy = to_e[1] * radial_w + perp[1] * 0.85;
+                    let mut gx = to_e[0] * radial_w + perp[0] * tang_w;
+                    let mut gy = to_e[1] * radial_w + perp[1] * tang_w;
 
                     if !e.is_vulnerable && (los_mech_count >= 2 || me.hp < 0.55 * me.max_hp) {
                         if let Some(corner) = nav.find_cover_anchor(

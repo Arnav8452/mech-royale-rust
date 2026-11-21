@@ -76,6 +76,9 @@ pub(crate) struct WorldState {
     pub last_strafe_flip_t: f64,
     pub next_strafe_flip_t: f64,
     pub juke_boost_until: f64,
+    pub orbit_active_1v1: bool,
+    pub orbit_sign: f64,
+    pub last_orbit_flip_t: f64,
     rng_state: u64,
     pub pos_history: VecDeque<[f64; 2]>,
     pub cmd_move_streak: u32,
@@ -109,6 +112,9 @@ impl WorldState {
             last_strafe_flip_t: -100.0,
             next_strafe_flip_t: -100.0,
             juke_boost_until: -100.0,
+            orbit_active_1v1: false,
+            orbit_sign: strafe_sign,
+            last_orbit_flip_t: -100.0,
             rng_state: (seed ^ 0x9E37_79B9_7F4A_7C15).max(1),
             pos_history: VecDeque::with_capacity(7),
             cmd_move_streak: 0,
@@ -154,11 +160,15 @@ impl WorldState {
                         self.last_damage_t = t;
                         self.last_damage_by = *by;
                     }
-                    if (weapon == "gun" || weapon == "npc") && t - self.last_strafe_flip_t >= 0.35 {
-                        self.strafe_sign = -self.strafe_sign;
-                        self.last_strafe_flip_t = t;
-                        self.next_strafe_flip_t = t + 0.65 + 0.40 * self.next_unit_f64();
-                        self.juke_boost_until = t + 0.22;
+                    if weapon == "gun" || weapon == "npc" {
+                        if self.orbit_active_1v1 {
+                            self.juke_boost_until = t + 0.30;
+                        } else if t - self.last_strafe_flip_t >= 0.35 {
+                            self.strafe_sign = -self.strafe_sign;
+                            self.last_strafe_flip_t = t;
+                            self.next_strafe_flip_t = t + 0.65 + 0.40 * self.next_unit_f64();
+                            self.juke_boost_until = t + 0.22;
+                        }
                     }
                 }
                 GameEvent::Hit { .. } => {

@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m7".to_string(),
+            name: "rust-bot-m9-orbit".to_string(),
             config: hello.config,
             map,
             nav,
@@ -133,7 +133,7 @@ impl Bot {
             &self.map,
             &self.nav,
             &mut self.nav_scratch,
-            &self.world,
+            &mut self.world,
             obs,
             eye_h,
             &mech_cands,
@@ -141,6 +141,7 @@ impl Bot {
             primary_mech.as_ref().or(any_visible_mech.as_ref()),
             primary_farm.as_ref(),
             immediate_kill_avail,
+            stuck_active,
         );
 
         // Fire back while retreating in plain sight; hold fire once LOS broken or 1.8 s clear
@@ -1810,6 +1811,94 @@ mod tests {
             act.move_dir.unwrap()[0] < -0.4,
             "should hunt West (-x) toward last_hunt_pos at [-150, 0], got {:?}",
             act.move_dir
+        );
+    }
+
+    #[test]
+    fn orbits_continuously_in_1v1_without_timer_flip_and_boosts_on_hit() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        // Open Oval position (-45, 0) orbiting enemy at (-90, 0) (dist = 45 m)
+        let p_me = [-45.0, 0.0];
+        let p_en = [-90.0, 0.0];
+        let mz = bot.map.ground_height(p_me[0], p_me[1]);
+        let ez = bot.map.ground_height(p_en[0], p_en[1]);
+        obs.t = 30.0;
+        obs.self_obs.pos = [p_me[0], p_me[1], mz];
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 100.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [-45.0, 120.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 120.0;
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.mechs = vec![ActorObs {
+            id: 5,
+            kind: "mech".into(),
+            pos: [p_en[0], p_en[1], ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1200.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+
+        bot.act(&obs);
+        assert!(bot.world.orbit_active_1v1);
+        let init_sign = bot.world.orbit_sign;
+
+        // 1. Over 1.6 s (> old 0.65-1.05 s timer), orbit_sign must NEVER flip from timer
+        for step in 1..=16 {
+            obs.t = 30.0 + (step as f64) * 0.1;
+            bot.act(&obs);
+            assert!(bot.world.orbit_active_1v1);
+            assert_eq!(
+                bot.world.orbit_sign, init_sign,
+                "1v1 orbit must not reverse on timer (step {step})"
+            );
+        }
+
+        // 2. Taking a gun hit keeps orbit_sign unchanged and arms orbit boost
+        obs.t = 31.8;
+        obs.events = vec![GameEvent::Damaged {
+            amount: 45.0,
+            weapon: "gun".into(),
+            bearing: Some(PI),
+            by: Some(5),
+            rear: false,
+        }];
+        let act_hit = bot.act(&obs);
+        assert_eq!(
+            bot.world.orbit_sign, init_sign,
+            "incoming hit during 1v1 orbit must boost along orbit instead of reversing"
+        );
+        assert!(bot.world.juke_boost_until > obs.t);
+        assert_eq!(act_hit.boost, Some(true));
+
+        // 3. Move just North of prism 49 NE wall (y <= -101.7 at x=170): heading South hits prism 49 at 8-13 m -> bounce flips!
+        obs.events.clear();
+        obs.t = 32.5;
+        let wx = 170.0;
+        let wy = -96.0;
+        let wz = bot.map.ground_height(wx, wy);
+        let ewz = bot.map.ground_height(215.0, -96.0);
+        obs.self_obs.pos = [wx, wy, wz];
+        obs.mechs[0].pos = [215.0, -96.0, ewz];
+        // to_e = [+1, 0], perp_pos = [0, +1] (North, open), sign = -1.0 heads South [0, -1] directly into prism 49!
+        bot.world.orbit_sign = -1.0;
+        bot.world.last_orbit_flip_t = 20.0;
+        bot.act(&obs);
+        assert_eq!(
+            bot.world.orbit_sign, 1.0,
+            "obstacle 8-13 m ahead along orbit tangent must cleanly bounce-flip orbit_sign"
         );
     }
 }
