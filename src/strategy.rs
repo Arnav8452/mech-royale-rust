@@ -410,9 +410,21 @@ impl StrategyState {
 
         // cl-farmfirst: house bots escalate as we kill. Reach ~8 cubes (HP/damage) before
         // taking optional fights early; fight anything within 50 m or anything shooting us.
-        let farm_gate = obs.t < 95.0
-            && me.cubes < 8
-            && obs.t - world.last_mech_damage_t > 3.0
+        // cl-nolaser: with only the Gun (slot 1 empty) never take optional fights at any time,
+        // and a hit only forces Combat when the shooter is within 65 m.
+        let unarmed = me.weapons.get(1).and_then(|w| w.as_ref()).is_none();
+        let shooter_close = world.last_damage_by.is_some_and(|id| {
+            world.tracked_enemies.get(&id).is_some_and(|e| {
+                dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 65.0
+            })
+        });
+        let hit_forces_fight = if unarmed {
+            obs.t - world.last_mech_damage_t <= 3.0 && shooter_close
+        } else {
+            obs.t - world.last_mech_damage_t <= 3.0
+        };
+        let farm_gate = ((obs.t < 95.0 && me.cubes < 8) || unarmed)
+            && !hit_forces_fight
             && !world
                 .tracked_enemies
                 .values()

@@ -1649,6 +1649,18 @@ mod tests {
         let (hello, mut obs) = load_sample_hello_and_obs();
         obs.self_obs.cubes = 8; // cl-farmfirst: past the early farm gate
         let mut bot = Bot::new(hello);
+        // cl-nolaser: armed (slot 1 = Laser) so optional Combat is allowed
+        while obs.self_obs.weapons.len() < 2 {
+            obs.self_obs.weapons.push(None);
+        }
+        obs.self_obs.weapons[1] = Some(WeaponObs {
+            kind: WeaponKind::Laser,
+            cooldown: 0.0,
+            ammo: None,
+            reload: None,
+            charge: Some(0.0),
+            stats: bot.config.weapons.laser.clone(),
+        });
         obs.t = 40.0;
         let mz = bot.map.ground_height(0.0, 0.0);
         let cz = bot.map.ground_height(0.0, 10.0);
