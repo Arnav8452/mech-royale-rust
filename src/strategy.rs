@@ -655,6 +655,16 @@ impl StrategyState {
                     .unwrap_or(0.0);
 
                 // Proactive High-Ground Rooftop Dominance (any loadout, 8-42 m roofs)
+                let have_laser_climb = me
+                    .weapons
+                    .iter()
+                    .flatten()
+                    .any(|w| w.kind == WeaponKind::Laser);
+                let enemy_lt_close = have_laser_climb
+                    && !have_lightning
+                    && los_mechs
+                        .iter()
+                        .any(|m| m.weapons.contains(&WeaponKind::Lightning) && m.dist < 56.0);
                 let roof_max_h = if me.energy >= 78.0 {
                     42.0
                 } else if me.energy >= 54.0 {
@@ -668,6 +678,7 @@ impl StrategyState {
                     && !immediate_kill_avail
                     && !lt_rush_charger
                     && (los_mech_count >= 2
+                        || enemy_lt_close
                         || combat_enemy.is_some_and(|e| e.dist > my_lt_range + 4.0)
                         || (los_mech_count == 0 && !world.tracked_enemies.is_empty()))
                 {
@@ -1460,6 +1471,34 @@ impl StrategyState {
                     let has_lightning = have_lightning;
                     let enemy_has_lightning = e.weapons.contains(&WeaponKind::Lightning);
                     let enemy_has_laser = e.weapons.contains(&WeaponKind::Laser);
+                    let closest_lt_threat = if have_laser && !has_lightning {
+                        los_mechs
+                            .iter()
+                            .filter(|m| m.weapons.contains(&WeaponKind::Lightning) && m.dist < 56.0)
+                            .min_by(|a, b| a.dist.total_cmp(&b.dist))
+                            .copied()
+                    } else {
+                        None
+                    };
+                    if let Some(lt_e) = closest_lt_threat {
+                        self.tactic = CombatTactic::OpenStrafe;
+                        let away_lt = unit2d(me.pos[0] - lt_e.pos[0], me.pos[1] - lt_e.pos[1]);
+                        let (away_w, tang_lt_w) = if lt_e.dist < 48.0 {
+                            (1.0, 0.20)
+                        } else {
+                            (0.90, 0.45)
+                        };
+                        let mut gx = away_lt[0] * away_w + perp[0] * tang_lt_w;
+                        let mut gy = away_lt[1] * away_w + perp[1] * tang_lt_w;
+                        if dist_next > safe_r * 0.85 {
+                            let zdir = unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]);
+                            gx += zdir[0] * 0.55;
+                            gy += zdir[1] * 0.55;
+                        }
+                        let dir = unit2d(gx, gy);
+                        let goal_pt = [me.pos[0] + dir[0] * 20.0, me.pos[1] + dir[1] * 20.0];
+                        return (dir, goal_pt);
+                    }
                     let lt_brawl_d = if have_laser && has_lightning {
                         (my_lt_range - 8.0).max(34.0)
                     } else {

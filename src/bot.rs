@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m14-gunrail".to_string(),
+            name: "rust-bot-m24-anti-lightning".to_string(),
             config: hello.config,
             map,
             nav,
@@ -274,13 +274,35 @@ impl Bot {
         // Boost & jump (Zero-Energy Jump-Charge Laser + Jump-Jet roof climb + clean unstuck)
         let moving = move_dir[0].hypot(move_dir[1]) > 0.25;
         let slot1_empty = me.weapons.get(1).and_then(|w| w.as_ref()).is_none();
+        let have_lightning = me
+            .weapons
+            .iter()
+            .flatten()
+            .any(|w| w.kind == crate::protocol::WeaponKind::Lightning);
+        let have_laser_here = me
+            .weapons
+            .iter()
+            .flatten()
+            .any(|w| w.kind == crate::protocol::WeaponKind::Laser);
+        let enemy_close_lightning = !have_lightning
+            && have_laser_here
+            && self.strategy.posture == Posture::Combat
+            && los_mechs.iter().any(|m| {
+                m.weapons
+                    .contains(&crate::protocol::WeaponKind::Lightning)
+                    && m.dist < 58.0
+            });
         let laser_charging_now = me.weapons.iter().enumerate().take(2).any(|(i, wopt)| {
             wopt.as_ref().is_some_and(|w| {
                 w.kind == crate::protocol::WeaponKind::Laser
                     && (fire[i] || w.charge.unwrap_or(0.0) > 0.0)
             })
         });
-        let jump_charge = me.grounded && moving && laser_charging_now && !aimed_laser_dodge;
+        let jump_charge = me.grounded
+            && moving
+            && laser_charging_now
+            && !aimed_laser_dodge
+            && !enemy_close_lightning;
         let near_roof_wall = climbing_roof
             && (!self
                 .map
@@ -315,19 +337,7 @@ impl Bot {
             && self.world.cmd_move_streak >= 8
             && me.energy > 40.0;
 
-        let have_lightning = me
-            .weapons
-            .iter()
-            .flatten()
-            .any(|w| w.kind == crate::protocol::WeaponKind::Lightning);
         let saving_for_lightning = have_lightning && los_mechs.iter().any(|m| m.dist <= 45.0);
-        let enemy_close_lightning = !have_lightning
-            && self.strategy.posture == Posture::Combat
-            && los_mechs.iter().any(|m| {
-                m.weapons
-                    .contains(&crate::protocol::WeaponKind::Lightning)
-                    && m.dist < 62.0
-            });
         let juke_boost = ((t <= self.world.juke_boost_until) || dodged_bullet)
             && me.energy > 45.0
             && !saving_for_lightning;
@@ -343,7 +353,7 @@ impl Bot {
                     && self.strategy.posture == Posture::Combat
                     && los_mech_count >= 1
                     && me.energy > 58.0)
-                || (enemy_close_lightning && me.energy > 32.0)
+                || (enemy_close_lightning && me.energy > 8.0)
                 || (self.strategy.posture == Posture::EmergencyRegen
                     && los_mech_count > 0
                     && me.energy > 18.0)
@@ -2851,6 +2861,84 @@ mod tests {
             act.boost,
             Some(true),
             "[Gun, Laser] with 80 energy must boost-strafe continuously in combat"
+        );
+    }
+
+    #[test]
+    fn anti_lightning_enforces_hard_52m_kite_without_jump_float() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(-120.0, 20.0);
+        let ez = bot.map.ground_height(-164.0, 20.0);
+        assert!(bot.map.has_los([-120.0, 20.0, mz + 8.0], [-164.0, 20.0, ez + 4.5]));
+        obs.t = 35.0;
+        obs.self_obs.pos = [-120.0, 20.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 18.0; // low energy -> must STILL boost to break >52 m
+        obs.self_obs.aim = [PI, 0.0];
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [-120.0, 20.0];
+        obs.zone.next_center = [-120.0, 20.0];
+        obs.zone.radius = 250.0;
+        obs.zone.next_radius = 220.0;
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Gun,
+                cooldown: 0.0,
+                ammo: Some(12.0),
+                reload: Some(0.0),
+                charge: None,
+                stats: bot.config.weapons.gun.clone(),
+            }),
+            Some(WeaponObs {
+                kind: WeaponKind::Laser,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: Some(0.0),
+                stats: bot.config.weapons.laser.clone(),
+            }),
+        ];
+        // Even a low-HP (400 HP) Lightning rusher at 44 m MUST be kited strictly outward >52 m
+        obs.mechs = vec![ActorObs {
+            id: 40,
+            kind: "mech".into(),
+            pos: [-164.0, 20.0, ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(400.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun, WeaponKind::Lightning],
+            charging: false,
+        }];
+
+        let act = bot.act(&obs);
+        let mv = act.move_dir.unwrap();
+        assert!(
+            mv[0] > 0.85,
+            "Laser bot inside 48 m of Lightning enemy must sprint straight away +x, got {mv:?}"
+        );
+        assert_eq!(
+            act.boost,
+            Some(true),
+            "must burn even 18 energy to escape inside 48 m of Lightning bot"
+        );
+        assert_eq!(
+            act.jump,
+            Some(false),
+            "must NOT float in slow air jump arc near Lightning bot"
+        );
+        assert_eq!(
+            act.fire.unwrap(),
+            [true, true],
+            "must keep dual-firing Gun + Laser while escaping"
         );
     }
 }
