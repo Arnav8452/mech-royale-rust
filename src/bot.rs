@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m14-skyking".to_string(),
+            name: "rust-bot-m16-apex".to_string(),
             config: hello.config,
             map,
             nav,
@@ -161,6 +161,10 @@ impl Bot {
             && !immediate_kill_avail
             && !actively_taking_fire;
 
+        let allow_new_laser_charge = !climbing_roof
+            && !(self.strategy.posture == Posture::EmergencyRegen && !immediate_kill_avail)
+            && !(self.strategy.tactic == CombatTactic::CoverDuck && !immediate_kill_avail);
+
         let (fire, mut reload, chosen_aim, debug_aim_target) = if hold_fire_for_regen {
             ([false, false], false, None, None)
         } else if let Some(ref tgt) = combat_target {
@@ -174,6 +178,7 @@ impl Bot {
                 max_pitch,
                 &mech_cands,
                 tgt,
+                allow_new_laser_charge,
             )
         } else {
             let (pre_fire, pre_aim) = combat::eval_precharge_laser(
@@ -188,10 +193,6 @@ impl Bot {
             );
             (pre_fire, false, pre_aim, None)
         };
-
-        if fire[0] || fire[1] {
-            self.world.last_combat_t = t;
-        }
 
         // Cover-reload discipline & safe open reload
         let near_mech_100 = self
@@ -225,9 +226,18 @@ impl Bot {
         );
         self.world.last_move = move_dir;
 
-        // Rear-armor shielding & active 360° scanning (including while hidden in EmergencyRegen)
+        // Front-armor shielding (climbing/ducking), rear-armor shielding & active 360° scanning
         let final_aim = if let Some(aim) = chosen_aim {
             aim
+        } else if (climbing_roof || self.strategy.tactic == CombatTactic::CoverDuck)
+            && los_mech_count > 0
+        {
+            let m = los_mechs
+                .iter()
+                .min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap())
+                .unwrap();
+            let yaw = (m.pos[1] - me.pos[1]).atan2(m.pos[0] - me.pos[0]);
+            [yaw, 0.0]
         } else if t - self.world.last_damage_t <= 2.2 {
             if let Some(b) = self.world.last_damage_bearing {
                 [b, 0.0]
@@ -299,12 +309,15 @@ impl Bot {
             && self.world.cmd_move_streak >= 8
             && me.energy > 40.0;
 
-        let saving_for_lightning = me
+        let have_lightning = me
             .weapons
             .iter()
             .flatten()
-            .any(|w| w.kind == crate::protocol::WeaponKind::Lightning)
-            && los_mechs.iter().any(|m| m.dist <= 45.0);
+            .any(|w| w.kind == crate::protocol::WeaponKind::Lightning);
+        let saving_for_lightning = have_lightning && los_mechs.iter().any(|m| m.dist <= 45.0);
+        let enemy_close_lightning = los_mechs.iter().any(|m| {
+            m.dist <= 52.0 && m.weapons.contains(&crate::protocol::WeaponKind::Lightning)
+        });
         let juke_boost = ((t <= self.world.juke_boost_until) || dodged_bullet)
             && me.energy > 45.0
             && !saving_for_lightning;
@@ -316,6 +329,11 @@ impl Bot {
                 || (dodged_hazard && me.energy > 15.0)
                 || juke_boost
                 || (laser_charging_now && me.energy > 35.0)
+                || (!have_lightning
+                    && self.strategy.posture == Posture::Combat
+                    && los_mech_count >= 1
+                    && me.energy > 58.0)
+                || (enemy_close_lightning && me.energy > 32.0)
                 || (self.strategy.posture == Posture::EmergencyRegen
                     && los_mech_count > 0
                     && me.energy > 18.0)
@@ -2050,6 +2068,7 @@ mod tests {
             1.3,
             &cands,
             &cands[0],
+            true,
         );
         assert!(fire[1], "Lightning must fire at 32 m");
         assert!(
@@ -2059,13 +2078,13 @@ mod tests {
     }
 
     #[test]
-    fn skyrail_swaps_into_laser_lightning_and_uses_jump_charge_without_jet_drain() {
+    fn apex_swaps_into_gun_laser_and_uses_jump_charge_without_jet_drain() {
         let (hello, mut obs) = load_sample_hello_and_obs();
         let mut bot = Bot::new(hello);
-        let mz = bot.map.ground_height(-45.0, 0.0);
-        let ez = bot.map.ground_height(-120.0, 0.0);
+        let mz = bot.map.ground_height(-120.0, 20.0);
+        let ez = bot.map.ground_height(-195.0, 20.0);
         obs.t = 25.0;
-        obs.self_obs.pos = [-45.0, 0.0, mz];
+        obs.self_obs.pos = [-120.0, 20.0, mz];
         obs.self_obs.grounded = true;
         obs.self_obs.hp = 1400.0;
         obs.self_obs.max_hp = 1400.0;
@@ -2092,29 +2111,20 @@ mod tests {
         obs.pickups = vec![PickupObs {
             id: 801,
             kind: WeaponKind::Laser,
-            pos: [-44.0, 0.0, mz],
+            pos: [-119.0, 20.0, mz],
         }];
         obs.mechs.clear();
 
         let (take0, drop0) = bot
             .strategy
             .pick_weapon_take_and_drop(&bot.config, &bot.world, &obs, &[]);
-        assert_eq!((take0, drop0), (Some(801), Some(0)), "must swap un-upgraded Gun for Laser");
-
-        obs.self_obs.upgrades = vec!["gun_damage".into(), "gun_mag".into()];
-        let (take2, drop2) = bot
-            .strategy
-            .pick_weapon_take_and_drop(&bot.config, &bot.world, &obs, &[]);
         assert_eq!(
-            (take2, drop2),
-            (None, None),
-            "must protect Gun once >= 2 gun upgrades invested"
+            (take0, drop0),
+            (Some(801), Some(1)),
+            "must swap Lightning for Laser to form [Gun, Laser]"
         );
 
-        // Zero-Energy Jump-Charge Laser: tick 1 grounded jumps; tick 2 airborne does NOT jet boost
-        obs.pickups.clear();
-        obs.self_obs.upgrades.clear();
-        obs.self_obs.weapons[0] = Some(WeaponObs {
+        obs.self_obs.weapons[1] = Some(WeaponObs {
             kind: WeaponKind::Laser,
             cooldown: 0.0,
             ammo: None,
@@ -2122,14 +2132,49 @@ mod tests {
             charge: Some(0.0),
             stats: bot.config.weapons.laser.clone(),
         });
-        obs.zone.center = [-45.0, 0.0];
-        obs.zone.next_center = [-45.0, 0.0];
+        obs.pickups = vec![PickupObs {
+            id: 802,
+            kind: WeaponKind::Lightning,
+            pos: [-119.0, 20.0, mz],
+        }];
+        let (take_lt, drop_lt) = bot
+            .strategy
+            .pick_weapon_take_and_drop(&bot.config, &bot.world, &obs, &[]);
+        assert_eq!(
+            (take_lt, drop_lt),
+            (None, None),
+            "must protect [Gun, Laser] instead of swapping for Lightning"
+        );
+
+        // Zero-Energy Jump-Charge Laser in Open Oval: tick 1 grounded jumps; tick 2 airborne does NOT jet boost
+        obs.pickups.clear();
+        obs.self_obs.upgrades.clear();
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Laser,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: Some(0.0),
+                stats: bot.config.weapons.laser.clone(),
+            }),
+            Some(WeaponObs {
+                kind: WeaponKind::Lightning,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: None,
+                stats: bot.config.weapons.lightning.clone(),
+            }),
+        ];
+        obs.zone.center = [-120.0, 20.0];
+        obs.zone.next_center = [-120.0, 20.0];
         obs.zone.radius = 200.0;
         obs.zone.next_radius = 180.0;
         obs.mechs = vec![ActorObs {
             id: 93,
             kind: "mech".into(),
-            pos: [-120.0, 0.0, ez],
+            pos: [-195.0, 20.0, ez],
             vel: [0.0, 0.0, 0.0],
             aim: [0.0, 0.0],
             hp: Some(1400.0),
@@ -2400,5 +2445,199 @@ mod tests {
             .expect("full-HP Laser+Lightning mech vs 80 m enemy must proactively seize prism 58 roof");
         assert!(rz2 - mz >= 8.0);
         assert!(a_seize.move_dir.unwrap()[1] < -0.5);
+    }
+
+    #[test]
+    fn apex_enters_combat_under_los_fire_instead_of_chasing_distant_pickup() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(-120.0, 20.0);
+        let pz = bot.map.ground_height(0.0, 20.0);
+        let ez = bot.map.ground_height(-195.0, 20.0);
+        obs.t = 12.0;
+        obs.self_obs.pos = [-120.0, 20.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Gun,
+                cooldown: 0.0,
+                ammo: Some(12.0),
+                reload: Some(0.0),
+                charge: None,
+                stats: bot.config.weapons.gun.clone(),
+            }),
+            None,
+        ];
+        obs.pickups = vec![PickupObs {
+            id: 910,
+            kind: WeaponKind::Laser,
+            pos: [0.0, 20.0, pz],
+        }];
+        obs.mechs = vec![ActorObs {
+            id: 911,
+            kind: "mech".into(),
+            pos: [-195.0, 20.0, ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1400.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun, WeaponKind::Laser],
+            charging: true,
+        }];
+        bot.act(&obs);
+        assert_eq!(
+            bot.strategy.posture,
+            Posture::Combat,
+            "under direct LOS enemy fire, must enter Combat rather than running toward 120 m pickup"
+        );
+    }
+
+    #[test]
+    fn apex_finds_1step_close_corner_cover_and_blocks_new_laser_charge_on_1v1_duck() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        // NW corner of block 14 (x=90.6..186, y=-175.9..-101.7): moving 3-5 m East hides behind wall vs (115, -140)
+        let cz = bot.map.ground_height(89.0, -98.0);
+        let tz = bot.map.ground_height(115.0, -140.0);
+        let cov = bot
+            .nav
+            .find_cover_point_within(
+                &bot.map,
+                [89.0, -98.0, cz],
+                8.0,
+                &[[115.0, -140.0, tz + 8.0]],
+                [0.0, 0.0],
+                500.0,
+                [0.0, 0.0],
+                400.0,
+                5.9,
+                None,
+            )
+            .expect("1-cell resolution scan must find close corner cover within < 6 m");
+        let d_cov = dist2d(89.0, -98.0, cov[0], cov[1]);
+        assert!(
+            d_cov >= 2.5 && d_cov < 6.0,
+            "close corner cover distance should be 2.5..<6.0 m, got {d_cov:.2}"
+        );
+
+        // 1v1 enemy charging Laser while our Gun is reloading and Laser is uncharged -> CoverDuck blocks new Laser charge
+        let mz = bot.map.ground_height(-55.0, -18.0);
+        let ez = bot.map.ground_height(-55.0, 60.0);
+        obs.t = 32.0;
+        obs.self_obs.pos = [-55.0, -18.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1200.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [-55.0, 0.0];
+        obs.zone.next_center = [-55.0, 0.0];
+        obs.zone.radius = 250.0;
+        obs.zone.next_radius = 220.0;
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Gun,
+                cooldown: 0.0,
+                ammo: Some(0.0),
+                reload: Some(1.0),
+                charge: None,
+                stats: bot.config.weapons.gun.clone(),
+            }),
+            Some(WeaponObs {
+                kind: WeaponKind::Laser,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: Some(0.0),
+                stats: bot.config.weapons.laser.clone(),
+            }),
+        ];
+        obs.mechs = vec![ActorObs {
+            id: 920,
+            kind: "mech".into(),
+            pos: [-55.0, 60.0, ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1400.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Laser],
+            charging: true,
+        }];
+        let a = bot.act(&obs);
+        assert_eq!(bot.strategy.tactic, CombatTactic::CoverDuck);
+        assert_eq!(
+            a.fire.unwrap()[1],
+            false,
+            "1v1 CoverDuck must NOT start a new Laser charge that halves sprint speed"
+        );
+    }
+
+    #[test]
+    fn apex_post_slew_gun_fires_on_small_offset_and_npc_aggro_shoots_back() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(-120.0, 20.0);
+        let nz = bot.map.ground_height(-165.0, 20.0);
+        let muzzle_h = crate::protocol::stat(&obs.self_obs.stats, "muzzle_height", 7.0);
+        let npc_h = crate::protocol::stat(&bot.config.npc, "height", 5.0);
+        let to_npc = direct_aim(
+            [-120.0, 20.0, mz + muzzle_h],
+            [-165.0, 20.0, nz + 0.5 * npc_h],
+        );
+
+        obs.t = 18.0;
+        obs.self_obs.pos = [-120.0, 20.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1200.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.cubes = 20; // > stat_cap so !want_farm_cubes -> NPC range normally 42 m
+        // Small 0.08 rad yaw offset: closes inside 0.025 s * 4.0 rad/s = 0.10 rad post-slew window
+        obs.self_obs.aim = [wrap_angle(to_npc[0] + 0.08), to_npc[1]];
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Gun,
+                cooldown: 0.0,
+                ammo: Some(12.0),
+                reload: Some(0.0),
+                charge: None,
+                stats: bot.config.weapons.gun.clone(),
+            }),
+            None,
+        ];
+        obs.mechs = vec![ActorObs {
+            id: 930,
+            kind: "npc".into(),
+            pos: [-165.0, 20.0, nz], // 45 m away (> 42 m base limit, <= 48 m aggro window)
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(350.0),
+            max_hp: Some(350.0),
+            cubes: None,
+            weapons: Vec::new(),
+            charging: false,
+        }];
+        obs.events = vec![GameEvent::Damaged {
+            amount: 25.0,
+            weapon: "npc".into(),
+            bearing: Some(PI),
+            by: Some(930),
+            rear: false,
+        }];
+
+        let a = bot.act(&obs);
+        assert!(
+            bot.world.last_mech_damage_t < 0.0,
+            "NPC damage must not update last_mech_damage_t"
+        );
+        assert_eq!(
+            a.fire.unwrap()[0],
+            true,
+            "aggroed 45 m NPC within post-slew Gun alignment must be shot immediately"
+        );
     }
 }

@@ -460,8 +460,14 @@ impl NavGrid {
         let mut cover_cands: Vec<(f64, [f64; 3], f64, bool)> = Vec::with_capacity(128);
         let mut fallback_cands: Vec<(f64, [f64; 3], f64, bool)> = Vec::with_capacity(128);
 
-        for cy in (y0..=y1).step_by(2) {
-            for cx in (x0..=x1).step_by(2) {
+        for cy in y0..=y1 {
+            if cy.abs_diff(me_cy) > 6 && (cy - y0) % 2 != 0 {
+                continue;
+            }
+            for cx in x0..=x1 {
+                if cx.abs_diff(me_cx) > 6 && (cx - x0) % 2 != 0 {
+                    continue;
+                }
                 let idx = cy * self.nx + cx;
                 if !self.walkable[idx] {
                     continue;
@@ -472,7 +478,7 @@ impl NavGrid {
                 }
                 let w = self.cell_to_world(cx, cy);
                 let d_me = (w[0] - me_pos[0]).hypot(w[1] - me_pos[1]);
-                if d_me < 6.0 || d_me > max_dist {
+                if d_me < 2.5 || d_me > max_dist {
                     continue;
                 }
                 if (w[0] - zone_center[0]).hypot(w[1] - zone_center[1]) > safe_zone_r {

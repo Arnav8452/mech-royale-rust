@@ -64,6 +64,7 @@ pub(crate) struct WorldState {
     pub blacklisted_pickups: HashMap<u64, f64>,
     pub last_damage_bearing: Option<f64>,
     pub last_damage_t: f64,
+    pub last_mech_damage_t: f64,
     pub last_damage_by: Option<u64>,
     pub last_target_id: Option<u64>,
     pub last_sound_bearing: Option<f64>,
@@ -104,6 +105,7 @@ impl WorldState {
             blacklisted_pickups: HashMap::new(),
             last_damage_bearing: None,
             last_damage_t: -100.0,
+            last_mech_damage_t: -100.0,
             last_damage_by: None,
             last_target_id: None,
             last_sound_bearing: None,
@@ -164,10 +166,16 @@ impl WorldState {
                     ..
                 } => {
                     self.last_combat_t = t;
+                    let is_mech_weapon = weapon != "npc" && weapon != "zone";
+                    if is_mech_weapon {
+                        self.last_mech_damage_t = t;
+                    }
                     if let Some(b) = bearing {
                         self.last_damage_bearing = Some(*b);
                         self.last_damage_t = t;
-                        self.last_damage_by = *by;
+                        if is_mech_weapon {
+                            self.last_damage_by = *by;
+                        }
                     }
                     if weapon == "gun" || weapon == "npc" {
                         if self.orbit_active_1v1 {
@@ -377,7 +385,7 @@ impl WorldState {
             let gz = map.ground_height(p.pos[0], p.pos[1]);
             let dh = p.pos[2] - gz;
             if is_ground_level(map, p.pos)
-                || ((2.5..=20.0).contains(&dh) && map.roof_top_at(p.pos[0], p.pos[1]).is_some())
+                || ((2.5..=40.0).contains(&dh) && map.roof_top_at(p.pos[0], p.pos[1]).is_some())
             {
                 self.last_pickup_seen.insert(p.id, (p.kind, p.pos, t));
             }
