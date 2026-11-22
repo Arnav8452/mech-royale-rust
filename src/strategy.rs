@@ -791,7 +791,7 @@ impl StrategyState {
                         .iter()
                         .any(|m| m.charging && m.dist > my_lt_range)
                         && our_laser_charge_frac < 0.65;
-                    if los_mech_count <= 1 && !enemy_charging_far && me.cubes < 15 {
+                    if los_mech_count <= 1 && !enemy_charging_far && me.cubes < 28 {
                         if let Some(cube) = obs
                             .cubes
                             .iter()
@@ -981,7 +981,7 @@ impl StrategyState {
                     }
                 }
             }
-            Posture::EarlyFarm if on_roof && me.cubes < 15 => {
+            Posture::EarlyFarm if on_roof && me.cubes < 28 => {
                 if let Some(cube) = obs
                     .cubes
                     .iter()
@@ -1576,16 +1576,17 @@ impl StrategyState {
         let protecting_regen = me.hp < 0.85 * me.max_hp
             && (obs.t - world.last_combat_t) >= (regen_delay - 2.0).max(1.5)
             && (obs.t - world.last_combat_t) <= regen_delay + 12.0;
-        let want_farm_cubes =
-            (me.cubes as f64) < config.cubes.stat_cap || (13..15).contains(&me.cubes);
+        // cl-vacuum: upgrades keep coming at 15/21/28 cubes; drops (+3 cubes each) paid off.
+        let _ = config.cubes.stat_cap;
+        let want_farm_cubes = me.cubes < 28;
 
-        if me.cubes < 15 {
+        if me.cubes < 28 {
             if let Some(cube) = obs
                 .cubes
                 .iter()
                 .filter(|c| {
                     is_reachable_cube(map, me.pos, c.pos)
-                        && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 85.0
+                        && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 120.0
                         && dist2d(c.pos[0], c.pos[1], nc[0], nc[1]) <= obs.zone.next_radius - 5.0
                 })
                 .min_by(|a, b| {
@@ -1674,7 +1675,11 @@ impl StrategyState {
         }
 
         // Early-game 50 m unvisited-grid cube snowball until stat_cap (10 cubes) + 13..14 -> 15 upgrade exception
-        if want_farm_cubes && obs.t < 200.0 {
+        let orig_want_cubes = me.cubes < 10 || (13..15).contains(&me.cubes);
+        let extra_cube_roam = want_farm_cubes
+            && world.last_hunt_pos.is_none()
+            && !world.is_huntable_sound(obs.t);
+        if (orig_want_cubes || extra_cube_roam) && obs.t < 200.0 {
             let explore_invalid = self.explore_goal.is_none_or(|g| {
                 obs.zone.next_radius > 24.0
                     && dist2d(g[0], g[1], nc[0], nc[1]) > (obs.zone.next_radius - 16.0).max(0.0)

@@ -362,7 +362,7 @@ impl Bot {
                     && slot1_empty
                     && me.energy > 28.0)
                 || (self.strategy.posture == Posture::EarlyFarm
-                    && (t < 45.0 || (me.cubes < 10 && t < 120.0))
+                    && (t < 45.0 || (me.cubes < 28 && t < 200.0))
                     && me.energy > 48.0));
 
         let boost = ground_boost || air_unstuck_boost || roof_jet;
