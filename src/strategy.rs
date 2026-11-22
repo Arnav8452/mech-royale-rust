@@ -340,22 +340,19 @@ impl StrategyState {
         let has_nanites = regen_delay <= 3.8;
         let winning_or_even_1v1 = los_count == 1 && los_mechs[0].hp <= me.hp + 180.0;
         let enemy_in_face = los_mechs.iter().any(|m| m.dist < 32.0);
+        // cl-berserk: every extra heal pause lost (disengage 4.28, lean 4.41); fight longer.
+        // Retreat only when nearly dead and outnumbered or clearly losing; leave cover at 60%.
+        let _ = (has_nanites, regen_delay);
         let want_regen = if self.posture == Posture::EmergencyRegen {
-            let hold_cap = if has_nanites { 0.88 } else { 0.80 };
             !immediate_kill_avail
                 && !enemy_in_face
-                && me.hp < hold_cap * me.max_hp
-                && !(me.hp >= 0.72 * me.max_hp && near_mechs == 0 && !has_nanites)
+                && me.hp < 0.60 * me.max_hp
+                && !(me.hp >= 0.45 * me.max_hp && near_mechs == 0)
         } else {
-            let lose_1v1_thr = if has_nanites { 0.56 } else { 0.42 };
             !immediate_kill_avail
                 && !enemy_in_face
-                && ((me.hp < 0.62 * me.max_hp && los_count >= 2)
-                    || (me.hp < lose_1v1_thr * me.max_hp && near_mechs > 0 && !winning_or_even_1v1)
-                    || (has_nanites
-                        && los_count == 0
-                        && me.hp < 0.72 * me.max_hp
-                        && (obs.t - world.last_combat_t) >= (regen_delay - 1.2).max(0.8)))
+                && ((me.hp < 0.35 * me.max_hp && los_count >= 2)
+                    || (me.hp < 0.25 * me.max_hp && near_mechs > 0 && !winning_or_even_1v1))
         };
         let my_ground = map.ground_height(me.pos[0], me.pos[1]);
         let on_roof =

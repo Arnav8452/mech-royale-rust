@@ -822,7 +822,7 @@ mod tests {
         obs.t = 40.0;
         let mz = bot.map.ground_height(86.0, -110.0);
         obs.self_obs.pos = [86.0, -110.0, mz];
-        obs.self_obs.hp = 380.0;
+        obs.self_obs.hp = 300.0;
         obs.self_obs.max_hp = 1400.0;
         obs.self_obs.in_zone = true;
         obs.zone.center = [0.0, 0.0];
@@ -877,7 +877,7 @@ mod tests {
         obs.t = 40.0;
         let mz = bot.map.ground_height(86.0, -110.0);
         obs.self_obs.pos = [86.0, -110.0, mz];
-        obs.self_obs.hp = 380.0;
+        obs.self_obs.hp = 300.0;
         obs.self_obs.max_hp = 1400.0;
         obs.self_obs.in_zone = true;
         obs.zone.center = [0.0, 0.0];
@@ -2397,7 +2397,7 @@ mod tests {
         obs.t = 30.0;
         obs.self_obs.pos = [-55.0, -18.0, mz];
         obs.self_obs.grounded = true;
-        obs.self_obs.hp = 500.0;
+        obs.self_obs.hp = 300.0;
         obs.self_obs.max_hp = 1400.0;
         obs.self_obs.energy = 80.0;
         obs.self_obs.in_zone = true;
@@ -2602,6 +2602,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "cl-berserk removes the 56% nanites fast-reset retreat on purpose"]
     fn skykite_triggers_nanites_fast_reset_at_52pct_hp() {
         let (hello, mut obs) = load_sample_hello_and_obs();
         let mut bot = Bot::new(hello);
