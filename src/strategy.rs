@@ -1943,7 +1943,10 @@ impl StrategyState {
                 continue;
             }
 
-            let score = prio as f64 * 45.0 - d - if roof_ok && !same_roof_ok { 15.0 } else { 0.0 };
+            // cl-grab: with slot 1 empty take the NEAREST weapon (armed early beats armed right);
+            // Lightning replaces a stopgap Laser later via swap_slot_for.
+            let prio_w = if slot1_empty { 0.0 } else { prio as f64 * 45.0 };
+            let score = prio_w - d - if roof_ok && !same_roof_ok { 15.0 } else { 0.0 };
             if best.is_none_or(|(bs, bid, _)| score > bs || (score == bs && id < bid)) {
                 best = Some((score, id, pos));
             }
