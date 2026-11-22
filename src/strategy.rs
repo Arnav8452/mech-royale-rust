@@ -1674,7 +1674,8 @@ impl StrategyState {
         }
 
         // Early-game 50 m unvisited-grid cube snowball until stat_cap (10 cubes) + 13..14 -> 15 upgrade exception
-        if want_farm_cubes && obs.t < 200.0 {
+        // cl-lean: vacuum (more farming/roaming) lost 0.30; go the other way. Drops supply cubes later.
+        if want_farm_cubes && obs.t < 90.0 {
             let explore_invalid = self.explore_goal.is_none_or(|g| {
                 obs.zone.next_radius > 24.0
                     && dist2d(g[0], g[1], nc[0], nc[1]) > (obs.zone.next_radius - 16.0).max(0.0)
