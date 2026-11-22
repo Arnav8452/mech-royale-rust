@@ -431,7 +431,7 @@ impl StrategyState {
             && world
                 .tracked_enemies
                 .values()
-                .any(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 220.0)
+                .any(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 150.0)
         {
             self.posture = Posture::Combat;
             return;
