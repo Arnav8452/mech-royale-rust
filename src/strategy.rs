@@ -1254,10 +1254,10 @@ impl StrategyState {
                 }
 
                 // 1. CoverDuck: outnumbered (2+ LOS), dry/reloading, or enemy charging laser
-                if (los_mech_count >= 2 && !immediate_kill_avail)
-                    || (no_weapon_can_shoot_now && !immediate_kill_avail)
-                    || enemy_laser_duck
-                {
+                let duck_multi_or_dry = (los_mech_count >= 2 && !immediate_kill_avail)
+                    || (no_weapon_can_shoot_now && !immediate_kill_avail);
+                let pure_laser_duck = enemy_laser_duck && !duck_multi_or_dry;
+                if duck_multi_or_dry || enemy_laser_duck {
                     if los_mech_count == 0
                         && (near_cover_14
                             || self.combat_cover_target.is_some_and(|cp| {
@@ -1284,10 +1284,15 @@ impl StrategyState {
                     }
 
                     if !threats.is_empty() {
+                        let max_cover_d = if pure_laser_duck { 18.0 } else { 48.0 };
                         let arrived_exposed = self.combat_cover_target.is_some_and(|cp| {
                             dist2d(me.pos[0], me.pos[1], cp[0], cp[1]) <= 5.5 && los_mech_count > 0
                         });
-                        if arrived_exposed {
+                        let stale_far = pure_laser_duck
+                            && self.combat_cover_target.is_some_and(|cp| {
+                                dist2d(me.pos[0], me.pos[1], cp[0], cp[1]) > 18.0
+                            });
+                        if arrived_exposed || stale_far {
                             self.combat_cover_target = None;
                         }
                         let keep = self
@@ -1303,7 +1308,7 @@ impl StrategyState {
                                 obs.zone.radius,
                                 obs.zone.next_center,
                                 obs.zone.next_radius,
-                                48.0,
+                                max_cover_d,
                                 None,
                             );
                             self.combat_cover_t = obs.t;
@@ -1316,6 +1321,9 @@ impl StrategyState {
                                 return ([0.0, 0.0], cp);
                             }
                             let wp = self.follow_astar(nav, scratch, me_xy, cp, obs.t);
+                            if enemy_laser_duck {
+                                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), cp);
+                            }
                             return (
                                 zigzag_cover_dir(
                                     nav,
@@ -1486,7 +1494,7 @@ impl StrategyState {
                         if me.hp < 0.65 * me.max_hp || enemy_has_lightning || los_mech_count >= 2 {
                             80.0
                         } else {
-                            70.0
+                            60.0
                         }
                     } else if has_lightning
                         && me.energy > 20.0

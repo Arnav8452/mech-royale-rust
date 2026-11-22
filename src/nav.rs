@@ -460,40 +460,55 @@ impl NavGrid {
         let mut cover_cands: Vec<(f64, [f64; 3], f64, bool)> = Vec::with_capacity(128);
         let mut fallback_cands: Vec<(f64, [f64; 3], f64, bool)> = Vec::with_capacity(128);
 
+        let near_x0 = (me_cx as isize - 5).max(x0 as isize) as usize;
+        let near_x1 = (me_cx as isize + 5).min(x1 as isize) as usize;
+        let near_y0 = (me_cy as isize - 5).max(y0 as isize) as usize;
+        let near_y1 = (me_cy as isize + 5).min(y1 as isize) as usize;
+
+        let mut push_cell = |cx: usize, cy: usize, min_d: f64| {
+            let idx = cy * self.nx + cx;
+            if !self.walkable[idx] {
+                return;
+            }
+            let cz = self.ground_z[idx] as f64;
+            if (cz - me_pos[2]).abs() > 22.0 {
+                return;
+            }
+            let w = self.cell_to_world(cx, cy);
+            let d_me = (w[0] - me_pos[0]).hypot(w[1] - me_pos[1]);
+            if d_me < min_d || d_me > max_dist {
+                return;
+            }
+            if (w[0] - zone_center[0]).hypot(w[1] - zone_center[1]) > safe_zone_r {
+                return;
+            }
+            let in_next = (w[0] - next_center[0]).hypot(w[1] - next_center[1]) <= safe_next_r;
+            let mut min_d_threat = f64::INFINITY;
+            for th in threats {
+                let dt = (w[0] - th[0]).hypot(w[1] - th[1]);
+                min_d_threat = min_d_threat.min(dt);
+            }
+            let pre =
+                -0.8 * d_me + (if in_next { 25.0 } else { 0.0 }) + 0.35 * min_d_threat.min(90.0);
+            let item = (pre, [w[0], w[1], cz], d_me, in_next);
+            if self.near_cover[idx] {
+                cover_cands.push(item);
+            } else {
+                fallback_cands.push(item);
+            }
+        };
+
+        for cy in near_y0..=near_y1 {
+            for cx in near_x0..=near_x1 {
+                push_cell(cx, cy, 2.5);
+            }
+        }
         for cy in (y0..=y1).step_by(2) {
             for cx in (x0..=x1).step_by(2) {
-                let idx = cy * self.nx + cx;
-                if !self.walkable[idx] {
+                if (near_x0..=near_x1).contains(&cx) && (near_y0..=near_y1).contains(&cy) {
                     continue;
                 }
-                let cz = self.ground_z[idx] as f64;
-                if (cz - me_pos[2]).abs() > 22.0 {
-                    continue;
-                }
-                let w = self.cell_to_world(cx, cy);
-                let d_me = (w[0] - me_pos[0]).hypot(w[1] - me_pos[1]);
-                if d_me < 6.0 || d_me > max_dist {
-                    continue;
-                }
-                if (w[0] - zone_center[0]).hypot(w[1] - zone_center[1]) > safe_zone_r {
-                    continue;
-                }
-                let in_next =
-                    (w[0] - next_center[0]).hypot(w[1] - next_center[1]) <= safe_next_r;
-                let mut min_d_threat = f64::INFINITY;
-                for th in threats {
-                    let dt = (w[0] - th[0]).hypot(w[1] - th[1]);
-                    min_d_threat = min_d_threat.min(dt);
-                }
-                let pre = -0.8 * d_me
-                    + (if in_next { 25.0 } else { 0.0 })
-                    + 0.35 * min_d_threat.min(90.0);
-                let item = (pre, [w[0], w[1], cz], d_me, in_next);
-                if self.near_cover[idx] {
-                    cover_cands.push(item);
-                } else {
-                    fallback_cands.push(item);
-                }
+                push_cell(cx, cy, 6.0);
             }
         }
 

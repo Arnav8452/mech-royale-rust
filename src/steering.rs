@@ -174,9 +174,9 @@ pub(crate) fn steer(
             if !ok_near {
                 score -= 4.0;
             } else if !ok_mid {
-                score -= 1.8;
+                score -= if ducking_to_cover { 0.6 } else { 1.8 };
             } else if !ok_far {
-                score -= 0.6;
+                score -= if ducking_to_cover { 0.15 } else { 0.6 };
             }
         }
 
@@ -185,7 +185,7 @@ pub(crate) fn steer(
             score += 2.2 * (dir[0] * away[0] + dir[1] * away[1]);
         }
 
-        let laser_w = if ducking_to_cover { 0.45 } else { 3.5 };
+        let laser_w = if ducking_to_cover { 0.0 } else { 3.5 };
         for ray in &laser_threats {
             let cross = (dir[0] * ray[1] - dir[1] * ray[0]).abs();
             score += laser_w * cross;

@@ -1,6 +1,6 @@
-use crate::geom::{angle_diff, direct_aim, dist3d};
+use crate::geom::{angle_diff, direct_aim, dist2d, dist3d, wrap_angle};
 use crate::map::Map;
-use crate::protocol::{stat, Config, Observation, SelfObs, WeaponKind, WeaponObs};
+use crate::protocol::{stat, Config, DropObs, Observation, SelfObs, WeaponKind, WeaponObs};
 use crate::world::WorldState;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -203,6 +203,7 @@ pub(crate) fn pick_best_mech_target(
     me: &SelfObs,
     last_damage_by: Option<u64>,
     last_target_id: Option<u64>,
+    drops: &[DropObs],
 ) -> Option<TargetCandidate> {
     let have_laser = me
         .weapons
@@ -267,6 +268,24 @@ pub(crate) fn pick_best_mech_target(
         if last_damage_by == Some(c.id) {
             score += 40.0;
         }
+        let dir_to_me = (me.pos[1] - c.pos[1]).atan2(me.pos[0] - c.pos[0]);
+        if angle_diff(c.aim[0], dir_to_me).abs() > std::f64::consts::FRAC_PI_2 {
+            score += 55.0;
+        }
+        if c.charging {
+            score += 45.0;
+        }
+        for d in drops {
+            if d.lands_in <= 3.0 {
+                if d.holder == Some(c.id) {
+                    score += 160.0;
+                    break;
+                } else if dist2d(c.pos[0], c.pos[1], d.pos[0], d.pos[1]) <= d.radius + 4.0 {
+                    score += 90.0;
+                    break;
+                }
+            }
+        }
 
         if best_los.is_none_or(|(bs, prev)| {
             score > bs + 1e-9 || ((score - bs).abs() <= 1e-9 && c.id < prev.id)
@@ -290,8 +309,11 @@ pub(crate) fn eval_combat(
     mech_cands: &[TargetCandidate],
     tgt: &TargetCandidate,
     allow_new_laser_charge: bool,
+    urgent_break_charge: bool,
 ) -> ([bool; 2], bool, Option<[f64; 2]>, Option<[f64; 3]>) {
     let me = &obs.self_obs;
+    let turn_rate = stat(&me.stats, "turn_rate", 4.0);
+    let pitch_rate = stat(&me.stats, "pitch_rate", 3.0);
     let mut fire = [false, false];
     let mut reload = false;
     let mut chosen_aim: Option<[f64; 2]>;
@@ -331,6 +353,8 @@ pub(crate) fn eval_combat(
             tgt,
             min_pitch,
             max_pitch,
+            turn_rate,
+            pitch_rate,
         )
     };
 
@@ -365,16 +389,21 @@ pub(crate) fn eval_combat(
             tgt,
             min_pitch,
             max_pitch,
+            turn_rate,
+            pitch_rate,
+            urgent_break_charge,
         );
         fire[ls] = should_hold;
 
-        if should_hold && charge < full_charge - 0.06 {
+        let yaw_snap = (turn_rate * 0.045).max(0.14);
+        let pitch_snap = (pitch_rate * 0.045).max(0.11);
+        if should_hold && charge < full_charge * 0.90 {
             if let Some(gs) = gun_slot {
                 let (g_aim, g_fire, g_rel, g_ready) = eval_gun_slot(gs);
                 reload = g_rel;
-                let handoff_ok = charge < full_charge - 0.12
-                    || (angle_diff(g_aim[0], l_aim[0]).abs() <= 0.14
-                        && (g_aim[1] - l_aim[1]).abs() <= 0.14);
+                let can_snap_next_tick = angle_diff(g_aim[0], l_aim[0]).abs() <= yaw_snap
+                    && (g_aim[1] - l_aim[1]).abs() <= pitch_snap;
+                let handoff_ok = charge < full_charge * 0.90 - 0.12 || can_snap_next_tick;
                 if g_ready && handoff_ok {
                     chosen_aim = Some(g_aim);
                     fire[gs] = g_fire;
@@ -453,6 +482,9 @@ pub(crate) fn eval_combat(
                         tgt,
                         min_pitch,
                         max_pitch,
+                        turn_rate,
+                        pitch_rate,
+                        false,
                     );
                     fire[ls] = should_hold;
                     chosen_aim = Some(l_aim);
@@ -486,6 +518,9 @@ pub(crate) fn eval_combat(
                 tgt,
                 min_pitch,
                 max_pitch,
+                turn_rate,
+                pitch_rate,
+                false,
             );
             fire[ls] = should_hold;
             if let Some(gs) = gun_slot {
@@ -628,6 +663,8 @@ fn eval_gun(
     tgt: &TargetCandidate,
     min_pitch: f64,
     max_pitch: f64,
+    turn_rate: f64,
+    pitch_rate: f64,
 ) -> ([f64; 2], bool, bool, bool) {
     let speed = stat(&w.stats, "speed", 252.0);
     let range = stat(&w.stats, "range", 230.0);
@@ -681,8 +718,10 @@ fn eval_gun(
     let dist = dist3d(muzzle, eff_lead);
     // Never gate trigger on cooldown <= 0.12: holding trigger fires cleanly every 0.24 s!
     let ready = reload_left <= 0.0 && ammo > 0.0 && dist <= range;
+    let dt_slew = if w.cooldown <= 0.05 { 0.048 } else { 0.095 };
+    let post_slew_aim = slew_step(cur_aim, aim, turn_rate, pitch_rate, dt_slew);
     let slew_ok = slew_aligned(
-        cur_aim,
+        post_slew_aim,
         aim,
         tgt.radius,
         tgt.aim_half_h,
@@ -733,6 +772,9 @@ pub(crate) fn eval_laser(
     tgt: &TargetCandidate,
     min_pitch: f64,
     max_pitch: f64,
+    turn_rate: f64,
+    pitch_rate: f64,
+    urgent_break_charge: bool,
 ) -> ([f64; 2], bool) {
     let aim_off = tgt.aim_z - tgt.pos[2];
     let muzzle_next = [
@@ -757,8 +799,9 @@ pub(crate) fn eval_laser(
     let cookoff = stat(&w.stats, "cookoff", 0.6);
     let charge = w.charge.unwrap_or(0.0);
 
+    let post_slew_aim = slew_step(cur_aim, aim, turn_rate, pitch_rate, 0.048);
     let aligned = slew_aligned(
-        cur_aim,
+        post_slew_aim,
         aim,
         tgt.radius,
         tgt.aim_half_h,
@@ -805,7 +848,9 @@ pub(crate) fn eval_laser(
     } else if charge >= min_charge
         && tgt.has_los
         && aligned
-        && (expected_dmg >= tgt.hp * 1.05 || losing_los)
+        && (expected_dmg >= tgt.hp * 1.05
+            || losing_los
+            || (urgent_break_charge && charge < full_charge * 0.72))
     {
         false
     } else {
@@ -976,6 +1021,23 @@ fn solve_linear_intercept_time(
     ];
     let dist0 = dist3d(muzzle, lead0);
     ((dist0 - shot_origin_offset).max(0.0) / bullet_speed.max(1.0)).min(2.0)
+}
+
+#[inline]
+pub(crate) fn slew_step(
+    cur_aim: [f64; 2],
+    target_aim: [f64; 2],
+    turn_rate: f64,
+    pitch_rate: f64,
+    dt: f64,
+) -> [f64; 2] {
+    let dyaw = angle_diff(cur_aim[0], target_aim[0]);
+    let max_dy = (turn_rate * dt).max(0.0);
+    let new_yaw = wrap_angle(cur_aim[0] + dyaw.clamp(-max_dy, max_dy));
+    let dpitch = target_aim[1] - cur_aim[1];
+    let max_dp = (pitch_rate * dt).max(0.0);
+    let new_pitch = cur_aim[1] + dpitch.clamp(-max_dp, max_dp);
+    [new_yaw, new_pitch]
 }
 
 #[inline]
