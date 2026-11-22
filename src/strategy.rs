@@ -410,7 +410,7 @@ impl StrategyState {
 
         // cl-farmfirst: house bots escalate as we kill. Reach ~8 cubes (HP/damage) before
         // taking optional fights early; fight anything within 50 m or anything shooting us.
-        let farm_gate = obs.t < 150.0
+        let farm_gate = obs.t < 600.0
             && me.cubes < 10
             && obs.t - world.last_mech_damage_t > 3.0
             && !world
