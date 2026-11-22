@@ -1696,7 +1696,12 @@ impl StrategyState {
         }
 
         // Early-game 50 m unvisited-grid cube snowball until stat_cap (10 cubes) + 13..14 -> 15 upgrade exception
-        if want_farm_cubes && obs.t < 200.0 {
+        // cl-roam: keep visiting unexplored 50 m cells all match (loot, crates, drones, weapons),
+        // but never in place of an enemy we can hunt.
+        let late_roam = obs.t < 330.0
+            && world.last_hunt_pos.is_none()
+            && !world.is_huntable_sound(obs.t);
+        if (want_farm_cubes && obs.t < 200.0) || late_roam {
             let explore_invalid = self.explore_goal.is_none_or(|g| {
                 obs.zone.next_radius > 24.0
                     && dist2d(g[0], g[1], nc[0], nc[1]) > (obs.zone.next_radius - 16.0).max(0.0)
