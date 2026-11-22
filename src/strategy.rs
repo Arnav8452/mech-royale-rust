@@ -116,9 +116,9 @@ impl StrategyState {
                 "plating" => 112.0,
                 "laser_charge" => 111.0,
                 "lightning_range" => 110.0,
-                "laser_damage" => 109.0,
-                "lightning_efficiency" => 108.0,
-                "armor" => 106.0,
+                "laser_damage" | "mortar_reload" => 109.0,
+                "lightning_efficiency" | "mortar_splash" => 108.0,
+                "armor" | "mortar_velocity" => 106.0,
                 "gun_mag" => 105.0,
                 "laser_pierce" => 103.0,
                 "gun_damage" | "gun_rate" => 101.0,
@@ -147,7 +147,6 @@ impl StrategyState {
                         48.0
                     }
                 }
-                id if id.starts_with("mortar_") => 25.0,
                 _ => {
                     if let Some(def) = def_opt {
                         let mut max_eff = 10.0_f64;
@@ -155,12 +154,12 @@ impl StrategyState {
                             let base = match eff.path.as_str() {
                                 "mech.regen_per_s" | "mech.regen_delay" => 114.0,
                                 "mech.hp" => 110.0,
+                                _ if eff.path.starts_with("weapons.mortar.") => 106.0,
                                 "mech.armor" => 106.0,
                                 _ if eff.path.starts_with("weapons.laser.") => 104.0,
                                 _ if eff.path.starts_with("weapons.lightning.") => 102.0,
                                 _ if eff.path.starts_with("weapons.gun.") => 98.0,
                                 "mech.walk_speed" | "mech.boost_speed" => 96.0,
-                                _ if eff.path.starts_with("weapons.mortar.") => 25.0,
                                 _ => 30.0,
                             };
                             max_eff = max_eff.max(base);
@@ -200,7 +199,7 @@ impl StrategyState {
 
         let mut best_pickup: Option<(u8, f64, WeaponKind, u64)> = None;
         for p in &obs.pickups {
-            if p.kind == WeaponKind::Mortar || world.blacklisted_pickups.contains_key(&p.id) {
+            if world.blacklisted_pickups.contains_key(&p.id) {
                 continue;
             }
             if me.weapons.iter().flatten().any(|w| w.kind == p.kind) {
@@ -752,7 +751,9 @@ impl StrategyState {
                             let e_cost = stat(&w.stats, "energy", 3.0);
                             w.cooldown <= 0.38 && tgt.dist <= r && me.energy >= 10.0_f64.max(e_cost)
                         }
-                        WeaponKind::Mortar => false,
+                        WeaponKind::Mortar => {
+                            w.cooldown <= 0.38 && tgt.dist >= 16.0 && tgt.dist <= 215.0
+                        }
                     });
                     !any_charging && !any_ready
                 } else {
@@ -1051,6 +1052,11 @@ impl StrategyState {
                         )
                     };
                     let has_lightning = have_lightning;
+                    let have_mortar = me
+                        .weapons
+                        .iter()
+                        .flatten()
+                        .any(|w| w.kind == WeaponKind::Mortar);
                     let enemy_has_lightning = e.weapons.contains(&WeaponKind::Lightning);
                     let enemy_has_laser = e.weapons.contains(&WeaponKind::Laser);
                     let lt_brawl_d = if have_laser && has_lightning {
@@ -1058,7 +1064,9 @@ impl StrategyState {
                     } else {
                         (my_lt_range - 12.0).max(32.0)
                     };
-                    let base_pref_dist: f64 = if lt_rush_charger {
+                    let base_pref_dist: f64 = if have_mortar && !lt_rush_charger {
+                        56.0
+                    } else if lt_rush_charger {
                         (my_lt_range - 12.0).max(26.0)
                     } else if have_laser && has_lightning {
                         if me.energy < 24.0 {
@@ -1089,10 +1097,14 @@ impl StrategyState {
                     };
 
                     let d2 = dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]);
-                    let (pref_dist, push_w) = if e.is_vulnerable || e.hp <= 480.0 {
+                    let (pref_dist, push_w) = if have_mortar && d2 < 24.0 {
+                        self.tactic = CombatTactic::OpenStrafe;
+                        (base_pref_dist, 0.78)
+                    } else if e.is_vulnerable || e.hp <= 480.0 {
                         self.tactic = CombatTactic::AggressivePush;
                         ((base_pref_dist - 10.0).max(22.0), 0.78)
                     } else if has_lightning
+                        && !have_mortar
                         && me.energy > 20.0
                         && d2 > (my_lt_range - 3.0)
                         && base_pref_dist <= (my_lt_range - 7.0)
@@ -1105,7 +1117,9 @@ impl StrategyState {
                     };
 
                     let in_band_neg = if is_1v1 { 6.0 } else { 10.0 };
-                    let radial_w = if d2 < pref_dist - in_band_neg {
+                    let radial_w = if have_mortar && d2 < 24.0 {
+                        -0.95
+                    } else if d2 < pref_dist - in_band_neg {
                         -0.65
                     } else if d2 > pref_dist + if self.tactic == CombatTactic::AggressivePush {
                         8.0
@@ -1459,19 +1473,19 @@ impl StrategyState {
     ) -> Option<[f64; 3]> {
         let me = &obs.self_obs;
         let slot1_empty = me.weapons.get(1).and_then(|w| w.as_ref()).is_none();
-        let have_lightning = me
-            .weapons
-            .iter()
-            .flatten()
-            .any(|w| w.kind == WeaponKind::Lightning);
         let have_laser = me
             .weapons
             .iter()
             .flatten()
             .any(|w| w.kind == WeaponKind::Laser);
+        let have_mortar = me
+            .weapons
+            .iter()
+            .flatten()
+            .any(|w| w.kind == WeaponKind::Mortar);
         let gun_upgrades = me.upgrades.iter().filter(|u| u.starts_with("gun_")).count();
-        let seeking_upgrade =
-            !have_lightning || (!have_laser && !(have_lightning && gun_upgrades >= 2));
+        let seeking_upgrade = !have_mortar
+            || (!have_laser && !(have_mortar && gun_upgrades >= 2));
 
         let close_los_enemy = los_mechs.iter().any(|m| m.dist < 60.0);
         let any_los_enemy = !los_mechs.is_empty();
@@ -1485,7 +1499,7 @@ impl StrategyState {
         let mut best: Option<(f64, u64, [f64; 3])> = None;
 
         for (&id, &(kind, pos, _)) in &world.last_pickup_seen {
-            if kind == WeaponKind::Mortar || world.blacklisted_pickups.contains_key(&id) {
+            if world.blacklisted_pickups.contains_key(&id) {
                 continue;
             }
             if me.weapons.iter().flatten().any(|w| w.kind == kind) {
@@ -1507,7 +1521,7 @@ impl StrategyState {
                 && dh <= 20.0
                 && me.energy >= 48.0
                 && !any_los_enemy
-                && (slot1_empty || !have_lightning || !have_laser)
+                && (slot1_empty || !have_mortar || !have_laser)
                 && d <= 85.0
                 && obs.t >= world.roof_climb_cooldown_until
                 && map.roof_top_at(pos[0], pos[1]).is_some();
@@ -1534,54 +1548,75 @@ impl StrategyState {
     }
 }
 
-/// Preferred loadout `[Laser, Lightning]` (protects Gun only when >= 2 Gun upgrades invested).
+/// Preferred loadout `[Laser, Mortar]` (protects Gun only when >= 2 Gun upgrades invested).
 fn swap_slot_for(me: &SelfObs, new_kind: WeaponKind) -> Option<usize> {
-    if new_kind == WeaponKind::Mortar {
-        return None;
-    }
-    if let Some(m_slot) = me
-        .weapons
-        .iter()
-        .take(2)
-        .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Mortar))
-    {
-        return Some(m_slot);
-    }
     let gun_upgrades = me.upgrades.iter().filter(|u| u.starts_with("gun_")).count();
-    let laser_upgrades = me.upgrades.iter().filter(|u| u.starts_with("laser_")).count();
+    let lt_upgrades = me
+        .upgrades
+        .iter()
+        .filter(|u| u.starts_with("lightning_"))
+        .count();
     let laser_slot = me
         .weapons
         .iter()
         .take(2)
         .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Laser));
+    let mortar_slot = me
+        .weapons
+        .iter()
+        .take(2)
+        .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Mortar));
+    let lt_slot = me
+        .weapons
+        .iter()
+        .take(2)
+        .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Lightning));
     let gun_slot = me
         .weapons
         .iter()
         .take(2)
         .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Gun));
 
-    if new_kind == WeaponKind::Lightning {
-        if let Some(gs) = gun_slot {
-            if gun_upgrades < 2 {
-                return Some(gs);
+    match new_kind {
+        WeaponKind::Mortar => {
+            if let Some(gs) = gun_slot {
+                if gun_upgrades < 2 {
+                    return Some(gs);
+                }
             }
-        }
-        if let Some(ls) = laser_slot {
-            if laser_upgrades == 0 {
-                return Some(ls);
+            if let Some(lts) = lt_slot {
+                if laser_slot.is_some() && lt_upgrades == 0 {
+                    return Some(lts);
+                }
             }
+            None
         }
-        return gun_slot.or(laser_slot);
+        WeaponKind::Laser => {
+            if let Some(gs) = gun_slot {
+                if gun_upgrades < 2 {
+                    return Some(gs);
+                }
+            }
+            if let Some(lts) = lt_slot {
+                if mortar_slot.is_some() && lt_upgrades == 0 {
+                    return Some(lts);
+                }
+            }
+            None
+        }
+        WeaponKind::Lightning => {
+            if mortar_slot.is_some() {
+                return None;
+            }
+            if let Some(gs) = gun_slot {
+                if gun_upgrades < 2 {
+                    return Some(gs);
+                }
+            }
+            None
+        }
+        WeaponKind::Gun => None,
     }
-    if new_kind == WeaponKind::Laser {
-        if let Some(gs) = gun_slot {
-            if gun_upgrades < 2 {
-                return Some(gs);
-            }
-        }
-        return None;
-    }
-    None
 }
 
 #[inline]

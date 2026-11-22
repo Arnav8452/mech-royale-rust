@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m13-skyrail".to_string(),
+            name: "rust-bot-m13-mortar".to_string(),
             config: hello.config,
             map,
             nav,
@@ -173,17 +173,30 @@ impl Bot {
                 tgt,
             )
         } else {
-            let (pre_fire, pre_aim) = combat::eval_precharge_laser(
-                obs,
+            let (m_fire, m_aim, m_pt) = combat::eval_indirect_mortar(
+                &self.map,
                 &self.config,
+                obs,
                 &self.world,
-                muzzle,
+                mech_height,
                 min_pitch,
                 max_pitch,
-                self.strategy.peek_target,
-                los_mech_count,
             );
-            (pre_fire, false, pre_aim, None)
+            if m_aim.is_some() {
+                (m_fire, false, m_aim, m_pt)
+            } else {
+                let (pre_fire, pre_aim) = combat::eval_precharge_laser(
+                    obs,
+                    &self.config,
+                    &self.world,
+                    muzzle,
+                    min_pitch,
+                    max_pitch,
+                    self.strategy.peek_target,
+                    los_mech_count,
+                );
+                (pre_fire, false, pre_aim, None)
+            }
         };
 
         if fire[0] || fire[1] {
@@ -2245,5 +2258,169 @@ mod tests {
             "1v2+ at <70% HP near prism 56 must trigger Building-Vault Escape"
         );
         assert_eq!(a_vault.jump, Some(true));
+    }
+
+    #[test]
+    fn mortar_solver_fires_low_arc_direct_and_rejects_self_splash_close_range() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(-45.0, 0.0);
+        let ez_far = bot.map.ground_height(-100.0, 0.0);
+        let ez_close = bot.map.ground_height(-55.0, 0.0);
+
+        let w_mortar = WeaponObs {
+            kind: WeaponKind::Mortar,
+            cooldown: 0.0,
+            ammo: None,
+            reload: None,
+            charge: None,
+            stats: bot.config.weapons.mortar.clone(),
+        };
+        let w_laser = WeaponObs {
+            kind: WeaponKind::Laser,
+            cooldown: 0.0,
+            ammo: None,
+            reload: None,
+            charge: Some(0.0),
+            stats: bot.config.weapons.laser.clone(),
+        };
+
+        // 1. Direct low-arc at 55 m on Open Oval
+        let direct = crate::combat::solve_mortar_aim(
+            &bot.map,
+            [-45.0, 0.0, mz],
+            9.0,
+            &w_mortar,
+            [-100.0, 0.0, ez_far],
+            [0.0, 0.0, 0.0],
+            true,
+            -0.7,
+            1.3,
+        );
+        let (aim_low, _) = direct.expect("must find clear low-arc mortar shot at 55 m");
+        assert!(aim_low[1] < 0.25, "55 m shot should use low arc, got {}", aim_low[1]);
+
+        obs.t = 30.0;
+        obs.self_obs.pos = [-45.0, 0.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.aim = aim_low;
+        obs.self_obs.weapons = vec![Some(w_laser.clone()), Some(w_mortar.clone())];
+        obs.mechs = vec![ActorObs {
+            id: 97,
+            kind: "mech".into(),
+            pos: [-100.0, 0.0, ez_far],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1400.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+        let a_fire = bot.act(&obs);
+        assert_eq!(a_fire.fire.unwrap()[1], true, "must fire aligned low-arc Mortar");
+        assert_eq!(
+            a_fire.fire.unwrap()[0],
+            true,
+            "must simultaneously start Laser charge for Mortar+Laser combo"
+        );
+
+        // 2. Reject close range (10 m < splash_r + 7.5 = 14.5 m) to avoid self-splash!
+        let too_close = crate::combat::solve_mortar_aim(
+            &bot.map,
+            [-45.0, 0.0, mz],
+            9.0,
+            &w_mortar,
+            [-55.0, 0.0, ez_close],
+            [0.0, 0.0, 0.0],
+            true,
+            -0.7,
+            1.3,
+        );
+        assert!(too_close.is_none(), "must reject 10 m close shot to avoid self-splash");
+    }
+
+    #[test]
+    fn mortar_lobs_high_arc_over_campus_building_at_tracked_enemy_behind_wall() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        // Bot North of prism 49 (top=25.72 m), stationary tracked enemy 136 m South behind prism 49!
+        let mz = bot.map.ground_height(160.0, -94.0);
+        let ez = bot.map.ground_height(160.0, -230.0);
+        assert!(
+            !bot.map.has_los([160.0, -94.0, mz + 8.0], [160.0, -230.0, ez + 4.5]),
+            "prism 49 must block direct LOS between (160, -94) and (160, -230)"
+        );
+
+        let w_mortar = WeaponObs {
+            kind: WeaponKind::Mortar,
+            cooldown: 0.0,
+            ammo: None,
+            reload: None,
+            charge: None,
+            stats: bot.config.weapons.mortar.clone(),
+        };
+        let high = crate::combat::solve_mortar_aim(
+            &bot.map,
+            [160.0, -94.0, mz],
+            9.0,
+            &w_mortar,
+            [160.0, -230.0, ez],
+            [0.0, 0.0, 0.0],
+            false,
+            -0.7,
+            1.3,
+        );
+        let (high_aim, _) = high.expect("must find clear high-arc over prism 49 at 136 m");
+        assert!(
+            high_aim[1] > 1.15 && high_aim[1] <= 1.30,
+            "over-building shell must use high arc pitch in (1.15, 1.30], got {}",
+            high_aim[1]
+        );
+
+        obs.t = 35.0;
+        obs.self_obs.pos = [160.0, -94.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [160.0, -140.0];
+        obs.zone.next_center = [160.0, -140.0];
+        obs.zone.radius = 250.0;
+        obs.zone.next_radius = 220.0;
+        obs.self_obs.aim = high_aim;
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Laser,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: Some(0.0),
+                stats: bot.config.weapons.laser.clone(),
+            }),
+            Some(w_mortar),
+        ];
+        obs.mechs = vec![ActorObs {
+            id: 98,
+            kind: "mech".into(),
+            pos: [160.0, -230.0, ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1400.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+        let a_indirect = bot.act(&obs);
+        assert_eq!(
+            a_indirect.fire.unwrap()[1],
+            true,
+            "bot must lob indirect high-arc Mortar over prism 49 at tracked enemy behind wall"
+        );
     }
 }

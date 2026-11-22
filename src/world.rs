@@ -369,7 +369,7 @@ impl WorldState {
             true
         });
         for p in &obs.pickups {
-            if p.kind == WeaponKind::Mortar || self.blacklisted_pickups.contains_key(&p.id) {
+            if self.blacklisted_pickups.contains_key(&p.id) {
                 continue;
             }
             let gz = map.ground_height(p.pos[0], p.pos[1]);

@@ -1,4 +1,4 @@
-use crate::geom::{angle_diff, direct_aim, dist3d};
+use crate::geom::{angle_diff, direct_aim, dist2d, dist3d};
 use crate::map::Map;
 use crate::protocol::{stat, Config, Observation, SelfObs, WeaponKind, WeaponObs};
 use crate::world::WorldState;
@@ -298,6 +298,7 @@ pub(crate) fn eval_combat(
     let mut laser_slot = None;
     let mut gun_slot = None;
     let mut lightning_slot = None;
+    let mut mortar_slot = None;
 
     for (i, wopt) in me.weapons.iter().enumerate().take(2) {
         if let Some(w) = wopt {
@@ -305,10 +306,12 @@ pub(crate) fn eval_combat(
                 WeaponKind::Laser => laser_slot = Some(i),
                 WeaponKind::Gun => gun_slot = Some(i),
                 WeaponKind::Lightning => lightning_slot = Some(i),
-                WeaponKind::Mortar => {}
+                WeaponKind::Mortar => mortar_slot = Some(i),
             }
         }
     }
+    let mech_height = stat(&config.mech, "height", 9.0)
+        * (1.0 + config.cubes.size_per_cube * (me.cubes as f64));
 
     let active_laser = laser_slot.filter(|&i| {
         me.weapons[i]
@@ -365,6 +368,33 @@ pub(crate) fn eval_combat(
             max_pitch,
         );
         fire[ls] = should_hold;
+
+        if should_hold && charge < full_charge - 0.22 {
+            if let Some(ms) = mortar_slot {
+                let mw = me.weapons[ms].as_ref().unwrap();
+                let mortar_farm_ok = matches!(tgt.kind, TargetKind::Mech)
+                    || (tgt.dist >= 16.0 && me.hp > 0.55 * me.max_hp);
+                if mw.cooldown <= 0.08 && mortar_farm_ok {
+                    if let Some((m_aim, m_pt)) = solve_mortar_aim(
+                        map,
+                        me.pos,
+                        mech_height,
+                        mw,
+                        tgt.pos,
+                        tgt.vel,
+                        tgt.has_los,
+                        min_pitch,
+                        max_pitch,
+                    ) {
+                        let aligned = angle_diff(me.aim[0], m_aim[0]).abs() <= 0.14
+                            && (me.aim[1] - m_aim[1]).abs() <= 0.14;
+                        chosen_aim = Some(m_aim);
+                        fire[ms] = aligned;
+                        return (fire, reload, chosen_aim, Some(m_pt));
+                    }
+                }
+            }
+        }
 
         if should_hold && charge < full_charge - 0.06 {
             if let Some(gs) = gun_slot {
@@ -456,6 +486,45 @@ pub(crate) fn eval_combat(
             }
 
             return (fire, reload, chosen_aim, debug_pt);
+        }
+    }
+
+    // 2.5. Mortar ballistic strike (low-arc direct/over-ridge or high-arc over-wall)
+    if let Some(ms) = mortar_slot {
+        let w = me.weapons[ms].as_ref().unwrap();
+        let mortar_farm_ok = matches!(tgt.kind, TargetKind::Mech)
+            || (tgt.dist >= 16.0 && me.hp > 0.55 * me.max_hp);
+        if w.cooldown <= 0.08 && mortar_farm_ok {
+            if let Some((m_aim, m_pt)) = solve_mortar_aim(
+                map,
+                me.pos,
+                mech_height,
+                w,
+                tgt.pos,
+                tgt.vel,
+                tgt.has_los,
+                min_pitch,
+                max_pitch,
+            ) {
+                let aligned = angle_diff(me.aim[0], m_aim[0]).abs() <= 0.14
+                    && (me.aim[1] - m_aim[1]).abs() <= 0.14;
+                chosen_aim = Some(m_aim);
+                fire[ms] = aligned;
+                if aligned {
+                    if let Some(ls) = laser_slot {
+                        let lw = me.weapons[ls].as_ref().unwrap();
+                        let l_range = stat(&lw.stats, "range", 280.0);
+                        if matches!(tgt.kind, TargetKind::Mech)
+                            && tgt.has_los
+                            && tgt.dist <= l_range - 2.0
+                            && lw.cooldown <= 0.08
+                        {
+                            fire[ls] = true;
+                        }
+                    }
+                }
+                return (fire, reload, chosen_aim, Some(m_pt));
+            }
         }
     }
 
@@ -832,11 +901,201 @@ fn lightning_energy_ok(
 #[inline]
 pub(crate) fn weapon_desirability(kind: WeaponKind) -> u8 {
     match kind {
-        WeaponKind::Lightning => 4,
-        WeaponKind::Laser => 3,
+        WeaponKind::Laser => 4,
+        WeaponKind::Mortar => 3,
+        WeaponKind::Lightning => 3,
         WeaponKind::Gun => 2,
-        WeaponKind::Mortar => 0,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn solve_mortar_aim(
+    map: &Map,
+    me_pos: [f64; 3],
+    me_height: f64,
+    w: &WeaponObs,
+    tgt_pos: [f64; 3],
+    tgt_vel: [f64; 3],
+    has_los: bool,
+    min_pitch: f64,
+    max_pitch: f64,
+) -> Option<([f64; 2], [f64; 3])> {
+    let v = stat(&w.stats, "speed", 72.0);
+    let g = stat(&w.stats, "gravity", 22.0);
+    let splash_r = stat(&w.stats, "splash_radius", 7.0);
+    let ttl = stat(&w.stats, "ttl", 7.0);
+
+    let min_safe_r = splash_r + 7.5;
+    let r_xy = dist2d(me_pos[0], me_pos[1], tgt_pos[0], tgt_pos[1]);
+    if r_xy < min_safe_r {
+        return None;
+    }
+
+    let mortar_origin = [me_pos[0], me_pos[1], me_pos[2] + me_height + 0.5];
+
+    let solve_arc = |target_pt: [f64; 3]| -> Option<(f64, f64, f64, f64, f64)> {
+        let dx = target_pt[0] - mortar_origin[0];
+        let dy = target_pt[1] - mortar_origin[1];
+        let dz = target_pt[2] - mortar_origin[2];
+        let r = dx.hypot(dy).max(0.5);
+        let yaw = dy.atan2(dx);
+        let v2 = v * v;
+        let disc = v2 * v2 - g * (g * r * r + 2.0 * dz * v2);
+        if disc < 0.0 {
+            return None;
+        }
+        let sq = disc.sqrt();
+        let p_low = ((v2 - sq) / (g * r)).atan();
+        let p_high = ((v2 + sq) / (g * r)).atan();
+        let t_low = r / (v * p_low.cos()).max(0.1);
+        let t_high = r / (v * p_high.cos()).max(0.1);
+        Some((yaw, p_low, t_low, p_high, t_high))
+    };
+
+    // 1. Low-arc ballistic solution (2 lead iterations; direct LOS or low ridge/roof clearance)
+    let mut t_est = (r_xy / v.max(1.0)).clamp(0.05, 2.9);
+    let mut low_pt = [
+        tgt_pos[0],
+        tgt_pos[1],
+        map.surface_height(tgt_pos[0], tgt_pos[1], tgt_pos[2]) + 0.4,
+    ];
+    for _ in 0..2 {
+        let damp = if t_est <= 1.0 {
+            0.90
+        } else if t_est <= 1.8 {
+            0.72
+        } else {
+            0.50
+        };
+        let px = tgt_pos[0] + tgt_vel[0] * t_est * damp;
+        let py = tgt_pos[1] + tgt_vel[1] * t_est * damp;
+        let pz = map.surface_height(px, py, tgt_pos[2]) + 0.4;
+        low_pt = [px, py, pz];
+        if let Some((_, p_low, t_low, _, _)) = solve_arc(low_pt) {
+            if p_low.is_finite() && t_low.is_finite() {
+                t_est = t_low;
+            }
+        }
+    }
+
+    if let Some((yaw, p_low, t_low, _, _)) = solve_arc(low_pt) {
+        if (min_pitch..=max_pitch).contains(&p_low)
+            && t_low <= 2.9
+            && dist2d(me_pos[0], me_pos[1], low_pt[0], low_pt[1]) >= min_safe_r
+        {
+            let vel_low = [
+                v * p_low.cos() * yaw.cos(),
+                v * p_low.cos() * yaw.sin(),
+                v * p_low.sin(),
+            ];
+            if map.has_mortar_arc_clearance(mortar_origin, vel_low, g, t_low) {
+                return Some(([yaw, p_low], low_pt));
+            }
+        }
+    }
+
+    // 2. High-arc over-wall artillery shell (120..225 m vs slow/camping tracked targets behind tall buildings)
+    let tgt_spd = tgt_vel[0].hypot(tgt_vel[1]);
+    if !has_los && tgt_spd <= 8.0 && (120.0..=225.0).contains(&r_xy) {
+        let px = tgt_pos[0] + tgt_vel[0] * 0.20;
+        let py = tgt_pos[1] + tgt_vel[1] * 0.20;
+        let pz = map.surface_height(px, py, tgt_pos[2]) + 0.4;
+        let high_pt = [px, py, pz];
+        if let Some((yaw, _, _, p_high, t_high)) = solve_arc(high_pt) {
+            if (min_pitch..=max_pitch).contains(&p_high)
+                && t_high <= (ttl - 0.3).max(4.5)
+                && dist2d(me_pos[0], me_pos[1], high_pt[0], high_pt[1]) >= min_safe_r
+            {
+                let vel_high = [
+                    v * p_high.cos() * yaw.cos(),
+                    v * p_high.cos() * yaw.sin(),
+                    v * p_high.sin(),
+                ];
+                if map.has_mortar_arc_clearance(mortar_origin, vel_high, g, t_high) {
+                    return Some(([yaw, p_high], high_pt));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+pub(crate) fn eval_indirect_mortar(
+    map: &Map,
+    _config: &Config,
+    obs: &Observation,
+    world: &WorldState,
+    mech_height: f64,
+    min_pitch: f64,
+    max_pitch: f64,
+) -> ([bool; 2], Option<[f64; 2]>, Option<[f64; 3]>) {
+    let me = &obs.self_obs;
+    let mut fire = [false, false];
+
+    // Never interrupt the final 0.22 s of an active Laser charge; preserve active charge below that
+    let mut charging_laser_slot = None;
+    for (idx, wopt) in me.weapons.iter().enumerate().take(2) {
+        if let Some(w) = wopt {
+            if w.kind == WeaponKind::Laser {
+                let full_charge = stat(&w.stats, "charge", 0.75);
+                let charge = w.charge.unwrap_or(0.0);
+                if charge >= full_charge - 0.22 {
+                    return (fire, None, None);
+                }
+                if charge > 0.0 {
+                    charging_laser_slot = Some(idx);
+                }
+            }
+        }
+    }
+
+    let Some(ms) = me
+        .weapons
+        .iter()
+        .take(2)
+        .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Mortar))
+    else {
+        return (fire, None, None);
+    };
+    let mw = me.weapons[ms].as_ref().unwrap();
+    if mw.cooldown > 0.08 {
+        return (fire, None, None);
+    }
+
+    let mut cands: Vec<(f64, u64, [f64; 3], [f64; 3])> = world
+        .tracked_enemies
+        .iter()
+        .filter_map(|(&id, e)| {
+            let d = dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]);
+            (d <= 220.0).then_some((d, id, e.pos, e.vel))
+        })
+        .collect();
+    cands.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    for (_, _, epos, evel) in cands {
+        if let Some((m_aim, m_pt)) = solve_mortar_aim(
+            map,
+            me.pos,
+            mech_height,
+            mw,
+            epos,
+            evel,
+            false,
+            min_pitch,
+            max_pitch,
+        ) {
+            let aligned = angle_diff(me.aim[0], m_aim[0]).abs() <= 0.14
+                && (me.aim[1] - m_aim[1]).abs() <= 0.14;
+            fire[ms] = aligned;
+            if let Some(ls) = charging_laser_slot {
+                fire[ls] = true;
+            }
+            return (fire, Some(m_aim), Some(m_pt));
+        }
+    }
+
+    (fire, None, None)
 }
 
 pub(crate) fn weapon_loadout_tag(weapons: &[Option<WeaponObs>]) -> String {
