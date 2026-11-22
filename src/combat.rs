@@ -112,12 +112,12 @@ pub(crate) fn select_targets(
             });
         } else {
             let d = dist3d(muzzle, actor.pos);
-            let npc_max_d = if want_farm_cubes { 125.0 } else { 42.0 };
+            let npc_max_d = if want_farm_cubes { 125.0 } else { 48.0 };
+            let aggro_npc = d <= 48.0 && obs.t - world.last_damage_t <= 2.2;
             if actor.kind == "npc"
                 && d <= npc_max_d
-                && me.hp > 0.45 * me.max_hp
-                && obs.t - world.last_damage_t > 2.5
-                && !protecting_regen
+                && obs.t - world.last_mech_damage_t > 2.5
+                && (aggro_npc || (me.hp > 0.45 * me.max_hp && !protecting_regen))
             {
                 let com_z = actor.pos[2] + 0.5 * npc_h;
                 if map.has_los(muzzle, [actor.pos[0], actor.pos[1], com_z]) {
@@ -155,7 +155,7 @@ pub(crate) fn select_targets(
     if best_farm.is_none()
         && (want_farm_cubes || slot1_empty)
         && me.hp > 0.45 * me.max_hp
-        && obs.t - world.last_damage_t > 2.5
+        && obs.t - world.last_mech_damage_t > 2.5
         && !protecting_regen
     {
         for c in &obs.crates {
@@ -289,6 +289,7 @@ pub(crate) fn eval_combat(
     max_pitch: f64,
     mech_cands: &[TargetCandidate],
     tgt: &TargetCandidate,
+    allow_new_laser_charge: bool,
 ) -> ([bool; 2], bool, Option<[f64; 2]>, Option<[f64; 3]>) {
     let me = &obs.self_obs;
     let mut fire = [false, false];
@@ -371,8 +372,9 @@ pub(crate) fn eval_combat(
             if let Some(gs) = gun_slot {
                 let (g_aim, g_fire, g_rel, g_ready) = eval_gun_slot(gs);
                 reload = g_rel;
-                let handoff_ok =
-                    charge < full_charge - 0.12 || angle_diff(g_aim[0], l_aim[0]).abs() <= 0.14;
+                let handoff_ok = charge < full_charge - 0.12
+                    || (angle_diff(g_aim[0], l_aim[0]).abs() <= 0.14
+                        && (g_aim[1] - l_aim[1]).abs() <= 0.14);
                 if g_ready && handoff_ok {
                     chosen_aim = Some(g_aim);
                     fire[gs] = g_fire;
@@ -435,7 +437,8 @@ pub(crate) fn eval_combat(
                 let l_range = stat(&lw.stats, "range", 280.0);
                 let allow_laser_farm = matches!(tgt.kind, TargetKind::Npc | TargetKind::Crate)
                     && me.hp > 0.55 * me.max_hp;
-                if tgt.dist <= l_range - 2.0
+                if allow_new_laser_charge
+                    && tgt.dist <= l_range - 2.0
                     && lw.cooldown <= 0.08
                     && (matches!(tgt.kind, TargetKind::Mech) || allow_laser_farm)
                 {
@@ -466,7 +469,8 @@ pub(crate) fn eval_combat(
         let l_range = stat(&w.stats, "range", 280.0);
         let allow_laser_farm =
             matches!(tgt.kind, TargetKind::Npc | TargetKind::Crate) && me.hp > 0.55 * me.max_hp;
-        if tgt.has_los
+        if allow_new_laser_charge
+            && tgt.has_los
             && tgt.dist <= l_range - 2.0
             && w.cooldown <= 0.08
             && (matches!(tgt.kind, TargetKind::Mech) || allow_laser_farm)
@@ -833,9 +837,9 @@ fn lightning_energy_ok(
 #[inline]
 pub(crate) fn weapon_desirability(kind: WeaponKind) -> u8 {
     match kind {
-        WeaponKind::Lightning => 4,
-        WeaponKind::Laser => 3,
-        WeaponKind::Gun => 2,
+        WeaponKind::Laser => 4,
+        WeaponKind::Gun => 3,
+        WeaponKind::Lightning => 2,
         WeaponKind::Mortar => 0,
     }
 }

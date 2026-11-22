@@ -64,6 +64,7 @@ pub(crate) struct WorldState {
     pub blacklisted_pickups: HashMap<u64, f64>,
     pub last_damage_bearing: Option<f64>,
     pub last_damage_t: f64,
+    pub last_mech_damage_t: f64,
     pub last_damage_by: Option<u64>,
     pub last_target_id: Option<u64>,
     pub last_sound_bearing: Option<f64>,
@@ -104,6 +105,7 @@ impl WorldState {
             blacklisted_pickups: HashMap::new(),
             last_damage_bearing: None,
             last_damage_t: -100.0,
+            last_mech_damage_t: -100.0,
             last_damage_by: None,
             last_target_id: None,
             last_sound_bearing: None,
@@ -167,7 +169,12 @@ impl WorldState {
                     if let Some(b) = bearing {
                         self.last_damage_bearing = Some(*b);
                         self.last_damage_t = t;
-                        self.last_damage_by = *by;
+                    }
+                    if weapon != "npc" && weapon != "zone" {
+                        self.last_mech_damage_t = t;
+                        if by.is_some() {
+                            self.last_damage_by = *by;
+                        }
                     }
                     if weapon == "gun" || weapon == "npc" {
                         if self.orbit_active_1v1 {
