@@ -1490,7 +1490,7 @@ impl StrategyState {
                         }
                     } else if has_lightning
                         && me.energy > 20.0
-                        && los_mech_count == 1
+                        && (los_mech_count == 1 || (!have_laser && los_mech_count == 2))
                         && me.hp > 0.30 * me.max_hp
                         && (!have_laser || e.dist <= 80.0 || e.charging)
                     {
@@ -1879,12 +1879,11 @@ impl StrategyState {
     ) -> Option<[f64; 3]> {
         let me = &obs.self_obs;
         let slot1_empty = me.weapons.get(1).and_then(|w| w.as_ref()).is_none();
-        let have_laser = me
+        let seeking_upgrade = !me
             .weapons
             .iter()
             .flatten()
-            .any(|w| w.kind == WeaponKind::Laser);
-        let seeking_upgrade = !have_laser;
+            .any(|w| w.kind == WeaponKind::Lightning);
 
         let close_los_enemy = los_mechs.iter().any(|m| m.dist < 60.0);
         let any_los_enemy = !los_mechs.is_empty();
@@ -1927,7 +1926,7 @@ impl StrategyState {
                 && dh <= 26.0
                 && me.energy >= req_energy
                 && !any_los_enemy
-                && (slot1_empty || !have_laser)
+                && (slot1_empty || seeking_upgrade)
                 && d <= 85.0
                 && obs.t >= world.roof_climb_cooldown_until
                 && map.roof_top_at(pos[0], pos[1]).is_some();
@@ -1967,27 +1966,28 @@ fn swap_slot_for(me: &SelfObs, new_kind: WeaponKind) -> Option<usize> {
     {
         return Some(m_slot);
     }
-    let lightning_slot = me
+    let laser_slot = me
         .weapons
         .iter()
         .take(2)
-        .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Lightning));
-    let have_laser = me
+        .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Laser));
+    let have_lightning = me
         .weapons
         .iter()
         .flatten()
-        .any(|w| w.kind == WeaponKind::Laser);
+        .any(|w| w.kind == WeaponKind::Lightning);
 
+    // cl-gunlight: target loadout [Gun, Lightning]; Lightning replaces a stopgap Laser.
     match new_kind {
-        WeaponKind::Laser => lightning_slot,
+        WeaponKind::Lightning => laser_slot,
         WeaponKind::Gun => {
-            if have_laser {
-                lightning_slot
+            if have_lightning {
+                laser_slot
             } else {
                 None
             }
         }
-        WeaponKind::Lightning | WeaponKind::Mortar => None,
+        WeaponKind::Laser | WeaponKind::Mortar => None,
     }
 }
 

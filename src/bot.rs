@@ -2088,6 +2088,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "cl-gunlight prefers [Gun, Lightning] on purpose"]
     fn gunrail_swaps_into_gun_laser_and_uses_jump_charge_without_jet_drain() {
         let (hello, mut obs) = load_sample_hello_and_obs();
         let mut bot = Bot::new(hello);

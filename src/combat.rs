@@ -837,9 +837,11 @@ fn lightning_energy_ok(
 #[inline]
 pub(crate) fn weapon_desirability(kind: WeaponKind) -> u8 {
     match kind {
-        WeaponKind::Laser => 4,
+        // cl-gunlight: [Gun, Lightning]. Lightning auto-hits in a 30 deg cone, chains to 2 more
+        // mechs within 14 m and shorts lasers; no self-slow. Laser only as a stopgap.
+        WeaponKind::Lightning => 4,
         WeaponKind::Gun => 3,
-        WeaponKind::Lightning => 2,
+        WeaponKind::Laser => 2,
         WeaponKind::Mortar => 0,
     }
 }
