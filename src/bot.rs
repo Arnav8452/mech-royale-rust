@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m14-gunrail".to_string(),
+            name: "rust-bot-m20-dropsiege".to_string(),
             config: hello.config,
             map,
             nav,
@@ -95,7 +95,18 @@ impl Bot {
             }
         }
 
-        let immediate_kill_avail = me.hp > 180.0 && los_mechs.iter().any(|m| m.hp <= 560.0);
+        let have_laser = me
+            .weapons
+            .iter()
+            .flatten()
+            .any(|w| w.kind == crate::protocol::WeaponKind::Laser);
+        let immediate_kill_avail = me.hp > 180.0
+            && los_mechs.iter().any(|m| {
+                m.hp <= 560.0
+                    || (have_laser
+                        && m.weapons.contains(&crate::protocol::WeaponKind::Mortar)
+                        && m.hp <= 760.0)
+            });
 
         self.strategy.update_posture(
             &self.map,
@@ -114,6 +125,7 @@ impl Bot {
             me,
             self.world.last_damage_by,
             self.world.last_target_id,
+            &obs.drops,
         );
         self.world.last_target_id = primary_mech.as_ref().map(|m| m.id);
         let any_visible_mech = primary_mech.clone().or_else(|| {
@@ -1635,7 +1647,7 @@ mod tests {
             is_vulnerable: false,
             last_reversal_t: -100.0,
         };
-        let picked = pick_best_mech_target(&[full_flanker, wounded_sticky], me, None, Some(5))
+        let picked = pick_best_mech_target(&[full_flanker, wounded_sticky], me, None, Some(5), &[])
             .expect("must pick a target");
         assert_eq!(
             picked.id, 5,
@@ -2851,6 +2863,87 @@ mod tests {
             act.boost,
             Some(true),
             "[Gun, Laser] with 80 energy must boost-strafe continuously in combat"
+        );
+    }
+
+    #[test]
+    fn dropsiege_kites_lightning_camper_outside_45m_then_dives_to_freeze_late_capture() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(-120.0, 20.0);
+        let dz = bot.map.ground_height(-155.0, 20.0);
+
+        // 1. Healthy Lightning camper (1200 HP, progress = 0.4) sits inside drop at (-155, 20), 35 m West of us at (-120, 20):
+        // Rather than suicide-diving into 4 m Lightning short-circuit range, must siege/kite back +x toward 60 m while firing [Gun, Laser]!
+        obs.t = 96.0;
+        obs.self_obs.pos = [-120.0, 20.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 85.0;
+        obs.self_obs.aim = [PI, 0.0];
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [-120.0, 20.0];
+        obs.zone.next_center = [-120.0, 20.0];
+        obs.zone.radius = 250.0;
+        obs.zone.next_radius = 220.0;
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Gun,
+                cooldown: 0.0,
+                ammo: Some(12.0),
+                reload: Some(0.0),
+                charge: None,
+                stats: bot.config.weapons.gun.clone(),
+            }),
+            Some(WeaponObs {
+                kind: WeaponKind::Laser,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: Some(0.0),
+                stats: bot.config.weapons.laser.clone(),
+            }),
+        ];
+        obs.drops = vec![DropObs {
+            id: 20010,
+            pos: [-155.0, 20.0, dz],
+            radius: 8.0,
+            lands_in: 0.0,
+            capture_s: 4.0,
+            progress: 0.4,
+            holder: Some(980),
+        }];
+        obs.mechs = vec![ActorObs {
+            id: 980,
+            kind: "mech".into(),
+            pos: [-155.0, 20.0, dz],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1200.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun, WeaponKind::Lightning],
+            charging: false,
+        }];
+
+        let act_siege = bot.act(&obs);
+        assert_eq!(bot.strategy.posture, Posture::SupplyDrop);
+        assert!(
+            act_siege.move_dir.unwrap()[0] > 0.2,
+            "at 35 m from a healthy Lightning drop camper (progress 0.4s), must siege back +x toward 60 m instead of diving into 45 m Lightning range, got {:?}",
+            act_siege.move_dir
+        );
+        assert_eq!(act_siege.fire.unwrap(), [true, true]);
+
+        // 2. When camper reaches progress >= 1.3 s (must_freeze_now = true): dives -x into far edge of ring to freeze capture clock!
+        obs.t = 97.5;
+        obs.drops[0].progress = 1.8;
+        let act_freeze = bot.act(&obs);
+        assert!(
+            act_freeze.move_dir.unwrap()[0] < -0.5,
+            "when single holder reaches progress >= 1.3s, must dive -x into ring edge to freeze capture clock, got {:?}",
+            act_freeze.move_dir
         );
     }
 }

@@ -330,7 +330,7 @@ impl StrategyState {
                 .values()
                 .filter(|e| dist2d(e.pos[0], e.pos[1], drop.pos[0], drop.pos[1]) <= 25.0)
                 .count();
-            if drop.lands_in <= 22.0 && d <= 280.0 && campers <= 2 {
+            if drop.holder == Some(me.id) || (drop.lands_in <= 22.0 && d <= 280.0 && campers <= 2) {
                 self.posture = Posture::SupplyDrop;
                 return;
             }
@@ -468,6 +468,20 @@ impl StrategyState {
                 self.peek_target = None;
                 world.orbit_active_1v1 = false;
                 return (unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]), nc, None);
+            }
+            Posture::SupplyDrop if on_roof => {
+                if let Some(drop) = self.find_best_supply_drop(world, obs, los_mechs) {
+                    world.roof_climb_goal = None;
+                    self.tactic = CombatTactic::None;
+                    self.peek_target = None;
+                    world.orbit_active_1v1 = false;
+                    let dxy = [drop.pos[0], drop.pos[1]];
+                    return (
+                        unit2d(dxy[0] - me.pos[0], dxy[1] - me.pos[1]),
+                        dxy,
+                        None,
+                    );
+                }
             }
             Posture::EmergencyRegen => {
                 if let Some((rxy, rz)) = world.roof_climb_goal {
@@ -1083,7 +1097,112 @@ impl StrategyState {
             Posture::SupplyDrop => {
                 if let Some(drop) = self.find_best_supply_drop(world, obs, los_mechs) {
                     let d = dist2d(me.pos[0], me.pos[1], drop.pos[0], drop.pos[1]);
-                    if drop.lands_in > 5.0 && d < 28.0 {
+                    let mut ring_campers: Vec<([f64; 3], f64, bool)> = Vec::new();
+                    for m in mech_cands {
+                        if dist2d(m.pos[0], m.pos[1], drop.pos[0], drop.pos[1])
+                            <= drop.radius + 10.0
+                        {
+                            ring_campers.push((
+                                m.pos,
+                                m.hp,
+                                m.weapons.contains(&WeaponKind::Lightning),
+                            ));
+                        }
+                    }
+                    for (&id, te) in &world.tracked_enemies {
+                        if obs.t - te.last_seen_t <= 1.8
+                            && dist2d(te.pos[0], te.pos[1], drop.pos[0], drop.pos[1])
+                                <= drop.radius + 10.0
+                            && !mech_cands.iter().any(|m| m.id == id)
+                        {
+                            ring_campers.push((
+                                te.pos,
+                                te.hp,
+                                te.weapons.contains(&WeaponKind::Lightning),
+                            ));
+                        }
+                    }
+
+                    let must_freeze_now = drop.lands_in <= 0.5
+                        && drop.holder.is_some_and(|h| h != me.id)
+                        && drop.progress >= 1.3
+                        && ring_campers.len() <= 1;
+                    if must_freeze_now {
+                        if let Some(&(cpos, _, _)) = ring_campers.first() {
+                            let away = unit2d(drop.pos[0] - cpos[0], drop.pos[1] - cpos[1]);
+                            let r_edge = (drop.radius - 1.5).max(1.5);
+                            let pt = [
+                                drop.pos[0] + away[0] * r_edge,
+                                drop.pos[1] + away[1] * r_edge,
+                            ];
+                            return (unit2d(pt[0] - me.pos[0], pt[1] - me.pos[1]), pt);
+                        }
+                    }
+
+                    let siege_ring = !must_freeze_now
+                        && drop.holder != Some(me.id)
+                        && !ring_campers.is_empty()
+                        && (ring_campers.len() >= 2
+                            || drop.lands_in > 1.5
+                            || ring_campers.iter().any(|&(_, hp, _)| hp > 420.0));
+                    if siege_ring && d <= 78.0 {
+                        let our_laser_frac = me
+                            .weapons
+                            .iter()
+                            .flatten()
+                            .find(|w| w.kind == WeaponKind::Laser)
+                            .map(|w| {
+                                let full = stat(&w.stats, "charge", 0.75).max(0.01);
+                                w.charge.unwrap_or(0.0) / full
+                            })
+                            .unwrap_or(0.0);
+                        let enemy_charging =
+                            our_laser_frac < 0.65 && los_mechs.iter().any(|m| m.charging);
+                        if enemy_charging {
+                            let threats: Vec<[f64; 3]> = mech_cands
+                                .iter()
+                                .filter(|m| m.has_los)
+                                .map(|m| [m.pos[0], m.pos[1], m.pos[2] + 7.5])
+                                .collect();
+                            if let Some(cp) = nav.find_cover_point_within(
+                                map,
+                                me.pos,
+                                eye_h,
+                                &threats,
+                                obs.zone.center,
+                                obs.zone.radius,
+                                obs.zone.next_center,
+                                obs.zone.next_radius,
+                                28.0,
+                                None,
+                            ) {
+                                self.tactic = CombatTactic::CoverDuck;
+                                let wp = self.follow_astar(nav, scratch, me_xy, cp, obs.t);
+                                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), cp);
+                            }
+                        }
+
+                        self.tactic = CombatTactic::OpenStrafe;
+                        let any_lt = ring_campers.iter().any(|&(_, _, lt)| lt);
+                        let siege_r = if any_lt { 60.0 } else { 52.0 };
+                        let to_drop = unit2d(drop.pos[0] - me.pos[0], drop.pos[1] - me.pos[1]);
+                        let tang = [
+                            -to_drop[1] * world.strafe_sign,
+                            to_drop[0] * world.strafe_sign,
+                        ];
+                        let rw = if d < siege_r - 6.0 {
+                            -0.70
+                        } else if d > siege_r + 8.0 {
+                            0.65
+                        } else {
+                            0.0
+                        };
+                        let dir = unit2d(to_drop[0] * rw + tang[0], to_drop[1] * rw + tang[1]);
+                        let g = [me.pos[0] + dir[0] * 18.0, me.pos[1] + dir[1] * 18.0];
+                        return (dir, g);
+                    }
+
+                    if drop.lands_in > 4.5 && d < 28.0 {
                         let threats: Vec<[f64; 3]> = mech_cands
                             .iter()
                             .filter(|m| m.has_los)
@@ -1387,7 +1506,7 @@ impl StrategyState {
                         .count();
                     let is_1v1 = los_mech_count == 1 && known_nearby_180 <= 1;
 
-                    let (perp, radial_band, tang_w) = if is_1v1 {
+                    let (perp, radial_band, tang_w) = if los_mech_count == 1 {
                         world.orbit_active_1v1 = true;
                         let orbit_blocked_for = |sign: f64| -> bool {
                             let p = [-to_e[1] * sign, to_e[0] * sign];
@@ -1846,6 +1965,14 @@ impl StrategyState {
             {
                 continue;
             }
+            let dist = dist2d(me.pos[0], me.pos[1], d.pos[0], d.pos[1]);
+            if d.holder == Some(me.id) {
+                let score = -1000.0 + dist;
+                if best.is_none_or(|(bd, _)| score < bd) {
+                    best = Some((score, d));
+                }
+                continue;
+            }
             let campers = world
                 .tracked_enemies
                 .values()
@@ -1854,7 +1981,6 @@ impl StrategyState {
             if campers >= 4 {
                 continue;
             }
-            let dist = dist2d(me.pos[0], me.pos[1], d.pos[0], d.pos[1]);
             let eta = dist / 15.0;
             let arrival_ok = d.lands_in <= (eta + 22.0).max(26.0);
             let duel_ok = !in_close_duel || dist <= 120.0;
