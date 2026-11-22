@@ -337,18 +337,25 @@ impl StrategyState {
         }
 
         let regen_delay = stat(&me.stats, "regen_delay", 5.0);
+        let has_nanites = regen_delay <= 3.8;
         let winning_or_even_1v1 = los_count == 1 && los_mechs[0].hp <= me.hp + 180.0;
         let enemy_in_face = los_mechs.iter().any(|m| m.dist < 32.0);
         let want_regen = if self.posture == Posture::EmergencyRegen {
+            let hold_cap = if has_nanites { 0.88 } else { 0.80 };
             !immediate_kill_avail
                 && !enemy_in_face
-                && me.hp < 0.80 * me.max_hp
-                && !(me.hp >= 0.72 * me.max_hp && near_mechs == 0 && regen_delay > 3.8)
+                && me.hp < hold_cap * me.max_hp
+                && !(me.hp >= 0.72 * me.max_hp && near_mechs == 0 && !has_nanites)
         } else {
+            let lose_1v1_thr = if has_nanites { 0.56 } else { 0.42 };
             !immediate_kill_avail
                 && !enemy_in_face
                 && ((me.hp < 0.62 * me.max_hp && los_count >= 2)
-                    || (me.hp < 0.42 * me.max_hp && near_mechs > 0 && !winning_or_even_1v1))
+                    || (me.hp < lose_1v1_thr * me.max_hp && near_mechs > 0 && !winning_or_even_1v1)
+                    || (has_nanites
+                        && los_count == 0
+                        && me.hp < 0.72 * me.max_hp
+                        && (obs.t - world.last_combat_t) >= (regen_delay - 1.2).max(0.8)))
         };
         let my_ground = map.ground_height(me.pos[0], me.pos[1]);
         let on_roof =
@@ -581,8 +588,11 @@ impl StrategyState {
                         self.peek_target = None;
                         world.orbit_active_1v1 = false;
                         let pk_xy = [pk_pos[0], pk_pos[1]];
+                        if on_roof && (pk_pos[2] - me.pos[2]).abs() <= 3.5 {
+                            return (unit2d(pk_xy[0] - me.pos[0], pk_xy[1] - me.pos[1]), pk_xy, None);
+                        }
                         let d_pk = dist2d(me.pos[0], me.pos[1], pk_xy[0], pk_xy[1]);
-                        if d_pk <= 18.0 {
+                        if d_pk <= 24.0 {
                             if world.roof_climb_goal.is_none() {
                                 world.roof_climb_goal = Some((pk_xy, pk_pos[2]));
                                 world.roof_climb_start_t = obs.t;
@@ -776,11 +786,32 @@ impl StrategyState {
                         }
                     }
 
-                    // 2. Defensive 3D Roof-Interior LOS Break (only when outnumbered, low HP, or dodging sniper laser)
+                    // 2. Defensive 3D Roof-Interior LOS Break & Same-Roof Cube Vacuum
                     let enemy_charging_far = los_mechs
                         .iter()
                         .any(|m| m.charging && m.dist > my_lt_range)
                         && our_laser_charge_frac < 0.65;
+                    if los_mech_count <= 1 && !enemy_charging_far && me.cubes < 15 {
+                        if let Some(cube) = obs
+                            .cubes
+                            .iter()
+                            .filter(|c| {
+                                (c.pos[2] - me.pos[2]).abs() <= 3.5
+                                    && map.roof_top_at(c.pos[0], c.pos[1]).is_some()
+                                    && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 28.0
+                                    && dist2d(c.pos[0], c.pos[1], nc[0], nc[1])
+                                        <= obs.zone.next_radius - 5.0
+                            })
+                            .min_by(|a, b| {
+                                dist2d(me.pos[0], me.pos[1], a.pos[0], a.pos[1])
+                                    .total_cmp(&dist2d(me.pos[0], me.pos[1], b.pos[0], b.pos[1]))
+                            })
+                        {
+                            self.tactic = CombatTactic::OpenStrafe;
+                            let goal = [cube.pos[0], cube.pos[1]];
+                            return (unit2d(goal[0] - me.pos[0], goal[1] - me.pos[1]), goal, None);
+                        }
+                    }
                     if (los_mech_count >= 2 || me.hp < 0.55 * me.max_hp || enemy_charging_far)
                         && !immediate_kill_avail
                     {
@@ -900,10 +931,21 @@ impl StrategyState {
 
                     // 4. Smooth Roof-Edge Strafe in 1v1
                     if let Some(e) = combat_enemy {
+                        let have_laser_roof = me
+                            .weapons
+                            .iter()
+                            .flatten()
+                            .any(|w| w.kind == WeaponKind::Laser);
                         let to_e = unit2d(e.pos[0] - me.pos[0], e.pos[1] - me.pos[1]);
                         let tang = [-to_e[1] * world.strafe_sign, to_e[0] * world.strafe_sign];
                         let d2 = dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]);
-                        let pref_d = if have_lightning { 38.0 } else { 52.0 };
+                        let pref_d = if have_laser_roof {
+                            82.0
+                        } else if have_lightning {
+                            38.0
+                        } else {
+                            64.0
+                        };
                         let rw = if d2 < pref_d - 6.0 {
                             -0.6
                         } else if d2 > pref_d + 8.0 {
@@ -935,6 +977,26 @@ impl StrategyState {
                             return (dir, g, None);
                         }
                     }
+                }
+            }
+            Posture::EarlyFarm if on_roof && me.cubes < 15 => {
+                if let Some(cube) = obs
+                    .cubes
+                    .iter()
+                    .filter(|c| {
+                        (c.pos[2] - me.pos[2]).abs() <= 3.5
+                            && map.roof_top_at(c.pos[0], c.pos[1]).is_some()
+                            && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 35.0
+                            && dist2d(c.pos[0], c.pos[1], nc[0], nc[1])
+                                <= obs.zone.next_radius - 5.0
+                    })
+                    .min_by(|a, b| {
+                        dist2d(me.pos[0], me.pos[1], a.pos[0], a.pos[1])
+                            .total_cmp(&dist2d(me.pos[0], me.pos[1], b.pos[0], b.pos[1]))
+                    })
+                {
+                    let goal = [cube.pos[0], cube.pos[1]];
+                    return (unit2d(goal[0] - me.pos[0], goal[1] - me.pos[1]), goal, None);
                 }
             }
             _ => {}
@@ -1162,7 +1224,7 @@ impl StrategyState {
                         .cubes
                         .iter()
                         .filter(|c| {
-                            is_ground_level(map, c.pos)
+                            is_reachable_cube(map, me.pos, c.pos)
                                 && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= cube_pull_r
                                 && dist2d(c.pos[0], c.pos[1], nc[0], nc[1])
                                     <= obs.zone.next_radius - 5.0
@@ -1401,18 +1463,28 @@ impl StrategyState {
                     } else {
                         (my_lt_range - 12.0).max(32.0)
                     };
+                    let punish_close = me.energy >= 24.0
+                        && me.hp > 0.35 * me.max_hp
+                        && los_mech_count == 1
+                        && (e.dist <= my_lt_range + 6.0 || e.hp <= 520.0);
                     let base_pref_dist: f64 = if lt_rush_charger {
                         (my_lt_range - 12.0).max(26.0)
                     } else if have_laser && has_lightning {
-                        if me.energy < 24.0 {
-                            68.0
-                        } else if me.hp > 0.30 * me.max_hp
-                            && los_mech_count == 1
-                            && (enemy_has_laser || e.dist <= 85.0)
-                        {
+                        if punish_close {
                             lt_brawl_d
+                        } else if me.hp < 0.65 * me.max_hp
+                            || enemy_has_lightning
+                            || los_mech_count >= 2
+                        {
+                            96.0
                         } else {
-                            64.0
+                            88.0
+                        }
+                    } else if have_laser && !has_lightning {
+                        if me.hp < 0.65 * me.max_hp || enemy_has_lightning {
+                            96.0
+                        } else {
+                            86.0
                         }
                     } else if has_lightning
                         && me.energy > 20.0
@@ -1449,7 +1521,11 @@ impl StrategyState {
 
                     let in_band_neg = if is_1v1 { 6.0 } else { 10.0 };
                     let radial_w = if d2 < pref_dist - in_band_neg {
-                        -0.65
+                        if have_laser && !punish_close {
+                            -0.72
+                        } else {
+                            -0.65
+                        }
                     } else if d2 > pref_dist + if self.tactic == CombatTactic::AggressivePush {
                         8.0
                     } else {
@@ -1506,7 +1582,7 @@ impl StrategyState {
                 .cubes
                 .iter()
                 .filter(|c| {
-                    is_ground_level(map, c.pos)
+                    is_reachable_cube(map, me.pos, c.pos)
                         && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 85.0
                         && dist2d(c.pos[0], c.pos[1], nc[0], nc[1]) <= obs.zone.next_radius - 5.0
                 })
@@ -1820,6 +1896,8 @@ impl StrategyState {
 
         let close_los_enemy = los_mechs.iter().any(|m| m.dist < 60.0);
         let any_los_enemy = !los_mechs.is_empty();
+        let on_roof = me.pos[2] > map.ground_height(me.pos[0], me.pos[1]) + 3.5
+            && map.roof_top_at(me.pos[0], me.pos[1]).is_some();
         let max_seek_d = if slot1_empty {
             210.0
         } else if seeking_upgrade {
@@ -1848,15 +1926,20 @@ impl StrategyState {
             let gz = map.ground_height(pos[0], pos[1]);
             let dh = pos[2] - gz;
             let ground_ok = is_ground_level(map, pos);
+            let same_roof_ok = on_roof
+                && (pos[2] - me.pos[2]).abs() <= 3.5
+                && map.roof_top_at(pos[0], pos[1]).is_some()
+                && d <= 45.0;
+            let req_energy = if dh > 20.0 { 54.0 } else { 48.0 };
             let roof_ok = dh > 2.5
-                && dh <= 20.0
-                && me.energy >= 48.0
+                && dh <= 26.0
+                && me.energy >= req_energy
                 && !any_los_enemy
                 && (slot1_empty || !have_lightning || !have_laser)
                 && d <= 85.0
                 && obs.t >= world.roof_climb_cooldown_until
                 && map.roof_top_at(pos[0], pos[1]).is_some();
-            if !ground_ok && !roof_ok {
+            if !ground_ok && !same_roof_ok && !roof_ok {
                 continue;
             }
 
@@ -1869,7 +1952,7 @@ impl StrategyState {
                 continue;
             }
 
-            let score = prio as f64 * 45.0 - d - if roof_ok { 15.0 } else { 0.0 };
+            let score = prio as f64 * 45.0 - d - if roof_ok && !same_roof_ok { 15.0 } else { 0.0 };
             if best.is_none_or(|(bs, bid, _)| score > bs || (score == bs && id < bid)) {
                 best = Some((score, id, pos));
             }
@@ -1953,4 +2036,10 @@ fn zigzag_cover_dir(
     } else {
         base
     }
+}
+
+#[inline]
+fn is_reachable_cube(map: &Map, me_pos: [f64; 3], pos: [f64; 3]) -> bool {
+    is_ground_level(map, pos)
+        || ((pos[2] - me_pos[2]).abs() <= 3.5 && map.roof_top_at(pos[0], pos[1]).is_some())
 }

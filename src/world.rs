@@ -298,12 +298,62 @@ impl WorldState {
             }
         }
 
-        // Track observed enemy laser beams to pinpoint exact 1.65 s laser cooldown windows
+        // Track observed enemy laser/lightning beams: pinpoint 1.65 s laser cooldown + discover unseen shooters
         for b in &obs.beams {
-            if b.kind == "laser" {
-                if let Some(e) = self.tracked_enemies.get_mut(&b.by) {
-                    e.laser_cd_until = e.laser_cd_until.max((t - b.age) + laser_cd_s);
+            if b.by == me.id || b.by >= 100 {
+                continue;
+            }
+            let beam_weapon = match b.kind.as_str() {
+                "laser" => Some(WeaponKind::Laser),
+                "lightning" => Some(WeaponKind::Lightning),
+                _ => None,
+            };
+            let beam_t = t - b.age;
+            if let Some(e) = self.tracked_enemies.get_mut(&b.by) {
+                if b.kind == "laser" {
+                    e.laser_cd_until = e.laser_cd_until.max(beam_t + laser_cd_s);
                 }
+                if let Some(wk) = beam_weapon {
+                    if !e.weapons.contains(&wk) {
+                        e.weapons.push(wk);
+                    }
+                }
+                if t - e.last_seen_t > 0.25 {
+                    if let Some(&mpos) = b.path.first() {
+                        let feet_z = map
+                            .surface_height(mpos[0], mpos[1], mpos[2])
+                            .min(mpos[2] - 4.0);
+                        e.pos = [mpos[0], mpos[1], feet_z];
+                        e.last_seen_t = beam_t.max(e.last_seen_t);
+                    }
+                }
+            } else if let Some(&mpos) = b.path.first() {
+                let feet_z = map
+                    .surface_height(mpos[0], mpos[1], mpos[2])
+                    .min(mpos[2] - 4.0);
+                self.tracked_enemies.insert(
+                    b.by,
+                    TrackedEnemy {
+                        pos: [mpos[0], mpos[1], feet_z],
+                        vel: [0.0, 0.0, 0.0],
+                        est_accel_z: 0.0,
+                        aim: [0.0, 0.0],
+                        hp: 1400.0,
+                        max_hp: 1400.0,
+                        weapons: beam_weapon.into_iter().collect(),
+                        charging: false,
+                        last_seen_t: beam_t,
+                        gun_reload_until: -100.0,
+                        laser_cd_until: if b.kind == "laser" {
+                            beam_t + laser_cd_s
+                        } else {
+                            -100.0
+                        },
+                        est_gun_shots: 0,
+                        last_gun_shot_t: -100.0,
+                        last_reversal_t: -100.0,
+                    },
+                );
             }
         }
 
@@ -377,7 +427,7 @@ impl WorldState {
             let gz = map.ground_height(p.pos[0], p.pos[1]);
             let dh = p.pos[2] - gz;
             if is_ground_level(map, p.pos)
-                || ((2.5..=20.0).contains(&dh) && map.roof_top_at(p.pos[0], p.pos[1]).is_some())
+                || ((2.5..=40.0).contains(&dh) && map.roof_top_at(p.pos[0], p.pos[1]).is_some())
             {
                 self.last_pickup_seen.insert(p.id, (p.kind, p.pos, t));
             }

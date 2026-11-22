@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m14-skyking".to_string(),
+            name: "rust-bot-m14-skykite".to_string(),
             config: hello.config,
             map,
             nav,
@@ -233,6 +233,19 @@ impl Bot {
                 [b, 0.0]
             } else {
                 [me.aim[0], 0.0]
+            }
+        } else if climbing_roof || self.strategy.tactic == CombatTactic::CoverDuck {
+            if let Some((_, closest_tracked)) = self.world.closest_tracked_enemy_within(me.pos, 160.0)
+            {
+                if t - closest_tracked.last_seen_t <= 2.0 {
+                    let yaw = (closest_tracked.pos[1] - me.pos[1])
+                        .atan2(closest_tracked.pos[0] - me.pos[0]);
+                    [yaw, 0.0]
+                } else {
+                    [wrap_angle(me.aim[0] + 0.95 * self.world.last_scan_dir), 0.0]
+                }
+            } else {
+                [wrap_angle(me.aim[0] + 0.95 * self.world.last_scan_dir), 0.0]
             }
         } else if self.strategy.posture == Posture::EmergencyRegen
             && (los_mech_count > 0 || t - self.world.last_damage_t <= 1.5)
@@ -2400,5 +2413,187 @@ mod tests {
             .expect("full-HP Laser+Lightning mech vs 80 m enemy must proactively seize prism 58 roof");
         assert!(rz2 - mz >= 8.0);
         assert!(a_seize.move_dir.unwrap()[1] < -0.5);
+    }
+
+    #[test]
+    fn skykite_kites_at_88m_with_laser_lightning_and_punishes_close_rushers() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        // Open Oval (>32 m from any building): me at (-120, 20), full-HP enemy at (-192, 20) (72 m West) -> kite +x (east)!
+        let mz = bot.map.ground_height(-120.0, 20.0);
+        let ez_far = bot.map.ground_height(-192.0, 20.0);
+        assert!(bot.map.has_los([-120.0, 20.0, mz + 8.0], [-192.0, 20.0, ez_far + 4.5]));
+        obs.t = 30.0;
+        obs.self_obs.pos = [-120.0, 20.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.aim = [PI, 0.0];
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [-120.0, 20.0];
+        obs.zone.next_center = [-120.0, 20.0];
+        obs.zone.radius = 250.0;
+        obs.zone.next_radius = 220.0;
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Laser,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: Some(0.0),
+                stats: bot.config.weapons.laser.clone(),
+            }),
+            Some(WeaponObs {
+                kind: WeaponKind::Lightning,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: None,
+                stats: bot.config.weapons.lightning.clone(),
+            }),
+        ];
+        obs.mechs = vec![ActorObs {
+            id: 103,
+            kind: "mech".into(),
+            pos: [-192.0, 20.0, ez_far],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1400.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+
+        let a_kite = bot.act(&obs);
+        assert!(
+            a_kite.move_dir.unwrap()[0] > 0.2,
+            "holding Laser+Lightning vs healthy enemy at 72 m must kite back toward 88 m instead of diving to 37 m, got {:?}",
+            a_kite.move_dir
+        );
+
+        // Enemy inside punish zone (46 m West <= 51 m) -> stay/punish in Lightning range instead of kiting to 88 m
+        let mut bot2 = Bot::new(load_sample_hello_and_obs().0);
+        let ez_close = bot2.map.ground_height(-166.0, 20.0);
+        obs.t = 31.0;
+        obs.mechs[0].pos = [-166.0, 20.0, ez_close];
+        let a_punish = bot2.act(&obs);
+        assert!(
+            a_punish.move_dir.unwrap()[0] < 0.2,
+            "enemy rushing to 46 m must be punished with Lightning+Laser instead of fleeing +x, got {:?}",
+            a_punish.move_dir
+        );
+    }
+
+    #[test]
+    fn skykite_tracks_unseen_shooter_from_obs_beams_and_vacuums_same_roof_cubes() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        // On prism 56 roof (-8, -24, 6.52); unseen mech 12 fires Laser outside our view; cube sits on same roof at (-20, -24)
+        let roof_z = bot
+            .map
+            .roof_top_at(-8.0, -24.0)
+            .expect("(-8, -24) must lie on prism 56 roof");
+        let _ = bot
+            .map
+            .roof_top_at(-20.0, -24.0)
+            .expect("(-20, -24) must lie on prism 56 roof");
+        obs.t = 25.0;
+        obs.self_obs.pos = [-8.0, -24.0, roof_z];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.cubes = 2;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [-10.0, -24.0];
+        obs.zone.next_center = [-10.0, -24.0];
+        obs.zone.radius = 250.0;
+        obs.zone.next_radius = 220.0;
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Laser,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: Some(0.0),
+                stats: bot.config.weapons.laser.clone(),
+            }),
+            Some(WeaponObs {
+                kind: WeaponKind::Lightning,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: None,
+                stats: bot.config.weapons.lightning.clone(),
+            }),
+        ];
+        obs.mechs.clear();
+        obs.beams = vec![BeamObs {
+            by: 12,
+            kind: "laser".into(),
+            path: vec![[-110.0, -24.0, 4.0], [-40.0, -24.0, 4.0]],
+            age: 0.1,
+        }];
+        obs.cubes = vec![crate::protocol::ItemObs {
+            id: 5099,
+            pos: [-20.0, -24.0, roof_z],
+            hp: None,
+        }];
+
+        let a_roof = bot.act(&obs);
+        let tracked = bot
+            .world
+            .tracked_enemies
+            .get(&12)
+            .expect("unseen Laser shooter from obs.beams must be added to tracked_enemies");
+        assert!(tracked.weapons.contains(&WeaponKind::Laser));
+        assert!(tracked.laser_cd_until > obs.t);
+        assert!(
+            a_roof.move_dir.unwrap()[0] < -0.7,
+            "bot on prism 56 roof must vacuum same-roof cube at (-20, -24), got {:?}",
+            a_roof.move_dir
+        );
+    }
+
+    #[test]
+    fn skykite_triggers_nanites_fast_reset_at_52pct_hp() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        // Near prism 58 at 52% HP with nanites (regen_delay = 3.5) vs full-HP enemy at 60 m
+        let mz = bot.map.ground_height(-55.0, -18.0);
+        let ez = bot.map.ground_height(-55.0, 42.0);
+        obs.t = 40.0;
+        obs.self_obs.pos = [-55.0, -18.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 720.0; // 51.4% < 56% nanites reset threshold
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.stats.insert("regen_delay".into(), 3.5);
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [-55.0, 0.0];
+        obs.zone.next_center = [-55.0, 0.0];
+        obs.zone.radius = 250.0;
+        obs.zone.next_radius = 220.0;
+        obs.mechs = vec![ActorObs {
+            id: 104,
+            kind: "mech".into(),
+            pos: [-55.0, 42.0, ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1400.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+
+        bot.act(&obs);
+        assert_eq!(
+            bot.strategy.posture,
+            Posture::EmergencyRegen,
+            "nanites bot at 51% HP vs healthy enemy must fast-reset instead of dying down"
+        );
     }
 }
