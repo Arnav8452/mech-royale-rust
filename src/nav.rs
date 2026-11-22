@@ -404,7 +404,7 @@ impl NavGrid {
         true
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub fn find_cover_point(
         &self,
         map: &Map,

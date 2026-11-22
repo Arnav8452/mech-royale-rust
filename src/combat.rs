@@ -1,6 +1,6 @@
 use crate::geom::{angle_diff, direct_aim, dist3d};
 use crate::map::Map;
-use crate::protocol::{stat, Config, Observation, SelfObs, WeaponKind, WeaponObs};
+use crate::protocol::{stat, Config, DropObs, Observation, SelfObs, WeaponKind, WeaponObs};
 use crate::world::WorldState;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -203,6 +203,7 @@ pub(crate) fn pick_best_mech_target(
     me: &SelfObs,
     last_damage_by: Option<u64>,
     last_target_id: Option<u64>,
+    drops: &[DropObs],
 ) -> Option<TargetCandidate> {
     let have_laser = me
         .weapons
@@ -243,7 +244,18 @@ pub(crate) fn pick_best_mech_target(
             score += 35.0;
         }
         if have_laser && c.weapons.contains(&WeaponKind::Mortar) {
-            score += 95.0; // Cook-off!
+            score += 145.0; // Cook-off!
+        }
+        for d in drops {
+            if d.lands_in <= 15.0 {
+                let dc = (c.pos[0] - d.pos[0]).hypot(c.pos[1] - d.pos[1]);
+                let dme = (me.pos[0] - d.pos[0]).hypot(me.pos[1] - d.pos[1]);
+                if d.holder == Some(c.id) || dc <= d.radius + 2.5 {
+                    score += 200.0;
+                } else if dc <= d.radius + 16.0 && dme <= 95.0 {
+                    score += 95.0;
+                }
+            }
         }
         if have_lightning {
             let lr = lt_range.unwrap_or(45.0);

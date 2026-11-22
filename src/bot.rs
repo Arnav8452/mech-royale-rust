@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m14-gunrail".to_string(),
+            name: "rust-bot-m19-drop-apex".to_string(),
             config: hello.config,
             map,
             nav,
@@ -95,7 +95,18 @@ impl Bot {
             }
         }
 
-        let immediate_kill_avail = me.hp > 180.0 && los_mechs.iter().any(|m| m.hp <= 560.0);
+        let have_laser = me
+            .weapons
+            .iter()
+            .flatten()
+            .any(|w| w.kind == crate::protocol::WeaponKind::Laser);
+        let immediate_kill_avail = me.hp > 180.0
+            && los_mechs.iter().any(|m| {
+                m.hp <= 560.0
+                    || (have_laser
+                        && m.weapons.contains(&crate::protocol::WeaponKind::Mortar)
+                        && m.hp <= 760.0)
+            });
 
         self.strategy.update_posture(
             &self.map,
@@ -114,6 +125,7 @@ impl Bot {
             me,
             self.world.last_damage_by,
             self.world.last_target_id,
+            &obs.drops,
         );
         self.world.last_target_id = primary_mech.as_ref().map(|m| m.id);
         let any_visible_mech = primary_mech.clone().or_else(|| {
@@ -1635,7 +1647,7 @@ mod tests {
             is_vulnerable: false,
             last_reversal_t: -100.0,
         };
-        let picked = pick_best_mech_target(&[full_flanker, wounded_sticky], me, None, Some(5))
+        let picked = pick_best_mech_target(&[full_flanker, wounded_sticky], me, None, Some(5), &[])
             .expect("must pick a target");
         assert_eq!(
             picked.id, 5,
@@ -2851,6 +2863,106 @@ mod tests {
             act.boost,
             Some(true),
             "[Gun, Laser] with 80 energy must boost-strafe continuously in combat"
+        );
+    }
+
+    #[test]
+    fn drop_apex_focuses_ring_contester_loots_safe_cubes_in_regen_and_claims_endgame_center() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(-120.0, 20.0);
+        let ez1 = bot.map.ground_height(-123.0, 22.0);
+        let ez2 = bot.map.ground_height(-190.0, 20.0);
+
+        // 1. Inside landed drop ring: stays in SupplyDrop even at 35% HP, keeps fast boost-orbit, focuses ring contester
+        obs.t = 96.0;
+        obs.self_obs.pos = [-117.0, 20.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 500.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 85.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [-120.0, 20.0];
+        obs.zone.next_center = [-120.0, 20.0];
+        obs.zone.radius = 250.0;
+        obs.zone.next_radius = 220.0;
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Gun,
+                cooldown: 0.0,
+                ammo: Some(12.0),
+                reload: Some(0.0),
+                charge: None,
+                stats: bot.config.weapons.gun.clone(),
+            }),
+            Some(WeaponObs {
+                kind: WeaponKind::Laser,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: Some(0.0),
+                stats: bot.config.weapons.laser.clone(),
+            }),
+        ];
+        obs.drops = vec![DropObs {
+            id: 20001,
+            pos: [-120.0, 20.0, mz],
+            radius: 8.0,
+            lands_in: 0.0,
+            capture_s: 4.0,
+            progress: 2.0,
+            holder: Some(obs.self_obs.id),
+        }];
+        obs.mechs = vec![
+            ActorObs {
+                id: 970,
+                kind: "mech".into(),
+                pos: [-123.0, 22.0, ez1], // inside drop ring at 1100 HP
+                vel: [0.0, 0.0, 0.0],
+                aim: [0.0, 0.0],
+                hp: Some(1100.0),
+                max_hp: Some(1400.0),
+                cubes: Some(0),
+                weapons: vec![WeaponKind::Gun],
+                charging: false,
+            },
+            ActorObs {
+                id: 971,
+                kind: "mech".into(),
+                pos: [-190.0, 20.0, ez2], // 70 m away outside ring at 650 HP
+                vel: [0.0, 0.0, 0.0],
+                aim: [0.0, 0.0],
+                hp: Some(650.0),
+                max_hp: Some(1400.0),
+                cubes: Some(0),
+                weapons: vec![WeaponKind::Gun],
+                charging: false,
+            },
+        ];
+
+        let act = bot.act(&obs);
+        assert_eq!(bot.strategy.posture, Posture::SupplyDrop);
+        assert_eq!(
+            bot.world.last_target_id,
+            Some(970),
+            "must prioritize ring contester (970) over distant wounded mech (971)"
+        );
+        assert_eq!(act.boost, Some(true));
+
+        // 2. Endgame (t=360, drops empty, no LOS enemies): claims final circle center
+        obs.t = 360.0;
+        obs.drops.clear();
+        obs.mechs.clear();
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.pos = [-120.0, 20.0, mz];
+        obs.zone.next_center = [-80.0, 20.0];
+        obs.zone.next_radius = 25.0;
+        let act_end = bot.act(&obs);
+        assert_eq!(bot.strategy.posture, Posture::ZoneRotate);
+        assert!(
+            act_end.move_dir.unwrap()[0] > 0.5,
+            "must rotate +x toward endgame final circle center (-80, 20), got {:?}",
+            act_end.move_dir
         );
     }
 }
