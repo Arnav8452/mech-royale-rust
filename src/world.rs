@@ -90,6 +90,7 @@ pub(crate) struct WorldState {
     pub cmd_move_streak: u32,
     pub unstuck_air_boost_until: f64,
     pub last_combat_t: f64,
+    pub last_kill_t: f64,
     pub last_scan_dir: f64,
 }
 
@@ -131,6 +132,7 @@ impl WorldState {
             cmd_move_streak: 0,
             unstuck_air_boost_until: -100.0,
             last_combat_t: -100.0,
+            last_kill_t: -100.0,
             last_scan_dir: 1.0,
         }
     }
@@ -200,6 +202,7 @@ impl WorldState {
                     }
                 }
                 GameEvent::Kill { target } => {
+                    self.last_kill_t = t;
                     self.tracked_enemies.remove(target);
                     if self.last_target_id == Some(*target) {
                         self.last_target_id = None;

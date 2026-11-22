@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m14-gunrail".to_string(),
+            name: "rust-bot-m22-postkill-cover".to_string(),
             config: hello.config,
             map,
             nav,
@@ -345,8 +345,8 @@ impl Bot {
                     && me.energy > 58.0)
                 || (enemy_close_lightning && me.energy > 32.0)
                 || (self.strategy.posture == Posture::EmergencyRegen
-                    && los_mech_count > 0
-                    && me.energy > 18.0)
+                    && (los_mech_count > 0 || (t - self.world.last_kill_t) <= 6.0)
+                    && me.energy > 22.0)
                 || (self.strategy.tactic == CombatTactic::CoverDuck
                     && los_mech_count > 0
                     && me.energy > 25.0)
@@ -2851,6 +2851,69 @@ mod tests {
             act.boost,
             Some(true),
             "[Gun, Laser] with 80 energy must boost-strafe continuously in combat"
+        );
+    }
+
+    #[test]
+    fn post_kill_breaks_los_to_cover_anchor_and_heals_before_reengaging() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        obs.t = 50.0;
+        let mz = bot.map.ground_height(86.0, -110.0);
+        obs.self_obs.pos = [86.0, -110.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 900.0; // 64.3%
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 30.0; // below 48 -> exercises ground regen_anchor cover path
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [50.0, -100.0];
+        obs.zone.next_center = [50.0, -100.0];
+        obs.zone.radius = 300.0;
+        obs.zone.next_radius = 220.0;
+        obs.zone.shrink_start = 120.0;
+        obs.mechs.clear();
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.events = vec![GameEvent::Kill { target: 5 }];
+
+        let act1 = bot.act(&obs);
+        assert_eq!(
+            bot.strategy.posture,
+            Posture::EmergencyRegen,
+            "after a kill at 64% HP with empty tracked_enemies, must enter EmergencyRegen"
+        );
+        let cp = bot
+            .strategy
+            .regen_anchor
+            .expect("must find a ground cover anchor via ensure_post_fight_cover_anchor");
+        if dist2d(86.0, -110.0, cp[0], cp[1]) > 5.0 {
+            let mv = act1.move_dir.unwrap();
+            assert!(
+                mv[0].hypot(mv[1]) > 0.5,
+                "must actively move toward cover anchor {cp:?}, got {mv:?}"
+            );
+        }
+
+        // Arrived at cover anchor at 68% HP: must hold still silently to regen without firing
+        obs.t = 54.0;
+        obs.events.clear();
+        obs.self_obs.pos = [cp[0], cp[1], bot.map.ground_height(cp[0], cp[1])];
+        obs.self_obs.hp = 950.0;
+        let act2 = bot.act(&obs);
+        assert_eq!(bot.strategy.posture, Posture::EmergencyRegen);
+        assert_eq!(act2.move_dir.unwrap(), [0.0, 0.0]);
+        assert_eq!(act2.fire.unwrap(), [false, false]);
+
+        // Healed past 90% (1280 / 1400): must exit EmergencyRegen and re-engage
+        obs.t = 61.0;
+        obs.self_obs.hp = 1280.0;
+        bot.act(&obs);
+        assert_ne!(
+            bot.strategy.posture,
+            Posture::EmergencyRegen,
+            "once healed >= 90% HP after kill cover break, must exit EmergencyRegen"
         );
     }
 }

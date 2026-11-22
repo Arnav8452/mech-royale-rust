@@ -63,6 +63,8 @@ pub(crate) struct StrategyState {
     pub cover_target: Option<[f64; 2]>,
     pub prev_cover_target: Option<[f64; 2]>,
     pub cover_target_t: f64,
+    pub regen_anchor: Option<[f64; 2]>,
+    pub regen_anchor_t: f64,
     pub combat_cover_target: Option<[f64; 2]>,
     pub combat_cover_t: f64,
     pub ambush_anchor: Option<[f64; 2]>,
@@ -84,6 +86,8 @@ impl StrategyState {
             cover_target: None,
             prev_cover_target: None,
             cover_target_t: -100.0,
+            regen_anchor: None,
+            regen_anchor_t: -100.0,
             combat_cover_target: None,
             combat_cover_t: -100.0,
             ambush_anchor: None,
@@ -295,6 +299,34 @@ impl StrategyState {
         self.cover_target
     }
 
+    fn ensure_post_fight_cover_anchor(
+        &mut self,
+        nav: &NavGrid,
+        obs: &Observation,
+    ) -> Option<[f64; 2]> {
+        let me = &obs.self_obs;
+        let nc = obs.zone.next_center;
+        let safe_next_r = (obs.zone.next_radius - 16.0).max(0.0);
+        let keep = self.regen_anchor.is_some_and(|a| {
+            obs.t - self.regen_anchor_t < 3.0
+                && (obs.zone.next_radius <= 24.0
+                    || dist2d(a[0], a[1], nc[0], nc[1]) <= safe_next_r)
+        });
+        if !keep {
+            self.regen_anchor = nav.find_cover_anchor(
+                me.pos,
+                obs.zone.center,
+                obs.zone.radius,
+                nc,
+                obs.zone.next_radius,
+                None,
+                64.0,
+            );
+            self.regen_anchor_t = obs.t;
+        }
+        self.regen_anchor
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn update_posture(
         &mut self,
@@ -340,17 +372,32 @@ impl StrategyState {
         let has_nanites = regen_delay <= 3.8;
         let winning_or_even_1v1 = los_count == 1 && los_mechs[0].hp <= me.hp + 180.0;
         let enemy_in_face = los_mechs.iter().any(|m| m.dist < 32.0);
+        let recent_kill = (obs.t - world.last_kill_t) <= 12.0;
+        let just_finished_fight =
+            los_count == 0 && (recent_kill || (obs.t - world.last_mech_damage_t) <= 8.0);
+        let in_post_fight_window = recent_kill || (obs.t - world.last_mech_damage_t) <= 18.0;
         let want_regen = if self.posture == Posture::EmergencyRegen {
-            let hold_cap = if has_nanites { 0.88 } else { 0.80 };
+            let hold_cap = if los_count == 0 {
+                0.90
+            } else if has_nanites {
+                0.88
+            } else {
+                0.80
+            };
             !immediate_kill_avail
                 && !enemy_in_face
                 && me.hp < hold_cap * me.max_hp
-                && !(me.hp >= 0.72 * me.max_hp && near_mechs == 0 && !has_nanites)
+                && !(me.hp >= 0.72 * me.max_hp
+                    && near_mechs == 0
+                    && !has_nanites
+                    && !in_post_fight_window)
         } else {
             let lose_1v1_thr = if has_nanites { 0.56 } else { 0.42 };
             !immediate_kill_avail
                 && !enemy_in_face
-                && ((me.hp < 0.62 * me.max_hp && los_count >= 2)
+                && ((recent_kill && me.hp < 0.85 * me.max_hp)
+                    || (just_finished_fight && me.hp < 0.82 * me.max_hp)
+                    || (me.hp < 0.62 * me.max_hp && los_count >= 2)
                     || (me.hp < lose_1v1_thr * me.max_hp && near_mechs > 0 && !winning_or_even_1v1)
                     || (has_nanites
                         && los_count == 0
@@ -392,6 +439,8 @@ impl StrategyState {
                 || self
                     .ensure_regen_cover(map, nav, world, obs, eye_h, los_count)
                     .is_some()
+                || ((recent_kill || just_finished_fight)
+                    && self.ensure_post_fight_cover_anchor(nav, obs).is_some())
                 || (self.posture == Posture::EmergencyRegen && los_count == 0))
         {
             self.posture = Posture::EmergencyRegen;
@@ -1067,6 +1116,13 @@ impl StrategyState {
                         zigzag_cover_dir(nav, me_xy, cp, wp, world.strafe_sign, los_mech_count > 0),
                         cp,
                     );
+                }
+                if let Some(cp) = self.ensure_post_fight_cover_anchor(nav, obs) {
+                    if dist2d(me.pos[0], me.pos[1], cp[0], cp[1]) <= 5.0 && los_mech_count == 0 {
+                        return ([0.0, 0.0], cp);
+                    }
+                    let wp = self.follow_astar(nav, scratch, me_xy, cp, obs.t);
+                    return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), cp);
                 }
                 if let Some((_, th)) = world.closest_tracked_enemy_within(me.pos, 220.0) {
                     let away = unit2d(me.pos[0] - th.pos[0], me.pos[1] - th.pos[1]);
