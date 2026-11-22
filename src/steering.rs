@@ -31,6 +31,20 @@ pub(crate) fn steer(
         stat(&me.stats, "air_accel", 12.0)
     };
     let move_spd = stat(&me.stats, "boost_speed", 19.5);
+    let active_drop_ring = obs
+        .drops
+        .iter()
+        .find(|d| {
+            d.lands_in <= 0.6
+                && dist2d(me.pos[0], me.pos[1], d.pos[0], d.pos[1]) <= d.radius - 0.1
+                && dist2d(
+                    me.pos[0] + goal_dir[0] * 2.5,
+                    me.pos[1] + goal_dir[1] * 2.5,
+                    d.pos[0],
+                    d.pos[1],
+                ) <= d.radius - 0.1
+        })
+        .map(|d| ([d.pos[0], d.pos[1]], (d.radius - 1.1).max(2.0)));
 
     let mut mortar_threats: Vec<[f64; 2]> = Vec::new();
     let mut bullet_escapes: Vec<([f64; 2], f64)> = Vec::new();
@@ -173,10 +187,24 @@ pub(crate) fn steer(
         if !(climbing_roof && goal_align > 0.6) {
             if !ok_near {
                 score -= 4.0;
+            } else if ducking_to_cover && goal_align > 0.65 {
+                if !ok_mid {
+                    score -= 0.35;
+                } else if !ok_far {
+                    score -= 0.10;
+                }
             } else if !ok_mid {
                 score -= 1.8;
             } else if !ok_far {
                 score -= 0.6;
+            }
+        }
+
+        if let Some((dxy, safe_r)) = active_drop_ring {
+            let nx = me.pos[0] + dir[0] * 4.2;
+            let ny = me.pos[1] + dir[1] * 4.2;
+            if dist2d(nx, ny, dxy[0], dxy[1]) > safe_r {
+                score -= 6.5;
             }
         }
 

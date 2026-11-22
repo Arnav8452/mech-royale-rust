@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m14-gunrail".to_string(),
+            name: "rust-bot-m18-dropking".to_string(),
             config: hello.config,
             map,
             nav,
@@ -95,7 +95,18 @@ impl Bot {
             }
         }
 
-        let immediate_kill_avail = me.hp > 180.0 && los_mechs.iter().any(|m| m.hp <= 560.0);
+        let have_laser = me
+            .weapons
+            .iter()
+            .flatten()
+            .any(|w| w.kind == crate::protocol::WeaponKind::Laser);
+        let immediate_kill_avail = me.hp > 180.0
+            && los_mechs.iter().any(|m| {
+                m.hp <= 560.0
+                    || (have_laser
+                        && m.weapons.contains(&crate::protocol::WeaponKind::Mortar)
+                        && m.hp <= 760.0)
+            });
 
         self.strategy.update_posture(
             &self.map,
@@ -114,6 +125,7 @@ impl Bot {
             me,
             self.world.last_damage_by,
             self.world.last_target_id,
+            &obs.drops,
         );
         self.world.last_target_id = primary_mech.as_ref().map(|m| m.id);
         let any_visible_mech = primary_mech.clone().or_else(|| {
@@ -328,17 +340,29 @@ impl Bot {
                     .contains(&crate::protocol::WeaponKind::Lightning)
                     && m.dist < 62.0
             });
+        let capturing_drop_inside_ring = self.strategy.posture == Posture::SupplyDrop
+            && obs.drops.iter().any(|d| {
+                d.lands_in <= 1.0
+                    && dist2d(me.pos[0], me.pos[1], d.pos[0], d.pos[1]) <= (d.radius - 1.2).max(1.5)
+            });
+        let urgent_drop_sprint = self.strategy.posture == Posture::SupplyDrop
+            && !capturing_drop_inside_ring
+            && obs.drops.iter().any(|d| {
+                let dd = dist2d(me.pos[0], me.pos[1], d.pos[0], d.pos[1]);
+                (d.lands_in <= 10.0 && dd <= 190.0) || d.holder.is_some_and(|h| h != me.id)
+            });
         let juke_boost = ((t <= self.world.juke_boost_until) || dodged_bullet)
             && me.energy > 45.0
-            && !saving_for_lightning;
+            && !saving_for_lightning
+            && !capturing_drop_inside_ring;
 
         let ground_boost = me.grounded
             && moving
             && ((!me.in_zone && me.energy > 5.0)
-                || (aimed_laser_dodge && me.energy > 25.0)
+                || (aimed_laser_dodge && me.energy > 25.0 && !capturing_drop_inside_ring)
                 || (dodged_hazard && me.energy > 15.0)
                 || juke_boost
-                || (laser_charging_now && me.energy > 35.0)
+                || (laser_charging_now && me.energy > 35.0 && !capturing_drop_inside_ring)
                 || (!have_lightning
                     && self.strategy.posture == Posture::Combat
                     && los_mech_count >= 1
@@ -357,7 +381,9 @@ impl Bot {
                         .as_ref()
                         .is_none_or(|m| !m.has_los || m.dist > 38.0))
                 || (self.strategy.posture == Posture::ZoneRotate && me.energy > 25.0)
-                || (self.strategy.posture == Posture::SupplyDrop && me.energy > 45.0)
+                || (self.strategy.posture == Posture::SupplyDrop
+                    && !capturing_drop_inside_ring
+                    && (me.energy > 42.0 || (urgent_drop_sprint && me.energy > 18.0)))
                 || (self.strategy.posture == Posture::LootWeapon
                     && slot1_empty
                     && me.energy > 28.0)
@@ -1635,7 +1661,7 @@ mod tests {
             is_vulnerable: false,
             last_reversal_t: -100.0,
         };
-        let picked = pick_best_mech_target(&[full_flanker, wounded_sticky], me, None, Some(5))
+        let picked = pick_best_mech_target(&[full_flanker, wounded_sticky], me, None, Some(5), &[])
             .expect("must pick a target");
         assert_eq!(
             picked.id, 5,
@@ -2851,6 +2877,136 @@ mod tests {
             act.boost,
             Some(true),
             "[Gun, Laser] with 80 energy must boost-strafe continuously in combat"
+        );
+    }
+
+    #[test]
+    fn dropking_locks_inside_landed_ring_without_overshoot_boost_and_focuses_ring_contester() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(-120.0, 20.0);
+        let ez1 = bot.map.ground_height(-123.0, 22.0);
+        let ez2 = bot.map.ground_height(-190.0, 20.0);
+
+        obs.t = 96.0;
+        obs.self_obs.pos = [-117.0, 20.0, mz]; // 3 m inside drop at (-120, 20)
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 500.0; // 35% HP, but holding landed drop with 2.4 s progress -> must finish full-heal capture!
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 85.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [-120.0, 20.0];
+        obs.zone.next_center = [-120.0, 20.0];
+        obs.zone.radius = 250.0;
+        obs.zone.next_radius = 220.0;
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Gun,
+                cooldown: 0.0,
+                ammo: Some(12.0),
+                reload: Some(0.0),
+                charge: None,
+                stats: bot.config.weapons.gun.clone(),
+            }),
+            Some(WeaponObs {
+                kind: WeaponKind::Laser,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: Some(0.0),
+                stats: bot.config.weapons.laser.clone(),
+            }),
+        ];
+        obs.drops = vec![DropObs {
+            id: 20001,
+            pos: [-120.0, 20.0, mz],
+            radius: 8.0,
+            lands_in: 0.0,
+            capture_s: 4.0,
+            progress: 2.4,
+            holder: Some(obs.self_obs.id),
+        }];
+        obs.mechs = vec![
+            ActorObs {
+                id: 970,
+                kind: "mech".into(),
+                pos: [-123.0, 22.0, ez1], // inside drop ring contesting at 1100 HP
+                vel: [0.0, 0.0, 0.0],
+                aim: [0.0, 0.0],
+                hp: Some(1100.0),
+                max_hp: Some(1400.0),
+                cubes: Some(0),
+                weapons: vec![WeaponKind::Gun],
+                charging: false,
+            },
+            ActorObs {
+                id: 971,
+                kind: "mech".into(),
+                pos: [-190.0, 20.0, ez2], // 70 m away outside ring at 650 HP
+                vel: [0.0, 0.0, 0.0],
+                aim: [0.0, 0.0],
+                hp: Some(650.0),
+                max_hp: Some(1400.0),
+                cubes: Some(0),
+                weapons: vec![WeaponKind::Gun],
+                charging: false,
+            },
+        ];
+
+        let act = bot.act(&obs);
+        assert_eq!(
+            bot.strategy.posture,
+            Posture::SupplyDrop,
+            "holding landed drop at 2.4/4.0 s progress must stay in SupplyDrop for full heal instead of fleeing"
+        );
+        assert_eq!(
+            act.boost,
+            Some(false),
+            "must NOT boost at 19.5 m/s while inside landed 8 m capture ring to avoid centrifugal ring exit"
+        );
+        assert_eq!(
+            bot.world.last_target_id,
+            Some(970),
+            "must prioritize enemy contesting inside drop ring (970) over distant wounded enemy (971)"
+        );
+    }
+
+    #[test]
+    fn dropking_tracks_global_drop_holder_and_skips_unwinnable_cross_map_capture() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(-120.0, 20.0);
+        let dz = bot.map.ground_height(180.0, 20.0);
+
+        obs.t = 100.0;
+        obs.self_obs.pos = [-120.0, 20.0, mz];
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 20.0];
+        obs.zone.next_center = [0.0, 20.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_radius = 350.0;
+        obs.mechs.clear();
+        obs.drops = vec![DropObs {
+            id: 20002,
+            pos: [180.0, 20.0, dz], // 300 m away!
+            radius: 8.0,
+            lands_in: 0.0,
+            capture_s: 4.0,
+            progress: 3.3, // only 0.7 s left until enemy 14 finishes capturing it
+            holder: Some(14),
+        }];
+
+        bot.act(&obs);
+        let tracked = bot
+            .world
+            .tracked_enemies
+            .get(&14)
+            .expect("global drop holder id=14 must be added to tracked_enemies at drop.pos");
+        assert!((tracked.pos[0] - 180.0).abs() < 1e-6);
+        assert_ne!(
+            bot.strategy.posture,
+            Posture::SupplyDrop,
+            "must skip unwinnable 300 m drop that enemy holder will finish capturing in 0.7 s"
         );
     }
 }

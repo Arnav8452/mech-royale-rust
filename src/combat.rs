@@ -1,6 +1,6 @@
 use crate::geom::{angle_diff, direct_aim, dist3d};
 use crate::map::Map;
-use crate::protocol::{stat, Config, Observation, SelfObs, WeaponKind, WeaponObs};
+use crate::protocol::{stat, Config, DropObs, Observation, SelfObs, WeaponKind, WeaponObs};
 use crate::world::WorldState;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -143,7 +143,11 @@ pub(crate) fn select_targets(
                         is_vulnerable: false,
                         last_reversal_t: -100.0,
                     };
-                    let score = 200.0 - d;
+                    let score = if (me.cubes as f64) < config.cubes.stat_cap {
+                        240.0 - d
+                    } else {
+                        200.0 - d
+                    };
                     if best_farm.as_ref().is_none_or(|(bs, _)| score > *bs) {
                         best_farm = Some((score, cand));
                     }
@@ -187,7 +191,7 @@ pub(crate) fn select_targets(
                     is_vulnerable: false,
                     last_reversal_t: -100.0,
                 };
-                let score = 100.0 - d;
+                let score = if slot1_empty { 215.0 - d } else { 100.0 - d };
                 if best_farm.as_ref().is_none_or(|(bs, _)| score > *bs) {
                     best_farm = Some((score, cand));
                 }
@@ -203,6 +207,7 @@ pub(crate) fn pick_best_mech_target(
     me: &SelfObs,
     last_damage_by: Option<u64>,
     last_target_id: Option<u64>,
+    drops: &[DropObs],
 ) -> Option<TargetCandidate> {
     let have_laser = me
         .weapons
@@ -243,7 +248,18 @@ pub(crate) fn pick_best_mech_target(
             score += 35.0;
         }
         if have_laser && c.weapons.contains(&WeaponKind::Mortar) {
-            score += 95.0; // Cook-off!
+            score += 145.0; // Cook-off!
+        }
+        for d in drops {
+            if d.lands_in <= 14.0 {
+                let dc = (c.pos[0] - d.pos[0]).hypot(c.pos[1] - d.pos[1]);
+                let dme = (me.pos[0] - d.pos[0]).hypot(me.pos[1] - d.pos[1]);
+                if d.holder == Some(c.id) || dc <= d.radius + 2.0 {
+                    score += 210.0;
+                } else if dc <= d.radius + 18.0 && dme <= 95.0 {
+                    score += 110.0;
+                }
+            }
         }
         if have_lightning {
             let lr = lt_range.unwrap_or(45.0);
@@ -368,11 +384,11 @@ pub(crate) fn eval_combat(
         );
         fire[ls] = should_hold;
 
-        if should_hold && charge < full_charge - 0.06 {
+        if should_hold && charge < full_charge * 0.86 {
             if let Some(gs) = gun_slot {
                 let (g_aim, g_fire, g_rel, g_ready) = eval_gun_slot(gs);
                 reload = g_rel;
-                let handoff_ok = charge < full_charge - 0.12
+                let handoff_ok = charge < full_charge * 0.78
                     || (angle_diff(g_aim[0], l_aim[0]).abs() <= 0.14
                         && (g_aim[1] - l_aim[1]).abs() <= 0.14);
                 if g_ready && handoff_ok {
@@ -800,12 +816,12 @@ pub(crate) fn eval_laser(
         false
     } else if !tgt.has_los && charge >= full_charge + hold_s - 0.35 {
         false
-    } else if charge >= full_charge * 0.90 && tgt.has_los && aligned {
+    } else if charge >= full_charge * 0.95 && tgt.has_los && aligned {
         false
     } else if charge >= min_charge
         && tgt.has_los
         && aligned
-        && (expected_dmg >= tgt.hp * 1.05 || losing_los)
+        && (expected_dmg >= tgt.hp * 1.02 || losing_los)
     {
         false
     } else {

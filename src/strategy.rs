@@ -330,7 +330,12 @@ impl StrategyState {
                 .values()
                 .filter(|e| dist2d(e.pos[0], e.pos[1], drop.pos[0], drop.pos[1]) <= 25.0)
                 .count();
-            if drop.lands_in <= 14.0 && d <= 170.0 && campers <= 1 {
+            let holding_or_in_ring = drop.holder == Some(me.id)
+                || (drop.lands_in <= 2.5 && d <= drop.radius + 6.0);
+            if (holding_or_in_ring && (me.hp > 240.0 || drop.progress >= 1.5))
+                || (drop.lands_in <= 14.0 && d <= 170.0 && campers <= 1)
+                || (drop.lands_in <= 8.0 && d <= 85.0 && campers <= 2 && me.hp >= 0.55 * me.max_hp)
+            {
                 self.posture = Posture::SupplyDrop;
                 return;
             }
@@ -468,6 +473,20 @@ impl StrategyState {
                 self.peek_target = None;
                 world.orbit_active_1v1 = false;
                 return (unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]), nc, None);
+            }
+            Posture::SupplyDrop if on_roof => {
+                if let Some(drop) = self.find_best_supply_drop(world, obs, los_mechs) {
+                    world.roof_climb_goal = None;
+                    self.tactic = CombatTactic::None;
+                    self.peek_target = None;
+                    world.orbit_active_1v1 = false;
+                    let dxy = [drop.pos[0], drop.pos[1]];
+                    return (
+                        unit2d(dxy[0] - me.pos[0], dxy[1] - me.pos[1]),
+                        dxy,
+                        None,
+                    );
+                }
             }
             Posture::EmergencyRegen => {
                 if let Some((rxy, rz)) = world.roof_climb_goal {
@@ -791,7 +810,9 @@ impl StrategyState {
                         .iter()
                         .any(|m| m.charging && m.dist > my_lt_range)
                         && our_laser_charge_frac < 0.65;
-                    if los_mech_count <= 1 && !enemy_charging_far && me.cubes < 15 {
+                    let want_cube_now = (me.cubes as f64) < config.cubes.stat_cap
+                        || (13..15).contains(&me.cubes);
+                    if los_mech_count <= 1 && !enemy_charging_far && want_cube_now {
                         if let Some(cube) = obs
                             .cubes
                             .iter()
@@ -981,7 +1002,11 @@ impl StrategyState {
                     }
                 }
             }
-            Posture::EarlyFarm if on_roof && me.cubes < 15 => {
+            Posture::EarlyFarm
+                if on_roof
+                    && ((me.cubes as f64) < config.cubes.stat_cap
+                        || (13..15).contains(&me.cubes)) =>
+            {
                 if let Some(cube) = obs
                     .cubes
                     .iter()
@@ -1083,14 +1108,14 @@ impl StrategyState {
             Posture::SupplyDrop => {
                 if let Some(drop) = self.find_best_supply_drop(world, obs, los_mechs) {
                     let d = dist2d(me.pos[0], me.pos[1], drop.pos[0], drop.pos[1]);
-                    if drop.lands_in > 5.0 && d < 28.0 {
+                    if drop.lands_in > 1.3 && d < 32.0 {
                         let threats: Vec<[f64; 3]> = mech_cands
                             .iter()
                             .filter(|m| m.has_los)
                             .map(|m| [m.pos[0], m.pos[1], m.pos[2] + 7.5])
                             .collect();
                         if !threats.is_empty() {
-                            if let Some(cp) = nav.find_cover_point(
+                            if let Some(cp) = nav.find_cover_point_within(
                                 map,
                                 me.pos,
                                 eye_h,
@@ -1099,26 +1124,41 @@ impl StrategyState {
                                 obs.zone.radius,
                                 obs.zone.next_center,
                                 obs.zone.next_radius,
+                                26.0,
+                                None,
                             ) {
+                                self.tactic = CombatTactic::CoverDuck;
                                 let wp = self.follow_astar(nav, scratch, me_xy, cp, obs.t);
                                 return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), cp);
                             }
                         }
                         let ang = obs.t * 1.1 * world.strafe_sign;
                         let orbit = [
-                            drop.pos[0] + 16.0 * ang.cos(),
-                            drop.pos[1] + 16.0 * ang.sin(),
+                            drop.pos[0] + 13.5 * ang.cos(),
+                            drop.pos[1] + 13.5 * ang.sin(),
                         ];
                         return (unit2d(orbit[0] - me.pos[0], orbit[1] - me.pos[1]), orbit);
                     }
-                    if drop.lands_in <= 4.5 && d <= (drop.radius - 1.5).max(1.0) {
-                        let r_in = (drop.radius * 0.55).max(1.5);
-                        let ang = obs.t * 1.8 * world.strafe_sign;
-                        let pt = [
-                            drop.pos[0] + r_in * ang.cos(),
-                            drop.pos[1] + r_in * ang.sin(),
-                        ];
-                        return (unit2d(pt[0] - me.pos[0], pt[1] - me.pos[1]), pt);
+                    if drop.lands_in <= 1.3 && d <= (drop.radius - 0.8).max(1.0) {
+                        if let Some(ce) = combat_enemy.or_else(|| los_mechs.first().copied()) {
+                            if los_mech_count >= 1 {
+                                let away = unit2d(drop.pos[0] - ce.pos[0], drop.pos[1] - ce.pos[1]);
+                                let perp =
+                                    [-away[1] * world.strafe_sign, away[0] * world.strafe_sign];
+                                let pt = [
+                                    drop.pos[0] + away[0] * 2.2 + perp[0] * 3.0,
+                                    drop.pos[1] + away[1] * 2.2 + perp[1] * 3.0,
+                                ];
+                                return (unit2d(pt[0] - me.pos[0], pt[1] - me.pos[1]), pt);
+                            }
+                        }
+                        if d <= 2.4 {
+                            return ([0.0, 0.0], [drop.pos[0], drop.pos[1]]);
+                        }
+                        return (
+                            unit2d(drop.pos[0] - me.pos[0], drop.pos[1] - me.pos[1]),
+                            [drop.pos[0], drop.pos[1]],
+                        );
                     }
                     let wp =
                         self.follow_astar(nav, scratch, me_xy, [drop.pos[0], drop.pos[1]], obs.t);
@@ -1210,12 +1250,21 @@ impl StrategyState {
 
                 let near_cover_14 = nav.has_near_cover_within(me.pos, 14.0);
 
-                // A. Mid-Combat Power Cube Magnet: free +4% max HP heal & +4% dmg mid-fight
-                if !enemy_laser_duck
+                // A. Mid-Combat Power Cube Magnet: free +4% max HP heal & +4% dmg mid-fight (capped at stat_cap to avoid hitbox bloat)
+                let want_cube_now =
+                    (me.cubes as f64) < config.cubes.stat_cap || (13..15).contains(&me.cubes);
+                if want_cube_now
+                    && !enemy_laser_duck
                     && los_mech_count <= 1
                     && !(no_weapon_can_shoot_now && los_mech_count >= 1)
                 {
-                    let cube_pull_r = if los_mech_count == 0 { 24.0 } else { 16.0 };
+                    let cube_pull_r = if (me.cubes as f64) >= config.cubes.stat_cap {
+                        10.0
+                    } else if los_mech_count == 0 {
+                        24.0
+                    } else {
+                        16.0
+                    };
                     let have_lt_ready = me
                         .weapons
                         .iter()
@@ -1323,7 +1372,7 @@ impl StrategyState {
                                     cp,
                                     wp,
                                     world.strafe_sign,
-                                    los_mech_count > 0,
+                                    los_mech_count > 0 && !enemy_laser_duck,
                                 ),
                                 cp,
                             );
@@ -1387,7 +1436,7 @@ impl StrategyState {
                         .count();
                     let is_1v1 = los_mech_count == 1 && known_nearby_180 <= 1;
 
-                    let (perp, radial_band, tang_w) = if is_1v1 {
+                    let (perp, radial_band, tang_w) = if los_mech_count == 1 {
                         world.orbit_active_1v1 = true;
                         let orbit_blocked_for = |sign: f64| -> bool {
                             let p = [-to_e[1] * sign, to_e[0] * sign];
@@ -1579,7 +1628,7 @@ impl StrategyState {
         let want_farm_cubes =
             (me.cubes as f64) < config.cubes.stat_cap || (13..15).contains(&me.cubes);
 
-        if me.cubes < 15 {
+        if want_farm_cubes {
             if let Some(cube) = obs
                 .cubes
                 .iter()
@@ -1836,8 +1885,7 @@ impl StrategyState {
         los_mechs: &[&TargetCandidate],
     ) -> Option<&'a DropObs> {
         let me = &obs.self_obs;
-        // cl-drops: every drop is a full heal + full energy + 3 cubes; chase them map-wide.
-        let max_pull = 460.0;
+        let max_pull = 500.0;
         let in_close_duel = los_mechs.iter().any(|m| m.dist < 60.0);
         let mut best: Option<(f64, &'a DropObs)> = None;
         for d in &obs.drops {
@@ -1845,6 +1893,21 @@ impl StrategyState {
                 > obs.zone.radius - 10.0
             {
                 continue;
+            }
+            let dist = dist2d(me.pos[0], me.pos[1], d.pos[0], d.pos[1]);
+            let we_hold = d.holder == Some(me.id);
+            if we_hold {
+                let score = -1000.0 + dist;
+                if best.is_none_or(|(bs, _)| score < bs) {
+                    best = Some((score, d));
+                }
+                continue;
+            }
+            if d.lands_in <= 0.0 && d.holder.is_some_and(|h| h != me.id) {
+                let time_left = (d.capture_s - d.progress).max(0.0);
+                if dist > 130.0 && (dist - 90.0) / 19.5 > time_left + 0.6 {
+                    continue;
+                }
             }
             let campers = world
                 .tracked_enemies
@@ -1854,7 +1917,6 @@ impl StrategyState {
             if campers >= 3 {
                 continue;
             }
-            let dist = dist2d(me.pos[0], me.pos[1], d.pos[0], d.pos[1]);
             let eta = dist / 15.0;
             let arrival_ok = d.lands_in <= (eta + 10.0).max(12.0);
             let duel_ok = !in_close_duel || dist <= 70.0;

@@ -364,6 +364,42 @@ impl WorldState {
             }
         }
 
+        // Global drop-holder radar: any enemy holding a landed drop is known to be inside its 8 m ring
+        for d in &obs.drops {
+            if d.lands_in <= 0.0 {
+                if let Some(hid) = d.holder {
+                    if hid != me.id && hid < 100 {
+                        if let Some(e) = self.tracked_enemies.get_mut(&hid) {
+                            if t - e.last_seen_t > 0.25 {
+                                e.pos = d.pos;
+                                e.last_seen_t = t;
+                            }
+                        } else {
+                            self.tracked_enemies.insert(
+                                hid,
+                                TrackedEnemy {
+                                    pos: d.pos,
+                                    vel: [0.0, 0.0, 0.0],
+                                    est_accel_z: 0.0,
+                                    aim: [0.0, 0.0],
+                                    hp: 1400.0,
+                                    max_hp: 1400.0,
+                                    weapons: Vec::new(),
+                                    charging: false,
+                                    last_seen_t: t,
+                                    gun_reload_until: -100.0,
+                                    laser_cd_until: -100.0,
+                                    est_gun_shots: 0,
+                                    last_gun_shot_t: -100.0,
+                                    last_reversal_t: -100.0,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // Track visible enemy gun projectiles near muzzles to predict full-mag reloads
         self.seen_proj_ids.retain(|_, seen_t| t - *seen_t <= 3.0);
         for p in &obs.projectiles {
