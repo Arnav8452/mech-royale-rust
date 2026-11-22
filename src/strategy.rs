@@ -121,32 +121,32 @@ impl StrategyState {
                 "nanites" => 116.0,
                 "plating" => 112.0,
                 "laser_charge" => 111.0,
-                "lightning_range" => 110.0,
-                "laser_damage" => 109.0,
-                "lightning_efficiency" => 108.0,
+                "laser_damage" => 110.0,
+                "gun_mag" => 109.0,
+                "gun_damage" | "gun_rate" => 107.0,
                 "armor" => 106.0,
-                "gun_mag" => 105.0,
-                "laser_pierce" => 103.0,
-                "gun_damage" | "gun_rate" => 101.0,
-                "servos" => 99.0,
-                "lightning_chain" => 97.0,
-                "gun_velocity" => 95.0,
-                "jets" => 92.0,
+                "laser_pierce" => 104.0,
+                "gun_velocity" => 102.0,
+                "servos" => 100.0,
+                "jets" => 96.0,
+                "lightning_range" => 94.0,
+                "lightning_efficiency" => 92.0,
                 "reactor" => {
                     if have_lightning {
                         88.0
                     } else {
-                        80.0
+                        82.0
                     }
                 }
                 "capacitor" => {
                     if have_lightning {
-                        84.0
+                        82.0
                     } else {
                         72.0
                     }
                 }
                 "gyros" => 78.0,
+                "lightning_chain" => 76.0,
                 "sensors" => {
                     if existing_stacks == 0 {
                         62.0
@@ -164,9 +164,9 @@ impl StrategyState {
                                 "mech.hp" => 110.0,
                                 "mech.armor" => 106.0,
                                 _ if eff.path.starts_with("weapons.laser.") => 104.0,
-                                _ if eff.path.starts_with("weapons.lightning.") => 102.0,
-                                _ if eff.path.starts_with("weapons.gun.") => 98.0,
+                                _ if eff.path.starts_with("weapons.gun.") => 103.0,
                                 "mech.walk_speed" | "mech.boost_speed" => 96.0,
+                                _ if eff.path.starts_with("weapons.lightning.") => 94.0,
                                 _ if eff.path.starts_with("weapons.mortar.") => 25.0,
                                 _ => 30.0,
                             };
@@ -386,7 +386,7 @@ impl StrategyState {
     ) {
         let me = &obs.self_obs;
         let los_count = los_mechs.len();
-        let ghost_mode = obs.alive > 4 && obs.zone.radius > 65.0;
+        let ghost_mode = obs.alive > 2 && obs.zone.radius > 65.0;
         let dist_next = dist2d(
             me.pos[0],
             me.pos[1],
@@ -428,13 +428,13 @@ impl StrategyState {
         let enemy_in_face = los_mechs.iter().any(|m| m.dist < 32.0);
         let easy_vulture = ghost_mode
             && los_count == 1
-            && los_mechs[0].hp <= 420.0
-            && me.hp >= 0.70 * me.max_hp;
+            && los_mechs[0].hp <= 480.0
+            && me.hp >= 0.65 * me.max_hp;
         let close_hideout_defense = ghost_mode
             && los_count == 1
-            && los_mechs[0].dist <= 52.0
-            && me.hp >= 0.65 * me.max_hp
-            && los_mechs[0].hp <= me.hp + 100.0;
+            && los_mechs[0].dist <= 55.0
+            && me.hp >= 0.60 * me.max_hp
+            && los_mechs[0].hp <= me.hp + 150.0;
         let want_regen = if ghost_mode {
             !immediate_kill_avail
                 && !easy_vulture
@@ -546,7 +546,7 @@ impl StrategyState {
         let my_ground = map.ground_height(me.pos[0], me.pos[1]);
         let on_roof =
             me.pos[2] > my_ground + 3.5 && map.roof_top_at(me.pos[0], me.pos[1]).is_some();
-        let ghost_mode = obs.alive > 4 && obs.zone.radius > 65.0;
+        let ghost_mode = obs.alive > 2 && obs.zone.radius > 65.0;
 
         if let Some((_, rz)) = world.roof_climb_goal {
             let climb_timeout = if rz - my_ground > 26.0 { 4.8 } else { 3.6 };
@@ -649,6 +649,9 @@ impl StrategyState {
                 } else if me.pos[2] <= my_ground + 2.5
                     && me.energy >= 48.0
                     && obs.t >= world.roof_climb_cooldown_until
+                    && (!ghost_mode
+                        || los_mech_count >= 2
+                        || !nav.has_near_cover_within(me.pos, 18.0))
                 {
                     let regen_roof = map
                         .find_climbable_roof_near(
@@ -771,7 +774,10 @@ impl StrategyState {
                     && obs.t >= world.roof_climb_cooldown_until
                     && !immediate_kill_avail
                     && !lt_rush_charger
-                    && (!ghost_mode || los_mech_count >= 1)
+                    && (!ghost_mode
+                        || los_mech_count >= 2
+                        || obs.t - world.last_mech_damage_t <= 3.5
+                        || los_mechs.iter().any(|m| m.dist <= 55.0 || m.charging))
                     && (los_mech_count >= 2
                         || combat_enemy.is_some_and(|e| e.dist > my_lt_range + 4.0)
                         || (los_mech_count == 0 && !world.tracked_enemies.is_empty()))
@@ -1018,10 +1024,21 @@ impl StrategyState {
 
                     // 4. Smooth Roof-Edge Strafe in 1v1
                     if let Some(e) = combat_enemy {
+                        let have_laser_roof = me
+                            .weapons
+                            .iter()
+                            .flatten()
+                            .any(|w| w.kind == WeaponKind::Laser);
                         let to_e = unit2d(e.pos[0] - me.pos[0], e.pos[1] - me.pos[1]);
                         let tang = [-to_e[1] * world.strafe_sign, to_e[0] * world.strafe_sign];
                         let d2 = dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]);
-                        let pref_d = if have_lightning { 38.0 } else { 52.0 };
+                        let pref_d = if have_laser_roof && !have_lightning {
+                            70.0
+                        } else if have_lightning {
+                            38.0
+                        } else {
+                            52.0
+                        };
                         let rw = if d2 < pref_d - 6.0 {
                             -0.6
                         } else if d2 > pref_d + 8.0 {
@@ -1104,7 +1121,7 @@ impl StrategyState {
         let nc = obs.zone.next_center;
         let safe_r = (obs.zone.next_radius - 18.0).max(0.0);
         let dist_next = dist2d(me.pos[0], me.pos[1], nc[0], nc[1]);
-        let ghost_mode = obs.alive > 4 && obs.zone.radius > 65.0;
+        let ghost_mode = obs.alive > 2 && obs.zone.radius > 65.0;
 
         match self.posture {
             Posture::ZoneRotate => {
@@ -1273,13 +1290,13 @@ impl StrategyState {
                 let near_cover_14 = nav.has_near_cover_within(me.pos, 14.0);
                 let easy_vulture = ghost_mode
                     && los_mech_count == 1
-                    && los_mechs[0].hp <= 420.0
-                    && me.hp >= 0.70 * me.max_hp;
+                    && los_mechs[0].hp <= 480.0
+                    && me.hp >= 0.65 * me.max_hp;
                 let close_hideout_defense = ghost_mode
                     && los_mech_count == 1
-                    && los_mechs[0].dist <= 52.0
-                    && me.hp >= 0.65 * me.max_hp
-                    && los_mechs[0].hp <= me.hp + 100.0;
+                    && los_mechs[0].dist <= 55.0
+                    && me.hp >= 0.60 * me.max_hp
+                    && los_mechs[0].hp <= me.hp + 150.0;
                 let ghost_retreat =
                     ghost_mode && !immediate_kill_avail && !easy_vulture && !close_hideout_defense;
 
@@ -1320,7 +1337,7 @@ impl StrategyState {
                         .cubes
                         .iter()
                         .filter(|c| {
-                            is_ground_level(map, c.pos)
+                            is_reachable_cube(map, me.pos, c.pos)
                                 && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= cube_pull_r
                                 && dist2d(c.pos[0], c.pos[1], nc[0], nc[1])
                                     <= obs.zone.next_radius - 5.0
@@ -1573,6 +1590,12 @@ impl StrategyState {
                         } else {
                             64.0
                         }
+                    } else if have_laser && !has_lightning {
+                        if me.hp < 0.65 * me.max_hp || enemy_has_lightning || los_mech_count >= 2 {
+                            80.0
+                        } else {
+                            70.0
+                        }
                     } else if has_lightning
                         && me.energy > 20.0
                         && los_mech_count == 1
@@ -1671,7 +1694,7 @@ impl StrategyState {
                 .cubes
                 .iter()
                 .filter(|c| {
-                    is_ground_level(map, c.pos)
+                    is_reachable_cube(map, me.pos, c.pos)
                         && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= cube_max_d
                         && dist2d(c.pos[0], c.pos[1], nc[0], nc[1]) <= obs.zone.next_radius - 5.0
                 })
@@ -1990,7 +2013,7 @@ impl StrategyState {
         los_mechs: &[&TargetCandidate],
     ) -> Option<[f64; 3]> {
         let me = &obs.self_obs;
-        let ghost_mode = obs.alive > 4 && obs.zone.radius > 65.0;
+        let ghost_mode = obs.alive > 2 && obs.zone.radius > 65.0;
         let close_los_enemy = los_mechs.iter().any(|m| m.dist < 60.0);
         let any_los_enemy = !los_mechs.is_empty();
         if ghost_mode
@@ -2007,32 +2030,27 @@ impl StrategyState {
         if ghost_mode && !slot1_empty && obs.t >= 60.0 {
             return None;
         }
-        let have_lightning = me
-            .weapons
-            .iter()
-            .flatten()
-            .any(|w| w.kind == WeaponKind::Lightning);
         let have_laser = me
             .weapons
             .iter()
             .flatten()
             .any(|w| w.kind == WeaponKind::Laser);
-        let gun_upgrades = me.upgrades.iter().filter(|u| u.starts_with("gun_")).count();
-        let seeking_upgrade =
-            !have_lightning || (!have_laser && !(have_lightning && gun_upgrades >= 2));
+        let on_roof = me.pos[2] > map.ground_height(me.pos[0], me.pos[1]) + 3.5
+            && map.roof_top_at(me.pos[0], me.pos[1]).is_some();
+        let seeking_upgrade = !have_laser;
 
         let max_seek_d = if ghost_mode {
             if slot1_empty && obs.t < 45.0 {
                 160.0
             } else if seeking_upgrade {
-                85.0
+                100.0
             } else {
                 40.0
             }
         } else if slot1_empty {
             210.0
         } else if seeking_upgrade {
-            140.0
+            160.0
         } else {
             65.0
         };
@@ -2057,15 +2075,19 @@ impl StrategyState {
             let gz = map.ground_height(pos[0], pos[1]);
             let dh = pos[2] - gz;
             let ground_ok = is_ground_level(map, pos);
+            let same_roof_ok = on_roof
+                && (pos[2] - me.pos[2]).abs() <= 3.5
+                && map.roof_top_at(pos[0], pos[1]).is_some()
+                && d <= 45.0;
             let roof_ok = dh > 2.5
                 && dh <= 20.0
                 && me.energy >= 48.0
                 && !any_los_enemy
-                && (slot1_empty || !have_lightning || !have_laser)
+                && (slot1_empty || !have_laser)
                 && d <= 85.0
                 && obs.t >= world.roof_climb_cooldown_until
                 && map.roof_top_at(pos[0], pos[1]).is_some();
-            if !ground_ok && !roof_ok {
+            if !ground_ok && !same_roof_ok && !roof_ok {
                 continue;
             }
 
@@ -2078,7 +2100,7 @@ impl StrategyState {
                 continue;
             }
 
-            let score = prio as f64 * 45.0 - d - if roof_ok { 15.0 } else { 0.0 };
+            let score = prio as f64 * 45.0 - d - if roof_ok && !same_roof_ok { 15.0 } else { 0.0 };
             if best.is_none_or(|(bs, bid, _)| score > bs || (score == bs && id < bid)) {
                 best = Some((score, id, pos));
             }
@@ -2088,7 +2110,7 @@ impl StrategyState {
     }
 }
 
-/// Preferred loadout `[Laser, Lightning]` (protects Gun only when >= 2 Gun upgrades invested).
+/// Preferred loadout `[Gun, Laser]` (zero weapon energy cost; 318.5 DPS dual-fire at 0-230 m).
 fn swap_slot_for(me: &SelfObs, new_kind: WeaponKind) -> Option<usize> {
     if new_kind == WeaponKind::Mortar {
         return None;
@@ -2101,41 +2123,28 @@ fn swap_slot_for(me: &SelfObs, new_kind: WeaponKind) -> Option<usize> {
     {
         return Some(m_slot);
     }
-    let gun_upgrades = me.upgrades.iter().filter(|u| u.starts_with("gun_")).count();
-    let laser_upgrades = me.upgrades.iter().filter(|u| u.starts_with("laser_")).count();
-    let laser_slot = me
+    let lightning_slot = me
         .weapons
         .iter()
         .take(2)
-        .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Laser));
-    let gun_slot = me
+        .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Lightning));
+    let have_laser = me
         .weapons
         .iter()
-        .take(2)
-        .position(|w| w.as_ref().is_some_and(|w| w.kind == WeaponKind::Gun));
+        .flatten()
+        .any(|w| w.kind == WeaponKind::Laser);
 
-    if new_kind == WeaponKind::Lightning {
-        if let Some(gs) = gun_slot {
-            if gun_upgrades < 2 {
-                return Some(gs);
+    match new_kind {
+        WeaponKind::Laser => lightning_slot,
+        WeaponKind::Gun => {
+            if have_laser {
+                lightning_slot
+            } else {
+                None
             }
         }
-        if let Some(ls) = laser_slot {
-            if laser_upgrades == 0 {
-                return Some(ls);
-            }
-        }
-        return gun_slot.or(laser_slot);
+        WeaponKind::Lightning | WeaponKind::Mortar => None,
     }
-    if new_kind == WeaponKind::Laser {
-        if let Some(gs) = gun_slot {
-            if gun_upgrades < 2 {
-                return Some(gs);
-            }
-        }
-        return None;
-    }
-    None
 }
 
 #[inline]
@@ -2162,4 +2171,10 @@ fn zigzag_cover_dir(
     } else {
         base
     }
+}
+
+#[inline]
+fn is_reachable_cube(map: &Map, me_pos: [f64; 3], pos: [f64; 3]) -> bool {
+    is_ground_level(map, pos)
+        || ((pos[2] - me_pos[2]).abs() <= 3.5 && map.roof_top_at(pos[0], pos[1]).is_some())
 }

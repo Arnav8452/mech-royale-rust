@@ -57,7 +57,7 @@ pub(crate) fn select_targets(
     let want_farm_cubes =
         (me.cubes as f64) < config.cubes.stat_cap || (13..15).contains(&me.cubes);
     let slot1_empty = me.weapons.get(1).is_some_and(|w| w.is_none());
-    let ghost_mode = obs.alive > 4 && obs.zone.radius > 65.0;
+    let ghost_mode = obs.alive > 2 && obs.zone.radius > 65.0;
     let quiet_farm_ok = !ghost_mode
         || (obs.t < 50.0
             && me.cubes < 6
@@ -852,9 +852,9 @@ fn lightning_energy_ok(
 #[inline]
 pub(crate) fn weapon_desirability(kind: WeaponKind) -> u8 {
     match kind {
-        WeaponKind::Lightning => 4,
-        WeaponKind::Laser => 3,
-        WeaponKind::Gun => 2,
+        WeaponKind::Laser => 4,
+        WeaponKind::Gun => 3,
+        WeaponKind::Lightning => 2,
         WeaponKind::Mortar => 0,
     }
 }
