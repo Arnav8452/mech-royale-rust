@@ -418,7 +418,11 @@ impl StrategyState {
             && world
                 .tracked_enemies
                 .values()
-                .any(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 220.0)
+                .any(|e| {
+                    // cl-gamble-blitz: once powered up (after the early gate), hunt out to 300 m.
+                    let r = if obs.t >= 95.0 { 300.0 } else { 220.0 };
+                    dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= r
+                })
         {
             self.posture = Posture::Combat;
             return;
