@@ -410,7 +410,7 @@ impl StrategyState {
         if let Some((_, rz)) = world.roof_climb_goal {
             if me.pos[2] >= rz - 0.8 {
                 world.roof_climb_goal = None;
-            } else if obs.t - world.roof_climb_start_t > 2.8 || me.energy < 12.0 {
+            } else if obs.t - world.roof_climb_start_t > 3.6 || me.energy < 12.0 {
                 world.roof_climb_goal = None;
                 world.roof_climb_cooldown_until = obs.t + 8.0;
             }
@@ -501,13 +501,225 @@ impl StrategyState {
                     }
                 }
 
-                // Elevated Roof Fighting: stay cleanly inside the roof interior or drop toward zone
+                // Proactive High-Ground Seizure: claim 9-28 m campus rooftop within 28 m when Laser-armed
+                let my_lt_range_roof = me
+                    .weapons
+                    .iter()
+                    .flatten()
+                    .find(|w| w.kind == WeaponKind::Lightning)
+                    .map(|w| stat(&w.stats, "range", 45.0))
+                    .unwrap_or(45.0);
+                let have_lt_roof = me
+                    .weapons
+                    .iter()
+                    .flatten()
+                    .any(|w| w.kind == WeaponKind::Lightning);
+                let lt_rush_roof = have_lt_roof
+                    && me.energy >= 24.0
+                    && combat_enemy.is_some_and(|e| {
+                        e.charging && e.dist <= my_lt_range_roof + 12.0 && me.hp > 0.30 * me.max_hp
+                    });
+                let have_laser_roof = me
+                    .weapons
+                    .iter()
+                    .flatten()
+                    .any(|w| w.kind == WeaponKind::Laser);
+
+                if me.pos[2] <= my_ground + 2.5
+                    && have_laser_roof
+                    && me.energy >= 58.0
+                    && obs.t >= world.roof_climb_cooldown_until
+                    && !immediate_kill_avail
+                    && !lt_rush_roof
+                    && ((los_mech_count >= 2 && me.hp < 0.85 * me.max_hp)
+                        || (combat_enemy.is_some_and(|e| e.dist > my_lt_range_roof + 8.0)
+                            && me.hp < 0.90 * me.max_hp)
+                        || (los_mech_count == 0 && !world.tracked_enemies.is_empty()))
+                {
+                    if let Some((rxy, rz)) = map.find_climbable_roof_near(
+                        me.pos[0],
+                        me.pos[1],
+                        my_ground,
+                        28.0,
+                        9.0,
+                        28.0,
+                        nc,
+                        obs.zone.next_radius,
+                    ) {
+                        world.roof_climb_goal = Some((rxy, rz));
+                        world.roof_climb_start_t = obs.t;
+                        self.tactic = CombatTactic::CoverDuck;
+                        self.peek_target = None;
+                        world.orbit_active_1v1 = false;
+                        return (
+                            unit2d(rxy[0] - me.pos[0], rxy[1] - me.pos[1]),
+                            rxy,
+                            Some(rz),
+                        );
+                    }
+                }
+
+                // Elevated Roof Fighting & 3D Parapet Jiggle-Peeking
                 if on_roof {
                     self.peek_target = None;
                     world.orbit_active_1v1 = false;
                     if dist_next > safe_r * 0.90 {
                         self.tactic = CombatTactic::None;
                         return (unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]), nc, None);
+                    }
+
+                    // Anti-jetpack defense: if 2+ enemies land ON OUR ROOF, drop off far edge!
+                    let same_roof_threats: Vec<[f64; 2]> = mech_cands
+                        .iter()
+                        .filter(|m| {
+                            (m.pos[2] - me.pos[2]).abs() <= 4.5
+                                && dist2d(me.pos[0], me.pos[1], m.pos[0], m.pos[1]) <= 40.0
+                        })
+                        .map(|m| [m.pos[0], m.pos[1]])
+                        .collect();
+                    if same_roof_threats.len() >= 2 {
+                        let n = same_roof_threats.len() as f64;
+                        let cx = same_roof_threats.iter().map(|p| p[0]).sum::<f64>() / n;
+                        let cy = same_roof_threats.iter().map(|p| p[1]).sum::<f64>() / n;
+                        let away = unit2d(me.pos[0] - cx, me.pos[1] - cy);
+                        let to_nc = unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]);
+                        let dir = unit2d(away[0] * 0.75 + to_nc[0] * 0.25, away[1] * 0.75 + to_nc[1] * 0.25);
+                        world.roof_climb_goal = None;
+                        world.roof_climb_cooldown_until = obs.t + 6.0;
+                        self.tactic = CombatTactic::CoverDuck;
+                        let g = [me.pos[0] + dir[0] * 14.0, me.pos[1] + dir[1] * 14.0];
+                        return (dir, g, None);
+                    }
+
+                    // 3D Roof-Parapet Laser Jiggle-Peek
+                    let laser_opt = me
+                        .weapons
+                        .iter()
+                        .flatten()
+                        .find(|w| w.kind == WeaponKind::Laser);
+                    let roof_target = combat_enemy
+                        .map(|e| (e.id, e.pos, e.dist))
+                        .or_else(|| {
+                            world
+                                .closest_tracked_enemy_within(me.pos, 220.0)
+                                .map(|(id, te)| {
+                                    (id, te.pos, dist2d(me.pos[0], me.pos[1], te.pos[0], te.pos[1]))
+                                })
+                        });
+                    if let (Some(lw), Some((e_id, e_pos, e_dist))) = (laser_opt, roof_target) {
+                        if e_dist > my_lt_range_roof + 4.0 && !immediate_kill_avail {
+                            let full_charge = stat(&lw.stats, "charge", 0.75);
+                            let charge = lw.charge.unwrap_or(0.0);
+                            let ready_to_peek = charge >= (full_charge - 0.22).max(0.25);
+
+                            let mut nearby_tracked: Vec<(u64, [f64; 3])> = world
+                                .tracked_enemies
+                                .iter()
+                                .filter(|(_, te)| {
+                                    dist2d(me.pos[0], me.pos[1], te.pos[0], te.pos[1]) <= 220.0
+                                })
+                                .map(|(&id, te)| (id, [te.pos[0], te.pos[1], te.pos[2] + 7.5]))
+                                .collect();
+                            nearby_tracked.sort_by_key(|(id, _)| *id);
+                            let primary_eye = [e_pos[0], e_pos[1], e_pos[2] + 7.5];
+                            let mut all_eyes: Vec<[f64; 3]> =
+                                nearby_tracked.iter().map(|&(_, p)| p).collect();
+                            if all_eyes.is_empty() {
+                                all_eyes.push(primary_eye);
+                            }
+                            let other_eyes: Vec<[f64; 3]> = nearby_tracked
+                                .iter()
+                                .filter(|&&(id, _)| id != e_id)
+                                .map(|&(_, p)| p)
+                                .collect();
+
+                            if !ready_to_peek {
+                                if los_mech_count == 0
+                                    && !all_eyes.iter().any(|&te| {
+                                        map.has_los(
+                                            [me.pos[0], me.pos[1], me.pos[2] + eye_h],
+                                            te,
+                                        )
+                                    })
+                                {
+                                    self.jiggle_precharging = true;
+                                    self.tactic = CombatTactic::CoverDuck;
+                                    return ([0.0, 0.0], me_xy, None);
+                                }
+                                let mut best_hide: Option<(f64, [f64; 2])> = None;
+                                for step_d in [5.0_f64, 9.0, 13.0] {
+                                    for k in 0..16 {
+                                        let theta = (k as f64) * (PI / 8.0);
+                                        let dir = [theta.cos(), theta.sin()];
+                                        let rx = me.pos[0] + dir[0] * step_d;
+                                        let ry = me.pos[1] + dir[1] * step_d;
+                                        if obs.zone.next_radius > 20.0
+                                            && dist2d(rx, ry, nc[0], nc[1]) > safe_r
+                                        {
+                                            continue;
+                                        }
+                                        let Some(rt) = map.roof_top_at(rx, ry) else {
+                                            continue;
+                                        };
+                                        if (rt - me.pos[2]).abs() > 2.5 {
+                                            continue;
+                                        }
+                                        let probe_eye = [rx, ry, rt + eye_h];
+                                        if all_eyes.iter().any(|&te| map.has_los(probe_eye, te)) {
+                                            continue;
+                                        }
+                                        let score = -step_d;
+                                        if best_hide.is_none_or(|(bs, _)| score > bs) {
+                                            best_hide = Some((score, [rx, ry]));
+                                        }
+                                    }
+                                }
+                                if let Some((_, pt)) = best_hide {
+                                    self.jiggle_precharging = true;
+                                    self.tactic = CombatTactic::CoverDuck;
+                                    return (unit2d(pt[0] - me.pos[0], pt[1] - me.pos[1]), pt, None);
+                                }
+                            } else if los_mech_count == 0 {
+                                let mut best_peek: Option<(f64, [f64; 2])> = None;
+                                for step_d in [4.0_f64, 8.0, 12.0] {
+                                    for k in 0..16 {
+                                        let theta = (k as f64) * (PI / 8.0);
+                                        let dir = [theta.cos(), theta.sin()];
+                                        let rx = me.pos[0] + dir[0] * step_d;
+                                        let ry = me.pos[1] + dir[1] * step_d;
+                                        if obs.zone.next_radius > 20.0
+                                            && dist2d(rx, ry, nc[0], nc[1]) > safe_r
+                                        {
+                                            continue;
+                                        }
+                                        let Some(rt) = map.roof_top_at(rx, ry) else {
+                                            continue;
+                                        };
+                                        if (rt - me.pos[2]).abs() > 2.5 {
+                                            continue;
+                                        }
+                                        let probe_eye = [rx, ry, rt + eye_h];
+                                        if !map.has_los(probe_eye, primary_eye) {
+                                            continue;
+                                        }
+                                        let other_los = other_eyes
+                                            .iter()
+                                            .filter(|&&te| map.has_los(probe_eye, te))
+                                            .count();
+                                        let score = -100.0 * (other_los as f64) - step_d;
+                                        if best_peek.is_none_or(|(bs, _)| score > bs) {
+                                            best_peek = Some((score, [rx, ry]));
+                                        }
+                                    }
+                                }
+                                if let Some((_, pt)) = best_peek {
+                                    self.tactic = CombatTactic::CornerPeek;
+                                    self.peek_target = Some(pt);
+                                    self.jiggle_precharging = true;
+                                    return (unit2d(pt[0] - me.pos[0], pt[1] - me.pos[1]), pt, None);
+                                }
+                            }
+                        }
                     }
 
                     let mut threats_xy: Vec<[f64; 2]> = mech_cands

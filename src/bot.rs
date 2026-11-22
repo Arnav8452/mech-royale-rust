@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m13-jiggle".to_string(),
+            name: "rust-bot-m13-roof".to_string(),
             config: hello.config,
             map,
             nav,
@@ -148,7 +148,7 @@ impl Bot {
             };
         let climbing_roof = desired_roof_z.is_some_and(|rz| {
             me.pos[2] < rz - 0.8
-                && dist2d(me.pos[0], me.pos[1], goal_pt[0], goal_pt[1]) <= 18.0
+                && dist2d(me.pos[0], me.pos[1], goal_pt[0], goal_pt[1]) <= 26.0
                 && me.energy >= 12.0
         });
 
@@ -263,9 +263,23 @@ impl Bot {
             })
         });
         let jump_charge = me.grounded && moving && laser_charging_now && !aimed_laser_dodge;
-        let roof_jump = climbing_roof && me.grounded;
-        let roof_jet =
-            climbing_roof && !me.grounded && desired_roof_z.is_some_and(|rz| me.pos[2] < rz + 1.0);
+        let near_roof_wall = climbing_roof
+            && (!self
+                .map
+                .is_pos_walkable(
+                    me.pos[0] + goal_dir[0] * 5.0,
+                    me.pos[1] + goal_dir[1] * 5.0,
+                    me.pos[2],
+                    mech_radius,
+                    mech_height,
+                    1.2,
+                )
+                .0
+                || dist2d(me.pos[0], me.pos[1], goal_pt[0], goal_pt[1]) <= 16.0);
+        let roof_jump = near_roof_wall && me.grounded;
+        let roof_jet = near_roof_wall
+            && !me.grounded
+            && desired_roof_z.is_some_and(|rz| me.pos[2] < rz + 1.0);
         let stuck_jump = me.grounded && stuck_active && !climbing_roof;
         if stuck_jump {
             if t - self.world.last_strafe_flip_t > 0.6 {
@@ -2260,7 +2274,8 @@ mod tests {
         obs.self_obs.grounded = true;
         obs.self_obs.hp = 1400.0;
         obs.self_obs.max_hp = 1400.0;
-        obs.self_obs.energy = 80.0;
+        // 50.0 < 58.0 proactive roof-climb threshold exercises ground corner jiggle-peek
+        obs.self_obs.energy = 50.0;
         obs.self_obs.in_zone = true;
         obs.zone.center = [175.0, -110.0];
         obs.zone.next_center = [175.0, -110.0];
@@ -2322,5 +2337,115 @@ mod tests {
             Some(true),
             "CornerPeek flash-peek must boost out around the corner"
         );
+    }
+
+    #[test]
+    fn proactive_roof_seizes_high_building_with_laser_and_jiggle_peeks_parapet() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+
+        // Part 1: On ground North of prism 58 (top=14.71 m, dh ~ 16.5 m) with Laser & 80 energy -> seize roof!
+        let mz_g = bot.map.ground_height(-55.0, -18.0);
+        let ez_g = bot.map.ground_height(-55.0, 60.0);
+        obs.t = 30.0;
+        obs.self_obs.pos = [-55.0, -18.0, mz_g];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1100.0; // < 90% max_hp
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [-55.0, 0.0];
+        obs.zone.next_center = [-55.0, 0.0];
+        obs.zone.radius = 250.0;
+        obs.zone.next_radius = 220.0;
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Laser,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: Some(0.0),
+                stats: bot.config.weapons.laser.clone(),
+            }),
+            Some(WeaponObs {
+                kind: WeaponKind::Lightning,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: None,
+                stats: bot.config.weapons.lightning.clone(),
+            }),
+        ];
+        obs.mechs = vec![ActorObs {
+            id: 99,
+            kind: "mech".into(),
+            pos: [-55.0, 60.0, ez_g],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1400.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+        let a_seize = bot.act(&obs);
+        let (rxy, rz) = bot
+            .world
+            .roof_climb_goal
+            .expect("must proactively seize 9-28 m prism 58 roof when Laser-armed with >= 58 energy");
+        assert!(rz - mz_g >= 9.0 && rz - mz_g <= 28.0);
+        assert!(a_seize.move_dir.unwrap()[1] < -0.5, "must steer South onto prism 58 roof toward {rxy:?}");
+
+        // Part 2: On prism 49 roof parapet (top=25.72 m, solid at x=162): 3D parapet hide -> jiggle peek!
+        let mut bot2 = Bot::new(load_sample_hello_and_obs().0);
+        let roof_z = bot2
+            .map
+            .roof_top_at(162.0, -118.0)
+            .expect("(162, -118) must lie on prism 49 solid roof");
+        let ez2 = bot2.map.ground_height(162.0, -66.0);
+        obs.t = 40.0;
+        obs.zone.center = [162.0, -110.0];
+        obs.zone.next_center = [162.0, -110.0];
+        obs.self_obs.pos = [162.0, -118.0, roof_z];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1200.0;
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.weapons[0].as_mut().unwrap().charge = Some(0.0);
+        obs.mechs = vec![ActorObs {
+            id: 100,
+            kind: "mech".into(),
+            pos: [162.0, -66.0, ez2],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1400.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+        // Phase 1: Exposed near North roof edge at 0 charge -> retreat South behind parapet!
+        let a_hide = bot2.act(&obs);
+        assert_eq!(bot2.strategy.tactic, CombatTactic::CoverDuck);
+        assert!(bot2.strategy.jiggle_precharging);
+        assert!(a_hide.move_dir.unwrap()[1] < -0.3, "must retreat South behind roof parapet to hide");
+
+        // Now tucked 27 m back behind North parapet at (162, -131) -> occluded in 3D, charges Laser, then peeks at 0.60 s!
+        obs.t = 40.2;
+        obs.self_obs.pos = [162.0, -131.0, roof_z];
+        obs.self_obs.weapons[0].as_mut().unwrap().charge = Some(0.0);
+        let a_charge = bot2.act(&obs);
+        assert_eq!(bot2.strategy.tactic, CombatTactic::CoverDuck);
+        assert_eq!(a_charge.fire.unwrap()[0], true, "hidden behind 3D parapet must start Laser charge");
+
+        obs.t = 40.8;
+        obs.self_obs.weapons[0].as_mut().unwrap().charge = Some(0.60);
+        let a_edge = bot2.act(&obs);
+        assert_eq!(
+            bot2.strategy.tactic,
+            CombatTactic::CornerPeek,
+            "at 0.60s charge on roof must flash-peek forward over North parapet"
+        );
+        assert!(a_edge.move_dir.unwrap()[1] > 0.3);
+        assert_eq!(a_edge.boost, Some(true));
     }
 }
