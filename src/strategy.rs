@@ -336,18 +336,23 @@ impl StrategyState {
             }
         }
 
+        let nanites_stacks = me.upgrades.iter().filter(|u| u.as_str() == "nanites").count();
         let winning_or_even_1v1 = los_count == 1 && los_mechs[0].hp <= me.hp + 180.0;
         let enemy_in_face = los_mechs.iter().any(|m| m.dist < 32.0);
-        let want_regen = if self.posture == Posture::EmergencyRegen {
-            !immediate_kill_avail
-                && !enemy_in_face
-                && me.hp < 0.72 * me.max_hp
-                && !(me.hp >= 0.65 * me.max_hp && near_mechs == 0)
+        let want_regen = if nanites_stacks >= 1 {
+            if self.posture == Posture::EmergencyRegen {
+                !immediate_kill_avail
+                    && !enemy_in_face
+                    && me.hp < 0.62 * me.max_hp
+                    && !(me.hp >= 0.56 * me.max_hp && near_mechs == 0)
+            } else {
+                !immediate_kill_avail
+                    && !enemy_in_face
+                    && ((me.hp < 0.42 * me.max_hp && los_count >= 2)
+                        || (me.hp < 0.28 * me.max_hp && near_mechs > 0 && !winning_or_even_1v1))
+            }
         } else {
-            !immediate_kill_avail
-                && !enemy_in_face
-                && ((me.hp < 0.50 * me.max_hp && los_count >= 2)
-                    || (me.hp < 0.30 * me.max_hp && near_mechs > 0 && !winning_or_even_1v1))
+            los_count == 0 && me.hp < 0.24 * me.max_hp
         };
         if want_regen
             && (self
@@ -1012,7 +1017,7 @@ impl StrategyState {
                     let has_lightning = have_lightning;
                     let enemy_has_lightning = e.weapons.contains(&WeaponKind::Lightning);
                     let enemy_has_laser = e.weapons.contains(&WeaponKind::Laser);
-                    let lt_brawl_d = (my_lt_range - 12.0).max(32.0);
+                    let lt_brawl_d = (my_lt_range - 12.0).max(30.0);
                     let base_pref_dist: f64 = if lt_rush_charger {
                         (my_lt_range - 12.0).max(26.0)
                     } else if has_lightning
@@ -1187,8 +1192,8 @@ impl StrategyState {
             [px, py]
         };
 
-        // Near sound hunt (< 60 m): immediate push while healthy
-        if world.is_huntable_sound(obs.t) && world.last_sound_is_near && me.hp >= 0.60 * me.max_hp
+        // Near sound hunt (< 60 m): relentless push down to 42% HP
+        if world.is_huntable_sound(obs.t) && world.last_sound_is_near && me.hp >= 0.42 * me.max_hp
         {
             if let Some(b) = world.last_sound_bearing {
                 let goal = clamp_next_safe(me.pos[0] + b.cos() * 75.0, me.pos[1] + b.sin() * 75.0);
@@ -1254,7 +1259,7 @@ impl StrategyState {
         }
 
         // 15 s hunt memory after enemy leaves 4.5 s tracking
-        if me.hp >= 0.62 * me.max_hp {
+        if me.hp >= 0.42 * me.max_hp {
             if let Some((hpos, _)) = world.last_hunt_pos {
                 let goal = clamp_next_safe(hpos[0], hpos[1]);
                 self.tactic = CombatTactic::AggressivePush;
@@ -1263,8 +1268,8 @@ impl StrategyState {
             }
         }
 
-        // Mid/far sound hunting when healthy
-        if world.is_huntable_sound(obs.t) && me.hp >= 0.62 * me.max_hp {
+        // Mid/far sound hunting down to 42% HP
+        if world.is_huntable_sound(obs.t) && me.hp >= 0.42 * me.max_hp {
             if let Some(b) = world.last_sound_bearing {
                 let hunt_d = match world.last_sound_dist.as_str() {
                     "near" => 75.0,

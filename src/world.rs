@@ -89,6 +89,7 @@ pub(crate) struct WorldState {
     pub cmd_move_streak: u32,
     pub unstuck_air_boost_until: f64,
     pub last_combat_t: f64,
+    pub last_combat_hop_t: f64,
     pub last_scan_dir: f64,
 }
 
@@ -128,6 +129,7 @@ impl WorldState {
             cmd_move_streak: 0,
             unstuck_air_boost_until: -100.0,
             last_combat_t: -100.0,
+            last_combat_hop_t: -100.0,
             last_scan_dir: 1.0,
         }
     }

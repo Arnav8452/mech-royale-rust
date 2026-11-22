@@ -39,7 +39,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m12-pred".to_string(),
+            name: "rust-bot-m12-berserk".to_string(),
             config: hello.config,
             map,
             nav,
@@ -97,7 +97,7 @@ impl Bot {
             }
         }
 
-        let immediate_kill_avail = me.hp > 180.0 && los_mechs.iter().any(|m| m.hp <= 620.0);
+        let immediate_kill_avail = me.hp > 140.0 && los_mechs.iter().any(|m| m.hp <= 780.0);
 
         self.strategy.update_posture(
             &self.map,
@@ -148,12 +148,9 @@ impl Bot {
             stuck_active,
         );
 
-        // Fire back while retreating in plain sight; hold fire once LOS broken or 1.8 s clear
-        let actively_taking_fire = los_mech_count > 0
-            && (t - self.world.last_damage_t < 1.8 || los_mechs.iter().any(|m| m.dist < 50.0));
-        let hold_fire_for_regen = self.strategy.posture == Posture::EmergencyRegen
-            && !immediate_kill_avail
-            && !actively_taking_fire;
+        // Berserker NEVER stops shooting while an enemy mech is in LOS
+        let hold_fire_for_regen =
+            self.strategy.posture == Posture::EmergencyRegen && los_mech_count == 0;
 
         let (fire, mut reload, chosen_aim, debug_aim_target) = if hold_fire_for_regen {
             ([false, false], false, None, None)
@@ -300,6 +297,15 @@ impl Bot {
                     && m.dist > my_lt_range
             });
         let jump_charge = me.grounded && moving && laser_charging_now && !aimed_laser_dodge;
+        let combat_hop = me.grounded
+            && moving
+            && los_mech_count >= 1
+            && (dodged_bullet || t - self.world.last_damage_t <= 0.4)
+            && t - self.world.last_combat_hop_t >= 1.35
+            && los_mechs.iter().all(|m| m.dist >= 34.0);
+        if combat_hop {
+            self.world.last_combat_hop_t = t;
+        }
         let stuck_jump = me.grounded && stuck_active;
         if stuck_jump {
             if t - self.world.last_strafe_flip_t > 0.6 {
@@ -309,7 +315,7 @@ impl Bot {
             self.strategy.cached_path.clear();
             self.world.unstuck_air_boost_until = t + 0.35;
         }
-        let any_jump = stuck_jump || jump_charge || late_laser_evade;
+        let any_jump = stuck_jump || jump_charge || late_laser_evade || combat_hop;
 
         let air_unstuck_boost = !me.grounded
             && me.vel[2] > 0.0
@@ -814,6 +820,7 @@ mod tests {
         obs.self_obs.pos = [86.0, -110.0, mz];
         obs.self_obs.hp = 380.0;
         obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.upgrades.push("nanites".into());
         obs.self_obs.in_zone = true;
         obs.zone.center = [0.0, 0.0];
         obs.zone.radius = 400.0;
@@ -869,6 +876,7 @@ mod tests {
         obs.self_obs.pos = [86.0, -110.0, mz];
         obs.self_obs.hp = 380.0;
         obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.upgrades.push("nanites".into());
         obs.self_obs.in_zone = true;
         obs.zone.center = [0.0, 0.0];
         obs.zone.radius = 400.0;
@@ -2183,5 +2191,76 @@ mod tests {
             Some(false),
             "airborne jump-charge must NOT drain jet energy"
         );
+    }
+
+    #[test]
+    fn berserker_stays_fighting_without_nanites_and_finishes_780hp_target() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(-45.0, 0.0);
+        let ez = bot.map.ground_height(-95.0, 0.0);
+        obs.t = 40.0;
+        obs.self_obs.pos = [-45.0, 0.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 380.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [-45.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [-45.0, 0.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 120.0;
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.self_obs.aim = direct_aim([-45.0, 0.0, mz + 7.0], [-95.0, 0.0, ez + 4.5]);
+        obs.mechs = vec![ActorObs {
+            id: 5,
+            kind: "mech".into(),
+            pos: [-95.0, 0.0, ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1400.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+
+        // 1. Without Nanites at 380 HP (27%), must stay in Combat instead of abandoning fight
+        let act1 = bot.act(&obs);
+        assert_eq!(bot.strategy.posture, Posture::Combat);
+        assert!(
+            act1.fire.unwrap()[0],
+            "without Nanites, Berserker must keep fighting at 380 HP in LOS"
+        );
+
+        // 2. With Nanites at 450 HP against 720 HP target (<= 780 HP), immediate_kill_avail keeps Combat!
+        obs.t = 40.2;
+        obs.self_obs.upgrades.push("nanites".into());
+        obs.self_obs.hp = 450.0;
+        obs.mechs[0].hp = Some(720.0);
+        // Add a second attacker to trigger los_count >= 2 check unless immediate_kill_avail holds
+        let e2z = bot.map.ground_height(-95.0, 20.0);
+        obs.mechs.push(ActorObs {
+            id: 6,
+            kind: "mech".into(),
+            pos: [-95.0, 20.0, e2z],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1400.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        });
+        let act2 = bot.act(&obs);
+        assert_eq!(
+            bot.strategy.posture,
+            Posture::Combat,
+            "with enemy <= 780 HP in LOS, Berserker must stay in Combat even at 450 HP 1v2"
+        );
+        assert!(act2.fire.unwrap()[0]);
     }
 }
