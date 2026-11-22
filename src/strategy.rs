@@ -68,6 +68,9 @@ pub(crate) struct StrategyState {
     pub ambush_anchor: Option<[f64; 2]>,
     pub ambush_anchor_t: f64,
     pub prev_ambush_anchor: Option<[f64; 2]>,
+    pub stealth_anchor: Option<([f64; 2], f64)>,
+    pub stealth_anchor_t: f64,
+    pub prev_stealth_anchor: Option<[f64; 2]>,
     pub explore_goal: Option<[f64; 2]>,
     pub explore_goal_t: f64,
 }
@@ -89,6 +92,9 @@ impl StrategyState {
             ambush_anchor: None,
             ambush_anchor_t: -100.0,
             prev_ambush_anchor: None,
+            stealth_anchor: None,
+            stealth_anchor_t: -100.0,
+            prev_stealth_anchor: None,
             explore_goal: None,
             explore_goal_t: -100.0,
         }
@@ -295,6 +301,76 @@ impl StrategyState {
         self.cover_target
     }
 
+    pub fn ensure_stealth_hideout(
+        &mut self,
+        map: &Map,
+        nav: &NavGrid,
+        world: &WorldState,
+        obs: &Observation,
+        eye_h: f64,
+    ) -> Option<([f64; 2], f64)> {
+        let me = &obs.self_obs;
+        let nc = obs.zone.next_center;
+        let safe_next_r = (obs.zone.next_radius - 16.0).max(0.0);
+        let enemy_eyes: Vec<[f64; 3]> = world
+            .tracked_enemies
+            .values()
+            .filter(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 220.0)
+            .map(|e| [e.pos[0], e.pos[1], e.pos[2] + 7.5])
+            .collect();
+        let sound_dangers = world.sound_dangers(obs.t);
+
+        let mut invalidated_by_threat = false;
+        let still_valid = self.stealth_anchor.is_some_and(|(pt, _)| {
+            let zone_ok = dist2d(pt[0], pt[1], obs.zone.center[0], obs.zone.center[1])
+                <= (obs.zone.radius - 10.0).max(0.0);
+            let next_ok =
+                obs.zone.next_radius <= 28.0 || dist2d(pt[0], pt[1], nc[0], nc[1]) <= safe_next_r;
+            let enemy_close = world
+                .tracked_enemies
+                .values()
+                .any(|e| dist2d(pt[0], pt[1], e.pos[0], e.pos[1]) <= 70.0)
+                || enemy_eyes.iter().any(|e| {
+                    dist2d(pt[0], pt[1], e[0], e[1]) <= 130.0
+                        && map.has_los([pt[0], pt[1], map.ground_height(pt[0], pt[1]) + eye_h], *e)
+                });
+            if enemy_close {
+                invalidated_by_threat = true;
+            }
+            let arrived_or_fresh = dist2d(me.pos[0], me.pos[1], pt[0], pt[1]) <= 8.0
+                || obs.t - self.stealth_anchor_t < 12.0;
+            let sound_ambushed = dist2d(me.pos[0], me.pos[1], pt[0], pt[1]) > 14.0
+                && sound_dangers.iter().any(|&(b, w)| {
+                    w >= 2.5 && {
+                        let d = unit2d(pt[0] - me.pos[0], pt[1] - me.pos[1]);
+                        d[0] * b.cos() + d[1] * b.sin() > 0.55
+                    }
+                });
+            zone_ok && next_ok && !enemy_close && arrived_or_fresh && !sound_ambushed
+        });
+
+        if !still_valid {
+            if invalidated_by_threat {
+                self.prev_stealth_anchor = self.stealth_anchor.map(|(p, _)| p);
+            }
+            self.stealth_anchor = nav.find_stealth_hideout(
+                map,
+                me.pos,
+                eye_h,
+                obs.zone.center,
+                obs.zone.radius,
+                nc,
+                obs.zone.next_radius,
+                &sound_dangers,
+                &enemy_eyes,
+                self.prev_stealth_anchor,
+                175.0,
+            );
+            self.stealth_anchor_t = obs.t;
+        }
+        self.stealth_anchor
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn update_posture(
         &mut self,
@@ -310,6 +386,7 @@ impl StrategyState {
     ) {
         let me = &obs.self_obs;
         let los_count = los_mechs.len();
+        let ghost_mode = obs.alive > 4 && obs.zone.radius > 65.0;
         let dist_next = dist2d(
             me.pos[0],
             me.pos[1],
@@ -317,8 +394,9 @@ impl StrategyState {
             obs.zone.next_center[1],
         );
         let safe_r = (obs.zone.next_radius - 18.0).max(0.0);
+        let rotate_lead = if ghost_mode { 26.0 } else { 20.0 };
 
-        if !me.in_zone || (dist_next > safe_r && obs.t >= obs.zone.shrink_start - 20.0) {
+        if !me.in_zone || (dist_next > safe_r && obs.t >= obs.zone.shrink_start - rotate_lead) {
             self.posture = Posture::ZoneRotate;
             return;
         }
@@ -330,7 +408,16 @@ impl StrategyState {
                 .values()
                 .filter(|e| dist2d(e.pos[0], e.pos[1], drop.pos[0], drop.pos[1]) <= 25.0)
                 .count();
-            if drop.lands_in <= 10.0 && d <= 105.0 && campers == 0 {
+            let drop_ok = if ghost_mode {
+                drop.lands_in <= 5.0
+                    && d <= 55.0
+                    && campers == 0
+                    && near_mechs == 0
+                    && !world.has_recent_near_combat_sound(obs.t, 5.0)
+            } else {
+                drop.lands_in <= 10.0 && d <= 105.0 && campers == 0
+            };
+            if drop_ok {
                 self.posture = Posture::SupplyDrop;
                 return;
             }
@@ -339,7 +426,24 @@ impl StrategyState {
         let regen_delay = stat(&me.stats, "regen_delay", 5.0);
         let winning_or_even_1v1 = los_count == 1 && los_mechs[0].hp <= me.hp + 180.0;
         let enemy_in_face = los_mechs.iter().any(|m| m.dist < 32.0);
-        let want_regen = if self.posture == Posture::EmergencyRegen {
+        let easy_vulture = ghost_mode
+            && los_count == 1
+            && los_mechs[0].hp <= 420.0
+            && me.hp >= 0.70 * me.max_hp;
+        let close_hideout_defense = ghost_mode
+            && los_count == 1
+            && los_mechs[0].dist <= 52.0
+            && me.hp >= 0.65 * me.max_hp
+            && los_mechs[0].hp <= me.hp + 100.0;
+        let want_regen = if ghost_mode {
+            !immediate_kill_avail
+                && !easy_vulture
+                && !close_hideout_defense
+                && !enemy_in_face
+                && ((me.hp < 0.85 * me.max_hp
+                    && (near_mechs > 0 || self.posture == Posture::EmergencyRegen))
+                    || (los_count >= 2 && me.hp < 0.90 * me.max_hp))
+        } else if self.posture == Posture::EmergencyRegen {
             !immediate_kill_avail
                 && !enemy_in_face
                 && me.hp < 0.80 * me.max_hp
@@ -391,7 +495,7 @@ impl StrategyState {
             return;
         }
 
-        if self.find_best_supply_drop(world, obs, los_mechs).is_some() {
+        if !ghost_mode && self.find_best_supply_drop(world, obs, los_mechs).is_some() {
             self.posture = Posture::SupplyDrop;
             return;
         }
@@ -401,10 +505,12 @@ impl StrategyState {
             return;
         }
 
-        if world
-            .tracked_enemies
-            .values()
-            .any(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 220.0)
+        let combat_detect_r = if ghost_mode { 140.0 } else { 220.0 };
+        if los_count > 0
+            || world
+                .tracked_enemies
+                .values()
+                .any(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= combat_detect_r)
         {
             self.posture = Posture::Combat;
             return;
@@ -440,6 +546,7 @@ impl StrategyState {
         let my_ground = map.ground_height(me.pos[0], me.pos[1]);
         let on_roof =
             me.pos[2] > my_ground + 3.5 && map.roof_top_at(me.pos[0], me.pos[1]).is_some();
+        let ghost_mode = obs.alive > 4 && obs.zone.radius > 65.0;
 
         if let Some((_, rz)) = world.roof_climb_goal {
             let climb_timeout = if rz - my_ground > 26.0 { 4.8 } else { 3.6 };
@@ -460,7 +567,14 @@ impl StrategyState {
                 self.tactic = CombatTactic::None;
                 self.peek_target = None;
                 world.orbit_active_1v1 = false;
-                return (unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]), nc, None);
+                let target = if ghost_mode {
+                    self.ensure_stealth_hideout(map, nav, world, obs, eye_h)
+                        .map(|(p, _)| p)
+                        .unwrap_or(nc)
+                } else {
+                    nc
+                };
+                return (unit2d(target[0] - me.pos[0], target[1] - me.pos[1]), target, None);
             }
             Posture::EmergencyRegen => {
                 if let Some((rxy, rz)) = world.roof_climb_goal {
@@ -657,6 +771,7 @@ impl StrategyState {
                     && obs.t >= world.roof_climb_cooldown_until
                     && !immediate_kill_avail
                     && !lt_rush_charger
+                    && (!ghost_mode || los_mech_count >= 1)
                     && (los_mech_count >= 2
                         || combat_enemy.is_some_and(|e| e.dist > my_lt_range + 4.0)
                         || (los_mech_count == 0 && !world.tracked_enemies.is_empty()))
@@ -835,8 +950,8 @@ impl StrategyState {
                         }
                     }
 
-                    // 3. Active Roof-Rim 1v1 Hunting when no enemy currently in LOS on roof
-                    if los_mech_count == 0 && me.hp >= 0.72 * me.max_hp {
+                    // 3. Active Roof-Rim 1v1 Hunting when no enemy currently in LOS on roof (endgame only)
+                    if !ghost_mode && los_mech_count == 0 && me.hp >= 0.72 * me.max_hp {
                         if let Some((pid, pe)) = world.closest_tracked_enemy_within(me.pos, 220.0) {
                             let pe_pos = pe.pos;
                             let primary_eye = [pe_pos[0], pe_pos[1], pe_pos[2] + 7.5];
@@ -896,6 +1011,9 @@ impl StrategyState {
                                 return (unit2d(g[0] - me.pos[0], g[1] - me.pos[1]), g, None);
                             }
                         }
+                    } else if ghost_mode && los_mech_count == 0 {
+                        self.tactic = CombatTactic::CoverDuck;
+                        return ([0.0, 0.0], me_xy, None);
                     }
 
                     // 4. Smooth Roof-Edge Strafe in 1v1
@@ -986,11 +1104,19 @@ impl StrategyState {
         let nc = obs.zone.next_center;
         let safe_r = (obs.zone.next_radius - 18.0).max(0.0);
         let dist_next = dist2d(me.pos[0], me.pos[1], nc[0], nc[1]);
+        let ghost_mode = obs.alive > 4 && obs.zone.radius > 65.0;
 
         match self.posture {
             Posture::ZoneRotate => {
-                let wp = self.follow_astar(nav, scratch, me_xy, nc, obs.t);
-                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), nc);
+                let target = if ghost_mode {
+                    self.ensure_stealth_hideout(map, nav, world, obs, eye_h)
+                        .map(|(p, _)| p)
+                        .unwrap_or(nc)
+                } else {
+                    nc
+                };
+                let wp = self.follow_astar(nav, scratch, me_xy, target, obs.t);
+                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), target);
             }
             Posture::EmergencyRegen => {
                 if let Some(cp) = self.ensure_regen_cover(map, nav, world, obs, eye_h, los_mech_count)
@@ -1145,9 +1271,41 @@ impl StrategyState {
                     && los_mechs.iter().any(|e| e.charging);
 
                 let near_cover_14 = nav.has_near_cover_within(me.pos, 14.0);
+                let easy_vulture = ghost_mode
+                    && los_mech_count == 1
+                    && los_mechs[0].hp <= 420.0
+                    && me.hp >= 0.70 * me.max_hp;
+                let close_hideout_defense = ghost_mode
+                    && los_mech_count == 1
+                    && los_mechs[0].dist <= 52.0
+                    && me.hp >= 0.65 * me.max_hp
+                    && los_mechs[0].hp <= me.hp + 100.0;
+                let ghost_retreat =
+                    ghost_mode && !immediate_kill_avail && !easy_vulture && !close_hideout_defense;
+
+                if ghost_retreat && los_mech_count == 0 {
+                    if near_cover_14
+                        || self.combat_cover_target.is_some_and(|cp| {
+                            dist2d(me.pos[0], me.pos[1], cp[0], cp[1]) <= 6.5
+                        })
+                    {
+                        self.tactic = CombatTactic::CoverDuck;
+                        return ([0.0, 0.0], self.combat_cover_target.unwrap_or(me_xy));
+                    }
+                    if let Some((pt, _)) = self.ensure_stealth_hideout(map, nav, world, obs, eye_h)
+                    {
+                        self.tactic = CombatTactic::CoverDuck;
+                        if dist2d(me.pos[0], me.pos[1], pt[0], pt[1]) <= 4.5 {
+                            return ([0.0, 0.0], pt);
+                        }
+                        let wp = self.follow_astar(nav, scratch, me_xy, pt, obs.t);
+                        return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), pt);
+                    }
+                }
 
                 // A. Mid-Combat Power Cube Magnet: free +4% max HP heal & +4% dmg mid-fight
                 if !enemy_laser_duck
+                    && !ghost_retreat
                     && los_mech_count <= 1
                     && !(no_weapon_can_shoot_now && los_mech_count >= 1)
                 {
@@ -1189,10 +1347,11 @@ impl StrategyState {
                     }
                 }
 
-                // 1. CoverDuck: outnumbered (2+ LOS), dry/reloading, or enemy charging laser
+                // 1. CoverDuck: outnumbered (2+ LOS), dry/reloading, enemy charging laser, or Ghost stealth disengage
                 if (los_mech_count >= 2 && !immediate_kill_avail)
                     || (no_weapon_can_shoot_now && !immediate_kill_avail)
                     || enemy_laser_duck
+                    || ghost_retreat
                 {
                     if los_mech_count == 0
                         && (near_cover_14
@@ -1493,21 +1652,27 @@ impl StrategyState {
             Posture::EarlyFarm => {}
         }
 
-        // EarlyFarm / fallback: cubes -> farm_target -> crates -> zone -> near sounds -> 50 m unvisited snowball -> 15 s hunt -> mid/far sounds -> sweep
+        // EarlyFarm / fallback: cubes -> farm_target -> crates -> (Ghost stealth alcove OR Endgame Closer hunt/sweep)
         let regen_delay = stat(&me.stats, "regen_delay", 5.0);
         let protecting_regen = me.hp < 0.85 * me.max_hp
             && (obs.t - world.last_combat_t) >= (regen_delay - 2.0).max(1.5)
             && (obs.t - world.last_combat_t) <= regen_delay + 12.0;
         let want_farm_cubes =
             (me.cubes as f64) < config.cubes.stat_cap || (13..15).contains(&me.cubes);
+        let near_mechs_90 = world
+            .tracked_enemies
+            .values()
+            .filter(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 90.0)
+            .count();
+        let cube_max_d = if ghost_mode { 55.0 } else { 85.0 };
 
-        if me.cubes < 15 {
+        if me.cubes < 15 && (!ghost_mode || near_mechs_90 == 0) {
             if let Some(cube) = obs
                 .cubes
                 .iter()
                 .filter(|c| {
                     is_ground_level(map, c.pos)
-                        && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 85.0
+                        && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= cube_max_d
                         && dist2d(c.pos[0], c.pos[1], nc[0], nc[1]) <= obs.zone.next_radius - 5.0
                 })
                 .min_by(|a, b| {
@@ -1536,9 +1701,18 @@ impl StrategyState {
             }
         }
 
+        let crate_allowed = if ghost_mode {
+            obs.t < 50.0
+                && me.cubes < 6
+                && near_mechs_90 == 0
+                && !world.has_recent_near_combat_sound(obs.t, 5.0)
+                && me.hp > 0.75 * me.max_hp
+        } else {
+            me.hp > 0.45 * me.max_hp
+        };
         if want_farm_cubes
-            && me.hp > 0.45 * me.max_hp
-            && obs.t - world.last_damage_t > 2.5
+            && crate_allowed
+            && obs.t - world.last_mech_damage_t > 2.5
             && !protecting_regen
         {
             if let Some(cr) = obs
@@ -1563,6 +1737,16 @@ impl StrategyState {
             }
         }
 
+        if ghost_mode {
+            if let Some((pt, _)) = self.ensure_stealth_hideout(map, nav, world, obs, eye_h) {
+                if dist2d(me.pos[0], me.pos[1], pt[0], pt[1]) <= 4.5 {
+                    return ([0.0, 0.0], pt);
+                }
+                let wp = self.follow_astar(nav, scratch, me_xy, pt, obs.t);
+                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), pt);
+            }
+        }
+
         if dist_next > safe_r * 0.65 {
             let wp = self.follow_astar(nav, scratch, me_xy, nc, obs.t);
             return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), nc);
@@ -1584,8 +1768,11 @@ impl StrategyState {
             [px, py]
         };
 
-        // Near sound hunt (< 60 m): immediate push while healthy
-        if world.is_huntable_sound(obs.t) && world.last_sound_is_near && me.hp >= 0.60 * me.max_hp
+        // Near sound hunt (< 60 m): immediate push while healthy (endgame only)
+        if !ghost_mode
+            && world.is_huntable_sound(obs.t)
+            && world.last_sound_is_near
+            && me.hp >= 0.60 * me.max_hp
         {
             if let Some(b) = world.last_sound_bearing {
                 let goal = clamp_next_safe(me.pos[0] + b.cos() * 75.0, me.pos[1] + b.sin() * 75.0);
@@ -1595,8 +1782,8 @@ impl StrategyState {
             }
         }
 
-        // Early-game 50 m unvisited-grid cube snowball until stat_cap (10 cubes) + 13..14 -> 15 upgrade exception
-        if want_farm_cubes && obs.t < 200.0 {
+        // Early-game 50 m unvisited-grid cube snowball (endgame only when <= 4 alive or small circle)
+        if !ghost_mode && want_farm_cubes && obs.t < 200.0 {
             let explore_invalid = self.explore_goal.is_none_or(|g| {
                 obs.zone.next_radius > 24.0
                     && dist2d(g[0], g[1], nc[0], nc[1]) > (obs.zone.next_radius - 16.0).max(0.0)
@@ -1650,8 +1837,8 @@ impl StrategyState {
             }
         }
 
-        // 15 s hunt memory after enemy leaves 4.5 s tracking
-        if me.hp >= 0.62 * me.max_hp {
+        // 15 s hunt memory after enemy leaves 4.5 s tracking (endgame only)
+        if !ghost_mode && me.hp >= 0.62 * me.max_hp {
             if let Some((hpos, _)) = world.last_hunt_pos {
                 let goal = clamp_next_safe(hpos[0], hpos[1]);
                 self.tactic = CombatTactic::AggressivePush;
@@ -1660,8 +1847,8 @@ impl StrategyState {
             }
         }
 
-        // Mid/far sound hunting when healthy
-        if world.is_huntable_sound(obs.t) && me.hp >= 0.62 * me.max_hp {
+        // Mid/far sound hunting when healthy (endgame only)
+        if !ghost_mode && world.is_huntable_sound(obs.t) && me.hp >= 0.62 * me.max_hp {
             if let Some(b) = world.last_sound_bearing {
                 let hunt_d = match world.last_sound_dist.as_str() {
                     "near" => 75.0,
@@ -1803,7 +1990,23 @@ impl StrategyState {
         los_mechs: &[&TargetCandidate],
     ) -> Option<[f64; 3]> {
         let me = &obs.self_obs;
+        let ghost_mode = obs.alive > 4 && obs.zone.radius > 65.0;
+        let close_los_enemy = los_mechs.iter().any(|m| m.dist < 60.0);
+        let any_los_enemy = !los_mechs.is_empty();
+        if ghost_mode
+            && (any_los_enemy
+                || world.has_recent_near_combat_sound(obs.t, 4.0)
+                || world
+                    .tracked_enemies
+                    .values()
+                    .any(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 90.0))
+        {
+            return None;
+        }
         let slot1_empty = me.weapons.get(1).and_then(|w| w.as_ref()).is_none();
+        if ghost_mode && !slot1_empty && obs.t >= 60.0 {
+            return None;
+        }
         let have_lightning = me
             .weapons
             .iter()
@@ -1818,9 +2021,15 @@ impl StrategyState {
         let seeking_upgrade =
             !have_lightning || (!have_laser && !(have_lightning && gun_upgrades >= 2));
 
-        let close_los_enemy = los_mechs.iter().any(|m| m.dist < 60.0);
-        let any_los_enemy = !los_mechs.is_empty();
-        let max_seek_d = if slot1_empty {
+        let max_seek_d = if ghost_mode {
+            if slot1_empty && obs.t < 45.0 {
+                160.0
+            } else if seeking_upgrade {
+                85.0
+            } else {
+                40.0
+            }
+        } else if slot1_empty {
             210.0
         } else if seeking_upgrade {
             140.0

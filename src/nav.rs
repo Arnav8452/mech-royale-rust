@@ -65,6 +65,8 @@ pub struct NavGrid {
     pub ny: usize,
     pub walkable: Vec<bool>,
     pub near_cover: Vec<bool>,
+    pub concealment: Vec<u8>,
+    pub open_yaw: Vec<f32>,
     pub ground_z: Vec<f32>,
     step_up: f64,
     max_slope_tan: f64,
@@ -87,6 +89,9 @@ impl NavGrid {
 
         let mut walkable = vec![false; total];
         let mut near_cover = vec![false; total];
+        let mut tall_wall = vec![false; total];
+        let mut concealment = vec![0u8; total];
+        let mut open_yaw = vec![0.0_f32; total];
         let mut ground_z = vec![0.0_f32; total];
 
         for cy in 0..ny {
@@ -99,6 +104,9 @@ impl NavGrid {
                 let idx = cy * nx + cx;
                 walkable[idx] = ok;
                 ground_z[idx] = surf_z as f32;
+                if !ok {
+                    tall_wall[idx] = map.roof_top_at(wx, wy).is_some_and(|rt| rt >= gz + 8.0);
+                }
             }
         }
 
@@ -131,6 +139,49 @@ impl NavGrid {
             }
         }
 
+        let rays: [(f64, f64); 16] = std::array::from_fn(|k| {
+            let a = (k as f64) * (std::f64::consts::PI / 8.0);
+            (a.cos(), a.sin())
+        });
+        for cy in 0..ny {
+            for cx in 0..nx {
+                let idx = cy * nx + cx;
+                if !walkable[idx] || !near_cover[idx] {
+                    continue;
+                }
+                let mut blocked = 0u8;
+                let mut open_sx = 0.0_f64;
+                let mut open_sy = 0.0_f64;
+                for &(dx, dy) in &rays {
+                    let mut hit = false;
+                    for s in 1..=16 {
+                        let tx = (cx as f64 + dx * (s as f64)).round() as isize;
+                        let ty = (cy as f64 + dy * (s as f64)).round() as isize;
+                        if tx < 0 || tx >= nx as isize || ty < 0 || ty >= ny as isize {
+                            hit = true;
+                            break;
+                        }
+                        if tall_wall[ty as usize * nx + tx as usize] {
+                            hit = true;
+                            break;
+                        }
+                    }
+                    if hit {
+                        blocked += 1;
+                    } else {
+                        open_sx += dx;
+                        open_sy += dy;
+                    }
+                }
+                concealment[idx] = blocked;
+                open_yaw[idx] = if open_sx.hypot(open_sy) > 1e-4 {
+                    open_sy.atan2(open_sx) as f32
+                } else {
+                    0.0
+                };
+            }
+        }
+
         Self {
             cell,
             origin_x,
@@ -139,6 +190,8 @@ impl NavGrid {
             ny,
             walkable,
             near_cover,
+            concealment,
+            open_yaw,
             ground_z,
             step_up,
             max_slope_tan: max_slope_deg.to_radians().tan(),
@@ -654,6 +707,157 @@ impl NavGrid {
         }
 
         best.map(|(_, pt)| pt)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_stealth_hideout(
+        &self,
+        map: &Map,
+        me_pos: [f64; 3],
+        eye_h: f64,
+        zone_center: [f64; 2],
+        zone_radius: f64,
+        next_center: [f64; 2],
+        next_radius: f64,
+        sound_dangers: &[(f64, f64)],
+        enemy_eyes: &[[f64; 3]],
+        avoid_prev: Option<[f64; 2]>,
+        max_dist_from_me: f64,
+    ) -> Option<([f64; 2], f64)> {
+        let safe_zone_r = (zone_radius - 10.0).max(0.0);
+        let safe_next_r = (next_radius - 18.0).max(0.0);
+        let in_next_safe = next_radius <= 28.0
+            || (me_pos[0] - next_center[0]).hypot(me_pos[1] - next_center[1]) <= safe_next_r;
+
+        let ((sx, sy), r_cells) = if in_next_safe {
+            (
+                (me_pos[0], me_pos[1]),
+                ((max_dist_from_me / self.cell).ceil() as isize).clamp(8, 56),
+            )
+        } else {
+            let rx = me_pos[0] - next_center[0];
+            let ry = me_pos[1] - next_center[1];
+            let rlen = rx.hypot(ry);
+            let (ux, uy) = if rlen > 1e-4 {
+                (rx / rlen, ry / rlen)
+            } else {
+                (1.0, 0.0)
+            };
+            (
+                (
+                    next_center[0] + ux * safe_next_r * 0.65,
+                    next_center[1] + uy * safe_next_r * 0.65,
+                ),
+                ((safe_next_r.min(220.0) / self.cell).ceil() as isize).clamp(10, 56),
+            )
+        };
+
+        let (scx, scy) = self.world_to_cell(sx, sy);
+        let x0 = (scx as isize - r_cells).max(0) as usize;
+        let x1 = (scx as isize + r_cells).min((self.nx - 1) as isize) as usize;
+        let y0 = (scy as isize - r_cells).max(0) as usize;
+        let y1 = (scy as isize + r_cells).min((self.ny - 1) as isize) as usize;
+
+        let mut cands: Vec<(f64, usize, [f64; 2])> = Vec::with_capacity(64);
+
+        for cy in (y0..=y1).step_by(2) {
+            for cx in (x0..=x1).step_by(2) {
+                let idx = cy * self.nx + cx;
+                if !self.walkable[idx] || !self.near_cover[idx] {
+                    continue;
+                }
+                let cz = self.ground_z[idx] as f64;
+                if (cz - me_pos[2]).abs() > 24.0 {
+                    continue;
+                }
+                let mut walk_8 = 0u8;
+                for dy in -1_isize..=1 {
+                    for dx in -1_isize..=1 {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        let ncx = cx as isize + dx;
+                        let ncy = cy as isize + dy;
+                        if ncx >= 0
+                            && ncx < self.nx as isize
+                            && ncy >= 0
+                            && ncy < self.ny as isize
+                            && self.walkable[ncy as usize * self.nx + ncx as usize]
+                        {
+                            walk_8 += 1;
+                        }
+                    }
+                }
+                if walk_8 < 3 {
+                    continue;
+                }
+
+                let w = self.cell_to_world(cx, cy);
+                let d_me = (w[0] - me_pos[0]).hypot(w[1] - me_pos[1]);
+                if in_next_safe && d_me > max_dist_from_me {
+                    continue;
+                }
+                if (w[0] - zone_center[0]).hypot(w[1] - zone_center[1]) > safe_zone_r {
+                    continue;
+                }
+                let d_next = (w[0] - next_center[0]).hypot(w[1] - next_center[1]);
+                if next_radius > 28.0 && d_next > safe_next_r {
+                    continue;
+                }
+
+                let mut score = 8.5 * (self.concealment[idx] as f64) - 0.28 * d_me;
+                if next_radius >= 65.0 && d_next >= 0.35 * safe_next_r && d_next <= 0.92 * safe_next_r
+                {
+                    score += 14.0;
+                }
+                if d_me > 8.0 {
+                    let dx = (w[0] - me_pos[0]) / d_me;
+                    let dy = (w[1] - me_pos[1]) / d_me;
+                    for &(bearing, weight) in sound_dangers {
+                        let dot = dx * bearing.cos() + dy * bearing.sin();
+                        if dot > 0.30 {
+                            score -= 32.0 * weight * dot;
+                        }
+                    }
+                }
+                for e in enemy_eyes {
+                    let de = (w[0] - e[0]).hypot(w[1] - e[1]);
+                    if de < 110.0 {
+                        score -= 1.8 * (110.0 - de);
+                    }
+                }
+                if let Some(prev) = avoid_prev {
+                    if (w[0] - prev[0]).hypot(w[1] - prev[1]) < 35.0 {
+                        score -= 90.0;
+                    }
+                }
+
+                cands.push((score, idx, w));
+            }
+        }
+
+        if cands.is_empty() {
+            return None;
+        }
+        cands.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+        cands.truncate(16);
+
+        let mut best: Option<(f64, usize, [f64; 2])> = None;
+        for (mut score, idx, w) in cands {
+            if !enemy_eyes.is_empty() {
+                let eye = [w[0], w[1], self.ground_z[idx] as f64 + eye_h];
+                for e in enemy_eyes {
+                    if map.has_los(eye, *e) {
+                        score -= 160.0;
+                    }
+                }
+            }
+            if best.is_none_or(|(bs, _, _)| score > bs) {
+                best = Some((score, idx, w));
+            }
+        }
+
+        best.map(|(_, idx, w)| (w, self.open_yaw[idx] as f64))
     }
 
     #[allow(clippy::too_many_arguments)]

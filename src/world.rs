@@ -64,6 +64,7 @@ pub(crate) struct WorldState {
     pub blacklisted_pickups: HashMap<u64, f64>,
     pub last_damage_bearing: Option<f64>,
     pub last_damage_t: f64,
+    pub last_mech_damage_t: f64,
     pub last_damage_by: Option<u64>,
     pub last_target_id: Option<u64>,
     pub last_sound_bearing: Option<f64>,
@@ -72,6 +73,7 @@ pub(crate) struct WorldState {
     pub last_sound_is_near: bool,
     pub last_sound_kind: String,
     pub last_sound_dist: String,
+    pub recent_sounds: VecDeque<(f64, f64, f64)>,
     pub last_move: [f64; 2],
     pub strafe_sign: f64,
     pub last_strafe_flip_t: f64,
@@ -104,6 +106,7 @@ impl WorldState {
             blacklisted_pickups: HashMap::new(),
             last_damage_bearing: None,
             last_damage_t: -100.0,
+            last_mech_damage_t: -100.0,
             last_damage_by: None,
             last_target_id: None,
             last_sound_bearing: None,
@@ -112,6 +115,7 @@ impl WorldState {
             last_sound_is_near: false,
             last_sound_kind: String::new(),
             last_sound_dist: String::new(),
+            recent_sounds: VecDeque::with_capacity(24),
             last_move: [0.0, 0.0],
             strafe_sign,
             last_strafe_flip_t: -100.0,
@@ -167,7 +171,12 @@ impl WorldState {
                     if let Some(b) = bearing {
                         self.last_damage_bearing = Some(*b);
                         self.last_damage_t = t;
-                        self.last_damage_by = *by;
+                    }
+                    if weapon != "npc" && weapon != "zone" {
+                        self.last_mech_damage_t = t;
+                        if by.is_some() {
+                            self.last_damage_by = *by;
+                        }
                     }
                     if weapon == "gun" || weapon == "npc" {
                         if self.orbit_active_1v1 {
@@ -388,7 +397,30 @@ impl WorldState {
             self.last_sound_priority = 0.0;
             self.last_sound_is_near = false;
         }
+        self.recent_sounds.retain(|(st, _, _)| t - *st <= 7.0);
         for s in &obs.sounds {
+            if matches!(
+                s.kind.as_str(),
+                "gun"
+                    | "laser"
+                    | "laser_charge"
+                    | "lightning"
+                    | "mortar"
+                    | "explosion"
+                    | "boost"
+                    | "jet"
+                    | "step"
+            ) {
+                let w = match s.dist.as_str() {
+                    "near" => 3.0,
+                    "mid" => 1.2,
+                    _ => 0.25,
+                };
+                if self.recent_sounds.len() >= 24 {
+                    self.recent_sounds.pop_front();
+                }
+                self.recent_sounds.push_back((t - s.age, s.bearing, w));
+            }
             if s.kind == "reload" {
                 let mut best_match: Option<(f64, u64)> = None;
                 for (&id, e) in &self.tracked_enemies {
@@ -514,5 +546,19 @@ impl WorldState {
                     | "boost"
                     | "reload"
             )
+    }
+
+    pub fn has_recent_near_combat_sound(&self, t: f64, window_s: f64) -> bool {
+        self.recent_sounds
+            .iter()
+            .any(|&(st, _, w)| t - st <= window_s && w >= 2.5)
+    }
+
+    pub fn sound_dangers(&self, t: f64) -> Vec<(f64, f64)> {
+        self.recent_sounds
+            .iter()
+            .filter(|&&(st, _, _)| t - st <= 7.0)
+            .map(|&(_, b, w)| (b, w))
+            .collect()
     }
 }

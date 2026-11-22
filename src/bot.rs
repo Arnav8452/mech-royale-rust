@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m14-skyking".to_string(),
+            name: "rust-bot-m15-ghost".to_string(),
             config: hello.config,
             map,
             nav,
@@ -161,37 +161,52 @@ impl Bot {
             && !immediate_kill_avail
             && !actively_taking_fire;
 
-        let (fire, mut reload, chosen_aim, debug_aim_target) = if hold_fire_for_regen {
-            ([false, false], false, None, None)
-        } else if let Some(ref tgt) = combat_target {
-            combat::eval_combat(
-                &self.map,
-                &self.config,
-                obs,
-                muzzle,
-                mech_radius,
-                min_pitch,
-                max_pitch,
-                &mech_cands,
-                tgt,
-            )
-        } else {
-            let (pre_fire, pre_aim) = combat::eval_precharge_laser(
-                obs,
-                &self.config,
-                &self.world,
-                muzzle,
-                min_pitch,
-                max_pitch,
-                self.strategy.peek_target,
-                los_mech_count,
-            );
-            (pre_fire, false, pre_aim, None)
-        };
+        let ghost_mode = obs.alive > 4 && obs.zone.radius > 65.0;
+        let enemy_alert_or_close = (t - self.world.last_mech_damage_t <= 3.5)
+            || los_mechs.iter().any(|m| {
+                let dir_m_to_me = (me.pos[1] - m.pos[1]).atan2(me.pos[0] - m.pos[0]);
+                let looking_at_me = crate::geom::angle_diff(m.aim[0], dir_m_to_me).abs() <= 0.62;
+                m.dist <= 55.0
+                    || m.charging
+                    || looking_at_me
+                    || (los_mech_count == 1 && m.hp <= 420.0 && me.hp >= 0.70 * me.max_hp)
+            });
+        let hold_fire_stealth = ghost_mode && primary_mech.is_some() && !enemy_alert_or_close;
+        let allow_new_laser_charge = !climbing_roof
+            && !(self.strategy.posture == Posture::EmergencyRegen && !immediate_kill_avail)
+            && !(self.strategy.tactic == CombatTactic::CoverDuck
+                && (los_mech_count >= 2 || ghost_mode)
+                && !immediate_kill_avail);
 
-        if fire[0] || fire[1] {
-            self.world.last_combat_t = t;
-        }
+        let (fire, mut reload, chosen_aim, debug_aim_target) =
+            if hold_fire_for_regen || hold_fire_stealth {
+                ([false, false], false, None, None)
+            } else if let Some(ref tgt) = combat_target {
+                combat::eval_combat(
+                    &self.map,
+                    &self.config,
+                    obs,
+                    muzzle,
+                    mech_radius,
+                    min_pitch,
+                    max_pitch,
+                    &mech_cands,
+                    tgt,
+                    allow_new_laser_charge,
+                )
+            } else {
+                let (pre_fire, pre_aim) = combat::eval_precharge_laser(
+                    obs,
+                    &self.config,
+                    &self.world,
+                    muzzle,
+                    min_pitch,
+                    max_pitch,
+                    self.strategy.peek_target,
+                    los_mech_count,
+                );
+                (pre_fire, false, pre_aim, None)
+            };
 
         // Cover-reload discipline & safe open reload
         let near_mech_100 = self
@@ -210,7 +225,7 @@ impl Bot {
         }
 
         // Context Steering
-        let (move_dir, dodged_hazard, aimed_laser_dodge, dodged_bullet) = steering::steer(
+        let (mut move_dir, dodged_hazard, aimed_laser_dodge, dodged_bullet) = steering::steer(
             &self.map,
             &self.nav,
             &self.config,
@@ -223,9 +238,36 @@ impl Bot {
             climbing_roof,
             ducking_to_cover,
         );
+
+        let stealth_quiet = ghost_mode
+            && los_mech_count == 0
+            && me.in_zone
+            && !climbing_roof
+            && !dodged_hazard
+            && !dodged_bullet
+            && !aimed_laser_dodge
+            && self.strategy.posture != Posture::ZoneRotate;
+        if stealth_quiet {
+            let near_hideout = self
+                .strategy
+                .stealth_anchor
+                .is_some_and(|(pt, _)| dist2d(me.pos[0], me.pos[1], pt[0], pt[1]) <= 22.0);
+            if self.world.has_recent_near_combat_sound(t, 6.0) || near_hideout {
+                let walk_spd = stat(&me.stats, "walk_speed", 11.7).max(5.5);
+                let silent_scale =
+                    ((self.config.sound.step_speed - 0.45) / walk_spd).clamp(0.25, 0.40);
+                let mlen = move_dir[0].hypot(move_dir[1]);
+                if mlen > silent_scale {
+                    move_dir = [
+                        move_dir[0] / mlen * silent_scale,
+                        move_dir[1] / mlen * silent_scale,
+                    ];
+                }
+            }
+        }
         self.world.last_move = move_dir;
 
-        // Rear-armor shielding & active 360° scanning (including while hidden in EmergencyRegen)
+        // Rear-armor shielding, alcove entrance-watching & active 360° scanning
         let final_aim = if let Some(aim) = chosen_aim {
             aim
         } else if t - self.world.last_damage_t <= 2.2 {
@@ -234,6 +276,15 @@ impl Bot {
             } else {
                 [me.aim[0], 0.0]
             }
+        } else if ghost_mode
+            && los_mech_count == 0
+            && self
+                .strategy
+                .stealth_anchor
+                .is_some_and(|(pt, _)| dist2d(me.pos[0], me.pos[1], pt[0], pt[1]) <= 6.5)
+        {
+            let (_, open_yaw) = self.strategy.stealth_anchor.unwrap();
+            [wrap_angle(open_yaw + 0.55 * (t * 0.9).sin()), 0.0]
         } else if self.strategy.posture == Posture::EmergencyRegen
             && (los_mech_count > 0 || t - self.world.last_damage_t <= 1.5)
         {
@@ -309,7 +360,8 @@ impl Bot {
             && me.energy > 45.0
             && !saving_for_lightning;
 
-        let ground_boost = me.grounded
+        let ground_boost = !stealth_quiet
+            && me.grounded
             && moving
             && ((!me.in_zone && me.energy > 5.0)
                 || (aimed_laser_dodge && me.energy > 25.0)
@@ -901,6 +953,7 @@ mod tests {
         let (hello, mut obs) = load_sample_hello_and_obs();
         let mut bot = Bot::new(hello);
         obs.t = 45.0;
+        obs.alive = 3;
         let mz = bot.map.ground_height(0.0, 0.0);
         obs.self_obs.pos = [0.0, 0.0, mz];
         obs.self_obs.hp = 1400.0;
@@ -948,6 +1001,7 @@ mod tests {
         let (hello, mut obs) = load_sample_hello_and_obs();
         let mut bot = Bot::new(hello);
         obs.t = 45.0;
+        obs.alive = 3;
         let mz = bot.map.ground_height(0.0, 0.0);
         obs.self_obs.pos = [0.0, 0.0, mz];
         obs.self_obs.hp = 1400.0;
@@ -1272,6 +1326,7 @@ mod tests {
         let (hello, mut obs) = load_sample_hello_and_obs();
         let mut bot = Bot::new(hello);
         obs.t = 40.0;
+        obs.alive = 3;
         let mz = bot.map.ground_height(0.0, 0.0);
         let ez = bot.map.ground_height(35.0, 0.0);
         obs.self_obs.pos = [0.0, 0.0, mz];
@@ -1314,6 +1369,7 @@ mod tests {
         let (hello, mut obs) = load_sample_hello_and_obs();
         let mut bot = Bot::new(hello);
         obs.t = 45.0;
+        obs.alive = 3;
         let mz = bot.map.ground_height(0.0, 0.0);
         obs.self_obs.pos = [0.0, 0.0, mz];
         obs.self_obs.hp = 1400.0;
@@ -1366,6 +1422,8 @@ mod tests {
         let (hello, mut obs) = load_sample_hello_and_obs();
         let mut bot = Bot::new(hello);
         obs.t = 40.0;
+        obs.alive = 3;
+        obs.alive = 3;
         let mz = bot.map.ground_height(0.0, 0.0);
         obs.self_obs.pos = [0.0, 0.0, mz];
         obs.self_obs.hp = 1400.0;
@@ -1405,6 +1463,7 @@ mod tests {
         let mut bot = Bot::new(hello);
         bot.world.last_combat_t = 37.0;
         obs.t = 40.0;
+        obs.alive = 3;
         let mz = bot.map.ground_height(0.0, 0.0);
         let cz = bot.map.ground_height(15.0, 0.0);
         obs.self_obs.pos = [0.0, 0.0, mz];
@@ -1620,6 +1679,7 @@ mod tests {
         let (hello, mut obs) = load_sample_hello_and_obs();
         let mut bot = Bot::new(hello);
         obs.t = 40.0;
+        obs.alive = 3;
         let mz = bot.map.ground_height(0.0, 0.0);
         let cz = bot.map.ground_height(0.0, 10.0);
         let ez = bot.map.ground_height(55.0, 0.0);
@@ -1669,6 +1729,7 @@ mod tests {
         let (hello, mut obs) = load_sample_hello_and_obs();
         let mut bot = Bot::new(hello);
         obs.t = 70.0;
+        obs.alive = 3;
         let mz = bot.map.ground_height(0.0, 0.0);
         let dz = bot.map.ground_height(20.0, 0.0);
         obs.self_obs.pos = [0.0, 0.0, mz];
@@ -1772,6 +1833,7 @@ mod tests {
         let (hello, mut obs) = load_sample_hello_and_obs();
         let mut bot = Bot::new(hello);
         obs.t = 15.0;
+        obs.alive = 3;
         let mz = bot.map.ground_height(0.0, 0.0);
         obs.self_obs.pos = [0.0, 0.0, mz];
         obs.self_obs.cubes = 2;
@@ -1821,6 +1883,7 @@ mod tests {
         let mz = bot.map.ground_height(0.0, 0.0);
         let ez = bot.map.ground_height(-150.0, 0.0);
         obs.t = 20.0;
+        obs.alive = 3;
         obs.self_obs.pos = [0.0, 0.0, mz];
         obs.self_obs.cubes = 10;
         obs.self_obs.hp = 1400.0;
@@ -1877,6 +1940,7 @@ mod tests {
         let mz = bot.map.ground_height(p_me[0], p_me[1]);
         let ez = bot.map.ground_height(p_en[0], p_en[1]);
         obs.t = 30.0;
+        obs.alive = 3;
         obs.self_obs.pos = [p_me[0], p_me[1], mz];
         obs.self_obs.hp = 1400.0;
         obs.self_obs.max_hp = 1400.0;
@@ -2050,6 +2114,7 @@ mod tests {
             1.3,
             &cands,
             &cands[0],
+            true,
         );
         assert!(fire[1], "Lightning must fire at 32 m");
         assert!(
@@ -2063,7 +2128,6 @@ mod tests {
         let (hello, mut obs) = load_sample_hello_and_obs();
         let mut bot = Bot::new(hello);
         let mz = bot.map.ground_height(-45.0, 0.0);
-        let ez = bot.map.ground_height(-120.0, 0.0);
         obs.t = 25.0;
         obs.self_obs.pos = [-45.0, 0.0, mz];
         obs.self_obs.grounded = true;
@@ -2111,9 +2175,13 @@ mod tests {
             "must protect Gun once >= 2 gun upgrades invested"
         );
 
-        // Zero-Energy Jump-Charge Laser: tick 1 grounded jumps; tick 2 airborne does NOT jet boost
+        // Zero-Energy Jump-Charge Laser: tick 1 grounded jumps on Open Oval; tick 2 airborne does NOT jet boost
         obs.pickups.clear();
         obs.self_obs.upgrades.clear();
+        obs.alive = 3;
+        let mz_open = bot.map.ground_height(-120.0, 20.0);
+        let ez_open = bot.map.ground_height(-195.0, 20.0);
+        obs.self_obs.pos = [-120.0, 20.0, mz_open];
         obs.self_obs.weapons[0] = Some(WeaponObs {
             kind: WeaponKind::Laser,
             cooldown: 0.0,
@@ -2122,14 +2190,14 @@ mod tests {
             charge: Some(0.0),
             stats: bot.config.weapons.laser.clone(),
         });
-        obs.zone.center = [-45.0, 0.0];
-        obs.zone.next_center = [-45.0, 0.0];
+        obs.zone.center = [-120.0, 20.0];
+        obs.zone.next_center = [-120.0, 20.0];
         obs.zone.radius = 200.0;
         obs.zone.next_radius = 180.0;
         obs.mechs = vec![ActorObs {
             id: 93,
             kind: "mech".into(),
-            pos: [-120.0, 0.0, ez],
+            pos: [-195.0, 20.0, ez_open],
             vel: [0.0, 0.0, 0.0],
             aim: [0.0, 0.0],
             hp: Some(1400.0),
@@ -2144,7 +2212,7 @@ mod tests {
 
         obs.t = 25.1;
         obs.self_obs.grounded = false;
-        obs.self_obs.pos[2] = mz + 2.0;
+        obs.self_obs.pos[2] = mz_open + 2.0;
         obs.self_obs.vel = [0.0, 12.0, 5.0];
         obs.self_obs.weapons[0].as_mut().unwrap().charge = Some(0.10);
         let a2 = bot.act(&obs);
@@ -2338,6 +2406,7 @@ mod tests {
 
         // 1. Wounded mech (500 HP < 0.42 * 1400, 80 energy) near prism 58 -> EmergencyRegen vaults onto roof!
         obs.t = 30.0;
+        obs.alive = 3;
         obs.self_obs.pos = [-55.0, -18.0, mz];
         obs.self_obs.grounded = true;
         obs.self_obs.hp = 500.0;
@@ -2400,5 +2469,356 @@ mod tests {
             .expect("full-HP Laser+Lightning mech vs 80 m enemy must proactively seize prism 58 roof");
         assert!(rz2 - mz >= 8.0);
         assert!(a_seize.move_dir.unwrap()[1] < -0.5);
+    }
+
+    #[test]
+    fn ghost_holds_fire_and_breaks_los_from_unalerted_distant_mech() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(-55.0, -18.0);
+        let ez = bot.map.ground_height(-55.0, 82.0);
+        obs.t = 35.0;
+        obs.alive = 14;
+        obs.self_obs.pos = [-55.0, -18.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 30.0;
+        obs.self_obs.aim = [PI / 2.0, 0.0];
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [-55.0, 0.0];
+        obs.zone.next_center = [-55.0, 0.0];
+        obs.zone.radius = 250.0;
+        obs.zone.next_radius = 220.0;
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.mechs = vec![ActorObs {
+            id: 110,
+            kind: "mech".into(),
+            pos: [-55.0, 82.0, ez], // 100 m North
+            vel: [0.0, 0.0, 0.0],
+            aim: [PI / 2.0, 0.0], // Facing away North (+y), unalerted
+            hp: Some(1400.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun, WeaponKind::Laser],
+            charging: false,
+        }];
+
+        let act = bot.act(&obs);
+        assert_eq!(
+            act.fire.unwrap(),
+            [false, false],
+            "Ghost mode must hold fire against unalerted healthy mech at 100 m"
+        );
+        assert_eq!(
+            bot.strategy.tactic,
+            CombatTactic::CoverDuck,
+            "Ghost mode must disengage behind nearby cover instead of picking a 1v1 fight"
+        );
+    }
+
+    #[test]
+    fn ghost_vultures_low_hp_enemy_and_defends_close_hideout() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(-120.0, 20.0);
+        let ez_far = bot.map.ground_height(-200.0, 20.0);
+        obs.t = 40.0;
+        obs.alive = 14;
+        obs.self_obs.pos = [-120.0, 20.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.aim = [PI, 0.0];
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [-120.0, 20.0];
+        obs.zone.next_center = [-120.0, 20.0];
+        obs.zone.radius = 250.0;
+        obs.zone.next_radius = 220.0;
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Laser,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: Some(0.0),
+                stats: bot.config.weapons.laser.clone(),
+            }),
+            Some(WeaponObs {
+                kind: WeaponKind::Lightning,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: None,
+                stats: bot.config.weapons.lightning.clone(),
+            }),
+        ];
+        // 1. Free 300 HP vulture kill at 80 m even if looking away
+        obs.mechs = vec![ActorObs {
+            id: 111,
+            kind: "mech".into(),
+            pos: [-200.0, 20.0, ez_far],
+            vel: [0.0, 0.0, 0.0],
+            aim: [PI, 0.0],
+            hp: Some(300.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+        let a_vulture = bot.act(&obs);
+        assert!(
+            a_vulture.fire.unwrap()[0],
+            "Ghost mode must take free Laser vulture kill on 300 HP target"
+        );
+
+        // 2. Close intruder at 40 m aiming at us -> full Lightning + Laser defense
+        let mut bot2 = Bot::new(load_sample_hello_and_obs().0);
+        let ez_close = bot2.map.ground_height(-160.0, 20.0);
+        obs.mechs = vec![ActorObs {
+            id: 112,
+            kind: "mech".into(),
+            pos: [-160.0, 20.0, ez_close],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0], // Aiming East straight at us
+            hp: Some(1100.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+        let a_def = bot2.act(&obs);
+        assert_eq!(
+            a_def.fire.unwrap(),
+            [true, true],
+            "Ghost mode must defend against 40 m intruder with full Lightning + Laser burst"
+        );
+    }
+
+    #[test]
+    fn ghost_finds_concealed_alcove_away_from_sounds_and_walks_silently() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(0.0, 0.0);
+        obs.t = 60.0;
+        obs.alive = 14;
+        obs.self_obs.pos = [0.0, 0.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.cubes = 2;
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.next_center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_radius = 320.0;
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.mechs.clear();
+        obs.sounds = vec![SoundObs {
+            kind: "gun".into(),
+            bearing: PI, // Near gunfire to the West
+            dist: "near".into(),
+            age: 0.1,
+        }];
+
+        let act1 = bot.act(&obs);
+        assert_eq!(bot.strategy.posture, Posture::EarlyFarm);
+        assert_ne!(
+            bot.strategy.tactic,
+            CombatTactic::AggressivePush,
+            "Ghost mode must NOT chase near gunfire sound"
+        );
+        let (pt, _) = bot
+            .strategy
+            .stealth_anchor
+            .expect("Ghost mode must select a precomputed concealed stealth_anchor");
+        let (cx, cy) = bot.nav.world_to_cell(pt[0], pt[1]);
+        let conceal = bot.nav.concealment[cy * bot.nav.nx + cx];
+        assert!(
+            conceal >= 4,
+            "selected hideout must have >= 4/16 blocked sightlines, got {conceal}"
+        );
+        assert_eq!(
+            act1.boost,
+            Some(false),
+            "Ghost mode must never boost while sneaking silently"
+        );
+        let mv_len = act1.move_dir.unwrap()[0].hypot(act1.move_dir.unwrap()[1]);
+        assert!(
+            mv_len > 0.1 && mv_len < 0.42,
+            "silent walk near combat sound must scale speed strictly below step_speed (mv_len={mv_len:.3})"
+        );
+
+        // Parked inside alcove <= 4.5 m -> stationary 100% silent hold
+        obs.t = 60.5;
+        obs.sounds.clear();
+        obs.self_obs.pos = [pt[0], pt[1], bot.map.ground_height(pt[0], pt[1])];
+        let act2 = bot.act(&obs);
+        assert_eq!(
+            act2.move_dir.unwrap(),
+            [0.0, 0.0],
+            "parked inside stealth alcove must hold completely still"
+        );
+    }
+
+    #[test]
+    fn ghost_npc_aggro_fix_and_no_laser_slowdown_while_escaping() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(-120.0, 20.0);
+        let nz = bot.map.ground_height(-150.0, 20.0);
+        obs.t = 30.0;
+        obs.alive = 14;
+        obs.self_obs.pos = [-120.0, 20.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 560.0; // 40% HP
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.aim = [PI, 0.0];
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [-120.0, 20.0];
+        obs.zone.next_center = [-120.0, 20.0];
+        obs.zone.radius = 250.0;
+        obs.zone.next_radius = 220.0;
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.sounds.clear();
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Gun,
+                cooldown: 0.0,
+                ammo: Some(12.0),
+                reload: Some(0.0),
+                charge: None,
+                stats: bot.config.weapons.gun.clone(),
+            }),
+            Some(WeaponObs {
+                kind: WeaponKind::Laser,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: Some(0.0),
+                stats: bot.config.weapons.laser.clone(),
+            }),
+        ];
+        obs.mechs = vec![ActorObs {
+            id: 77,
+            kind: "npc".into(),
+            pos: [-150.0, 20.0, nz],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(350.0),
+            max_hp: Some(350.0),
+            cubes: Some(0),
+            weapons: Vec::new(),
+            charging: false,
+        }];
+        obs.events = vec![GameEvent::Damaged {
+            amount: 25.0,
+            weapon: "npc".into(),
+            bearing: Some(PI),
+            by: Some(77),
+            rear: false,
+        }];
+
+        let act_npc = bot.act(&obs);
+        assert!(
+            bot.world.last_mech_damage_t < 0.0,
+            "NPC damage must not update last_mech_damage_t"
+        );
+        assert_eq!(
+            bot.world.last_damage_by, None,
+            "NPC damage must not hijack last_damage_by"
+        );
+        let npc_aim = act_npc.aim.expect("must aim toward aggroed NPC");
+        assert!(
+            npc_aim[1] < -0.10,
+            "must pitch down toward aggroed NPC on tick 1 instead of ignoring it, got {npc_aim:?}"
+        );
+
+        obs.t = 30.1;
+        obs.events.clear();
+        obs.self_obs.aim = npc_aim;
+        let act_npc2 = bot.act(&obs);
+        assert!(
+            act_npc2.fire.unwrap()[0],
+            "must shoot back at aggroed NPC instead of paralyzing itself, got {:?}",
+            act_npc2.fire
+        );
+
+        // Verify allow_new_laser_charge = false fires Gun without starting new Laser charge,
+        // while still finishing an active charge (0.30 s).
+        obs.t = 31.0;
+        obs.self_obs.aim = [PI, 0.0];
+        let ez = bot.map.ground_height(-190.0, 20.0);
+        obs.mechs = vec![ActorObs {
+            id: 113,
+            kind: "mech".into(),
+            pos: [-190.0, 20.0, ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1400.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+        let eye_h = 7.0;
+        let muzzle = [-120.0, 20.0, mz + eye_h];
+        bot.world.update(&obs, &bot.map, &bot.config);
+        let (cands, _) =
+            crate::combat::select_targets(&obs, &bot.map, &bot.config, &bot.world, muzzle);
+        let (fire_no_new, _, _, _) = crate::combat::eval_combat(
+            &bot.map,
+            &bot.config,
+            &obs,
+            muzzle,
+            2.5,
+            -0.7,
+            1.3,
+            &cands,
+            &cands[0],
+            false,
+        );
+        assert!(
+            fire_no_new[0],
+            "Gun must fire at 100% speed even when new Laser charge blocked"
+        );
+        assert!(
+            !fire_no_new[1],
+            "must NOT start new Laser charge when allow_new_laser_charge is false"
+        );
+
+        obs.self_obs.weapons[1].as_mut().unwrap().charge = Some(0.30);
+        let (fire_active, _, _, _) = crate::combat::eval_combat(
+            &bot.map,
+            &bot.config,
+            &obs,
+            muzzle,
+            2.5,
+            -0.7,
+            1.3,
+            &cands,
+            &cands[0],
+            false,
+        );
+        assert!(
+            fire_active[1],
+            "already-charging Laser must still finish holding/releasing"
+        );
     }
 }
