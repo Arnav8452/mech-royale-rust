@@ -340,17 +340,20 @@ impl StrategyState {
         let has_nanites = regen_delay <= 3.8;
         let winning_or_even_1v1 = los_count == 1 && los_mechs[0].hp <= me.hp + 180.0;
         let enemy_in_face = los_mechs.iter().any(|m| m.dist < 32.0);
+        // cl-disengage (Arnav's playtest): after a fight, break LOS and heal to near full before
+        // re-engaging; never stay in the open for kill-stealers. Break off early when 2+ see us.
+        let just_fought = (obs.t - world.last_combat_t) <= 10.0;
         let want_regen = if self.posture == Posture::EmergencyRegen {
-            let hold_cap = if has_nanites { 0.88 } else { 0.80 };
+            let hold_cap = if los_count == 0 { 0.95 } else if has_nanites { 0.88 } else { 0.80 };
             !immediate_kill_avail
                 && !enemy_in_face
                 && me.hp < hold_cap * me.max_hp
-                && !(me.hp >= 0.72 * me.max_hp && near_mechs == 0 && !has_nanites)
         } else {
             let lose_1v1_thr = if has_nanites { 0.56 } else { 0.42 };
             !immediate_kill_avail
                 && !enemy_in_face
-                && ((me.hp < 0.62 * me.max_hp && los_count >= 2)
+                && ((los_count == 0 && just_fought && me.hp < 0.85 * me.max_hp)
+                    || (me.hp < 0.80 * me.max_hp && los_count >= 2)
                     || (me.hp < lose_1v1_thr * me.max_hp && near_mechs > 0 && !winning_or_even_1v1)
                     || (has_nanites
                         && los_count == 0
