@@ -1146,6 +1146,40 @@ impl StrategyState {
                 }
             }
             Posture::Combat => {
+                // cl-string: vs 2+ enemies within 120 m never park behind one building (the
+                // squad wraps both corners -> rear hits). Keep moving tangentially around the
+                // inside of the next zone, away from the pack centroid; weapons keep firing.
+                {
+                    let pack: Vec<[f64; 2]> = world
+                        .tracked_enemies
+                        .values()
+                        .filter(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 120.0)
+                        .map(|e| [e.pos[0], e.pos[1]])
+                        .collect();
+                    if pack.len() >= 2 {
+                        let n = pack.len() as f64;
+                        let cx = pack.iter().map(|p| p[0]).sum::<f64>() / n;
+                        let cy = pack.iter().map(|p| p[1]).sum::<f64>() / n;
+                        let away = unit2d(me.pos[0] - cx, me.pos[1] - cy);
+                        let radial = unit2d(me.pos[0] - nc[0], me.pos[1] - nc[1]);
+                        let mut tan = [-radial[1], radial[0]];
+                        if tan[0] * away[0] + tan[1] * away[1] < 0.0 {
+                            tan = [-tan[0], -tan[1]];
+                        }
+                        let mut gx = tan[0] * 0.65 + away[0] * 0.35;
+                        let mut gy = tan[1] * 0.65 + away[1] * 0.35;
+                        let string_r = (obs.zone.next_radius - 30.0).max(0.0);
+                        if dist_next > string_r {
+                            gx -= radial[0] * 0.8;
+                            gy -= radial[1] * 0.8;
+                        }
+                        let dir = unit2d(gx, gy);
+                        let goal = [me.pos[0] + dir[0] * 30.0, me.pos[1] + dir[1] * 30.0];
+                        self.tactic = CombatTactic::OpenStrafe;
+                        let wp = self.follow_astar(nav, scratch, me_xy, goal, obs.t);
+                        return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), goal);
+                    }
+                }
                 let no_weapon_can_shoot_now = if let Some(tgt) = combat_enemy {
                     let any_charging = me
                         .weapons
