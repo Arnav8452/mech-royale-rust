@@ -225,6 +225,16 @@ pub(crate) fn pick_best_mech_target(
             continue;
         }
         let mut score = 150.0 - c.dist;
+        // cl-chasers: when 2+ are visible, focus the closest one (the chaser ahead of the pack).
+        let visible = cands.iter().filter(|o| o.has_los).count();
+        if visible >= 2
+            && cands
+                .iter()
+                .filter(|o| o.has_los && o.id != c.id)
+                .all(|o| c.dist < o.dist || (c.dist == o.dist && c.id < o.id))
+        {
+            score += 200.0;
+        }
         score += (c.max_hp - c.hp).max(0.0) * 0.35;
         if c.hp <= 320.0 {
             score += 220.0;

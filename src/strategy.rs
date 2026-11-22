@@ -1166,8 +1166,9 @@ impl StrategyState {
                         if tan[0] * away[0] + tan[1] * away[1] < 0.0 {
                             tan = [-tan[0], -tan[1]];
                         }
-                        let mut gx = tan[0] * 0.65 + away[0] * 0.35;
-                        let mut gy = tan[1] * 0.65 + away[1] * 0.35;
+                        // cl-chasers: mostly run straight away; the closest chaser strings out.
+                        let mut gx = tan[0] * 0.30 + away[0] * 0.70;
+                        let mut gy = tan[1] * 0.30 + away[1] * 0.70;
                         let string_r = (obs.zone.next_radius - 30.0).max(0.0);
                         if dist_next > string_r {
                             gx -= radial[0] * 0.8;
