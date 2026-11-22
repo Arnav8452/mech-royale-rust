@@ -112,12 +112,14 @@ impl StrategyState {
             let existing_stacks = me.upgrades.iter().filter(|u| *u == &choice.id).count();
 
             let base_score = match choice.id.as_str() {
-                "nanites" => 116.0,
+                // cl-dmg: kill speed first. Lanchester: vs packs, DPS removes threats, HP only delays.
+                "laser_damage" => 120.0,
+                "gun_rate" => 119.0,
+                "gun_damage" => 118.0,
+                "laser_charge" => 117.0,
+                "gun_mag" => 113.0,
                 "plating" => 112.0,
-                "laser_charge" => 111.0,
-                "laser_damage" => 110.0,
-                "gun_mag" => 109.0,
-                "gun_damage" | "gun_rate" => 107.0,
+                "nanites" => 100.0,
                 "armor" => 106.0,
                 "laser_pierce" => 104.0,
                 "gun_velocity" => 102.0,
@@ -354,7 +356,7 @@ impl StrategyState {
                     || (me.hp < lose_1v1_thr * me.max_hp && near_mechs > 0 && !winning_or_even_1v1)
                     || (has_nanites
                         && los_count == 0
-                        && me.hp < 0.72 * me.max_hp
+                        && me.hp < 0.40 * me.max_hp
                         && (obs.t - world.last_combat_t) >= (regen_delay - 1.2).max(0.8)))
         };
         let my_ground = map.ground_height(me.pos[0], me.pos[1]);
