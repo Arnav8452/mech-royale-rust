@@ -1713,7 +1713,7 @@ mod tests {
             id: 20000,
             pos: [20.0, 0.0, dz],
             radius: 8.0,
-            lands_in: 16.0,
+            lands_in: 30.0,
             capture_s: 4.0,
             progress: 0.0,
             holder: None,

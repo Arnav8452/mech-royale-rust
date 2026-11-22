@@ -330,7 +330,7 @@ impl StrategyState {
                 .values()
                 .filter(|e| dist2d(e.pos[0], e.pos[1], drop.pos[0], drop.pos[1]) <= 25.0)
                 .count();
-            if drop.lands_in <= 14.0 && d <= 170.0 && campers <= 1 {
+            if drop.lands_in <= 22.0 && d <= 280.0 && campers <= 2 {
                 self.posture = Posture::SupplyDrop;
                 return;
             }
@@ -1837,7 +1837,7 @@ impl StrategyState {
     ) -> Option<&'a DropObs> {
         let me = &obs.self_obs;
         // cl-drops: every drop is a full heal + full energy + 3 cubes; chase them map-wide.
-        let max_pull = 460.0;
+        let max_pull = 1200.0;
         let in_close_duel = los_mechs.iter().any(|m| m.dist < 60.0);
         let mut best: Option<(f64, &'a DropObs)> = None;
         for d in &obs.drops {
@@ -1851,17 +1851,17 @@ impl StrategyState {
                 .values()
                 .filter(|e| dist2d(e.pos[0], e.pos[1], d.pos[0], d.pos[1]) <= 25.0)
                 .count();
-            if campers >= 3 {
+            if campers >= 4 {
                 continue;
             }
             let dist = dist2d(me.pos[0], me.pos[1], d.pos[0], d.pos[1]);
             let eta = dist / 15.0;
-            let arrival_ok = d.lands_in <= (eta + 10.0).max(12.0);
-            let duel_ok = !in_close_duel || dist <= 70.0;
+            let arrival_ok = d.lands_in <= (eta + 22.0).max(26.0);
+            let duel_ok = !in_close_duel || dist <= 120.0;
             if arrival_ok
                 && duel_ok
                 && dist <= max_pull
-                && (los_mechs.len() <= 2 || dist <= d.radius + 30.0)
+                && (los_mechs.len() <= 3 || dist <= d.radius + 45.0)
                 && best.is_none_or(|(bd, _)| dist < bd)
             {
                 best = Some((dist, d));
