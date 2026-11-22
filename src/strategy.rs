@@ -111,7 +111,20 @@ impl StrategyState {
             });
             let existing_stacks = me.upgrades.iter().filter(|u| *u == &choice.id).count();
 
-            let base_score = match choice.id.as_str() {
+            // cl-gunlight-full: with Lightning held, its upgrades rank right after survival.
+            let lt_boost = if have_lightning {
+                match choice.id.as_str() {
+                    "lightning_efficiency" => Some(111.0), // -35% energy, +10% damage
+                    "lightning_range" => Some(110.0),      // +20% range and cone
+                    "capacitor" => Some(108.0),            // +30 energy
+                    "reactor" => Some(106.5),              // +30% energy regen
+                    "lightning_chain" => Some(104.0),      // +1 chain jump
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let base_score = if let Some(v) = lt_boost { v } else { match choice.id.as_str() {
                 "nanites" => 116.0,
                 "plating" => 112.0,
                 "laser_charge" => 111.0,
@@ -171,7 +184,7 @@ impl StrategyState {
                         10.0
                     }
                 }
-            };
+            } };
 
             let total = if held_req {
                 base_score
