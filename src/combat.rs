@@ -112,7 +112,7 @@ pub(crate) fn select_targets(
             });
         } else {
             let d = dist3d(muzzle, actor.pos);
-            let npc_max_d = if want_farm_cubes { 125.0 } else { 48.0 };
+            let npc_max_d = if want_farm_cubes { 70.0 } else { 48.0 };
             let aggro_npc = d <= 48.0 && obs.t - world.last_damage_t <= 2.2;
             if actor.kind == "npc"
                 && d <= npc_max_d

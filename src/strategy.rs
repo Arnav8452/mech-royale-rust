@@ -1624,7 +1624,7 @@ impl StrategyState {
                 .iter()
                 .filter(|c| {
                     is_ground_level(map, c.pos)
-                        && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 115.0
+                        && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 50.0
                         && dist2d(c.pos[0], c.pos[1], nc[0], nc[1]) <= obs.zone.next_radius - 5.0
                 })
                 .min_by(|a, b| {
@@ -1675,7 +1675,7 @@ impl StrategyState {
 
         // Early-game 50 m unvisited-grid cube snowball until stat_cap (10 cubes) + 13..14 -> 15 upgrade exception
         // cl-lean: vacuum (more farming/roaming) lost 0.30; go the other way. Drops supply cubes later.
-        if want_farm_cubes && obs.t < 90.0 {
+        if want_farm_cubes && obs.t < 45.0 {
             let explore_invalid = self.explore_goal.is_none_or(|g| {
                 obs.zone.next_radius > 24.0
                     && dist2d(g[0], g[1], nc[0], nc[1]) > (obs.zone.next_radius - 16.0).max(0.0)
@@ -1762,7 +1762,7 @@ impl StrategyState {
         let arrived_anchor = self
             .ambush_anchor
             .is_some_and(|a| dist2d(me.pos[0], me.pos[1], a[0], a[1]) <= 18.0);
-        let timed_refresh = obs.t - self.ambush_anchor_t >= 10.0;
+        let timed_refresh = obs.t - self.ambush_anchor_t >= 25.0;
 
         if anchor_invalid || arrived_anchor || timed_refresh {
             self.prev_ambush_anchor = self.ambush_anchor;
