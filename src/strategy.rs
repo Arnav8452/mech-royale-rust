@@ -410,13 +410,14 @@ impl StrategyState {
 
         // cl-farmfirst: house bots escalate as we kill. Reach ~8 cubes (HP/damage) before
         // taking optional fights early; fight anything within 50 m or anything shooting us.
+        // cl-pacifist: a hit only forces Combat once we are below 75% HP.
         let farm_gate = obs.t < 95.0
             && me.cubes < 8
-            && obs.t - world.last_mech_damage_t > 3.0
+            && (obs.t - world.last_mech_damage_t > 3.0 || me.hp >= 0.75 * me.max_hp)
             && !world
                 .tracked_enemies
                 .values()
-                .any(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 50.0);
+                .any(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 45.0);
         if !farm_gate
             && world
                 .tracked_enemies

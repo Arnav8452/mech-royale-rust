@@ -109,12 +109,23 @@ impl Bot {
             eye_h,
         );
 
-        let primary_mech = pick_best_mech_target(
-            &mech_cands,
-            me,
-            self.world.last_damage_by,
-            self.world.last_target_id,
-        );
+        // cl-pacifist: the squad escalates as we thin it. Until 90 s, while under 8 cubes or
+        // without a slot-1 weapon, don't shoot mechs at all (crates/drones only) unless one is
+        // within 45 m or we drop below 75% HP.
+        let pacifist = obs.t < 90.0
+            && (me.cubes < 8 || me.weapons.get(1).and_then(|w| w.as_ref()).is_none())
+            && me.hp >= 0.75 * me.max_hp
+            && !mech_cands.iter().any(|c| c.dist <= 45.0);
+        let primary_mech = if pacifist {
+            None
+        } else {
+            pick_best_mech_target(
+                &mech_cands,
+                me,
+                self.world.last_damage_by,
+                self.world.last_target_id,
+            )
+        };
         self.world.last_target_id = primary_mech.as_ref().map(|m| m.id);
         let any_visible_mech = primary_mech.clone().or_else(|| {
             mech_cands
@@ -1649,7 +1660,7 @@ mod tests {
         let (hello, mut obs) = load_sample_hello_and_obs();
         obs.self_obs.cubes = 8; // cl-farmfirst: past the early farm gate
         let mut bot = Bot::new(hello);
-        obs.t = 40.0;
+        obs.t = 92.0; // cl-pacifist: past the no-shoot window
         let mz = bot.map.ground_height(0.0, 0.0);
         let cz = bot.map.ground_height(0.0, 10.0);
         let ez = bot.map.ground_height(55.0, 0.0);
@@ -2094,7 +2105,7 @@ mod tests {
         let (hello, mut obs) = load_sample_hello_and_obs();
         let mut bot = Bot::new(hello);
         let mz = bot.map.ground_height(-45.0, 0.0);
-        obs.t = 25.0;
+        obs.t = 95.0; // cl-pacifist: past the no-shoot window
         obs.self_obs.pos = [-45.0, 0.0, mz];
         obs.self_obs.grounded = true;
         obs.self_obs.hp = 1400.0;
@@ -2201,7 +2212,7 @@ mod tests {
         assert_eq!(a1.fire.unwrap()[0], true);
         assert_eq!(a1.jump, Some(true), "grounded moving Laser charge must jump-launch");
 
-        obs.t = 25.1;
+        obs.t = 95.1;
         obs.self_obs.grounded = false;
         obs.self_obs.pos[2] = mz_open + 2.0;
         obs.self_obs.vel = [0.0, 12.0, 5.0];
