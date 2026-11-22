@@ -424,7 +424,18 @@ impl StrategyState {
                 .any(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 80.0)
         {
             // cl-gamble-ambush: never go looking for fights; the squad hunts us anyway.
-            self.posture = Posture::Combat;
+            // cl-guerrilla: for 12 s after a kill, vanish instead (unless someone is on top of us).
+            let vanishing = world.last_kill.is_some_and(|(_, kt)| obs.t - kt <= 12.0)
+                && obs.t - world.last_mech_damage_t > 2.0
+                && !world
+                    .tracked_enemies
+                    .values()
+                    .any(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 35.0);
+            if !vanishing {
+                self.posture = Posture::Combat;
+                return;
+            }
+            self.posture = Posture::EarlyFarm;
             return;
         }
 
@@ -1580,6 +1591,44 @@ impl StrategyState {
                 }
             }
             Posture::EarlyFarm => {}
+        }
+
+        // cl-guerrilla: after a kill the squad converges on that spot. Relocate ~110 m away
+        // from the kill site, away from the other tracked enemies, inside the next zone.
+        if let Some((kpos, kt)) = world.last_kill {
+            if obs.t - kt <= 12.0 {
+                let others: Vec<[f64; 2]> = world
+                    .tracked_enemies
+                    .values()
+                    .map(|e| [e.pos[0], e.pos[1]])
+                    .collect();
+                let (fx, fy) = if others.is_empty() {
+                    (kpos[0], kpos[1])
+                } else {
+                    let n = others.len() as f64;
+                    (
+                        0.5 * kpos[0] + 0.5 * others.iter().map(|p| p[0]).sum::<f64>() / n,
+                        0.5 * kpos[1] + 0.5 * others.iter().map(|p| p[1]).sum::<f64>() / n,
+                    )
+                };
+                let mut away = unit2d(me.pos[0] - fx, me.pos[1] - fy);
+                if away[0].abs() + away[1].abs() < 1e-6 {
+                    away = unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]);
+                }
+                let mut gx = kpos[0] + away[0] * 110.0;
+                let mut gy = kpos[1] + away[1] * 110.0;
+                let lim = (obs.zone.next_radius - 20.0).max(0.0);
+                let dg = dist2d(gx, gy, nc[0], nc[1]);
+                if dg > lim && dg > 1e-6 {
+                    gx = nc[0] + (gx - nc[0]) * lim / dg;
+                    gy = nc[1] + (gy - nc[1]) * lim / dg;
+                }
+                let goal = [gx, gy];
+                if dist2d(me.pos[0], me.pos[1], gx, gy) > 12.0 {
+                    let wp = self.follow_astar(nav, scratch, me_xy, goal, obs.t);
+                    return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), goal);
+                }
+            }
         }
 
         // EarlyFarm / fallback: cubes -> farm_target -> crates -> zone -> near sounds -> 50 m unvisited snowball -> 15 s hunt -> mid/far sounds -> sweep

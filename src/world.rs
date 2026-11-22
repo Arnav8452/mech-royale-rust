@@ -59,6 +59,8 @@ pub(crate) struct WorldState {
     pub tracked_enemies: HashMap<u64, TrackedEnemy>,
     pub visited_cells: HashSet<(i32, i32)>,
     pub last_hunt_pos: Option<([f64; 2], f64)>,
+    /// cl-guerrilla: where we stood when we last killed a mech, and when.
+    pub last_kill: Option<([f64; 2], f64)>,
     pub seen_proj_ids: HashMap<u64, f64>,
     pub last_pickup_seen: HashMap<u64, (WeaponKind, [f64; 3], f64)>,
     pub blacklisted_pickups: HashMap<u64, f64>,
@@ -100,6 +102,7 @@ impl WorldState {
             tracked_enemies: HashMap::new(),
             visited_cells: HashSet::new(),
             last_hunt_pos: None,
+            last_kill: None,
             seen_proj_ids: HashMap::new(),
             last_pickup_seen: HashMap::new(),
             blacklisted_pickups: HashMap::new(),
@@ -200,6 +203,7 @@ impl WorldState {
                     }
                 }
                 GameEvent::Kill { target } => {
+                    self.last_kill = Some(([obs.self_obs.pos[0], obs.self_obs.pos[1]], t));
                     self.tracked_enemies.remove(target);
                     if self.last_target_id == Some(*target) {
                         self.last_target_id = None;
