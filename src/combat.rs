@@ -233,8 +233,10 @@ pub(crate) fn pick_best_mech_target(
         } else if c.hp <= 820.0 {
             score += 75.0;
         }
-        if last_target_id == Some(c.id) && c.hp < 0.90 * c.max_hp {
-            score += 35.0;
+        // cl-commit: score ~= kills before we die, and house bots regen 45 HP/s after 5 s,
+        // so damage spread over several targets heals away. Finish the current target.
+        if last_target_id == Some(c.id) {
+            score += if c.hp < 0.90 * c.max_hp { 260.0 } else { 120.0 };
         }
         if c.is_reloading {
             score += 55.0;
