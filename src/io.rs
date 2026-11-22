@@ -5,7 +5,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use crate::bot::Bot;
-use crate::protocol::{stat, Hello, Observation, Ready};
+use crate::protocol::{stat, Action, Hello, Observation, Ready};
 
 #[derive(Deserialize)]
 struct MsgKind<'a> {
@@ -167,7 +167,17 @@ pub fn run() -> io::Result<()> {
             }
         };
 
-        let mut action = bot.act(&obs);
+        // Panic guard: a panic inside act() must never leave the mech a sitting target.
+        // Send an empty action for this tick and keep answering.
+        let mut action = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bot.act(&obs)
+        })) {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!("bot.act panicked at tick {}; sending empty action", obs.tick);
+                Action::default()
+            }
+        };
         action.tick = obs.tick;
         action.sanitize(min_pitch, max_pitch, obs.self_obs.aim);
 
