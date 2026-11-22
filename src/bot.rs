@@ -39,7 +39,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m11-corlas".to_string(),
+            name: "rust-bot-m11-fort".to_string(),
             config: hello.config,
             map,
             nav,
@@ -65,7 +65,11 @@ impl Bot {
         };
 
         if let Some(offer) = &obs.offer {
-            action.pick = Some(self.strategy.pick_upgrade(&self.config, offer, me));
+            let late_game = obs.t >= 240.0 || obs.zone.next_radius <= 100.0;
+            action.pick = Some(
+                self.strategy
+                    .pick_upgrade(&self.config, offer, me, late_game),
+            );
         }
 
         let muzzle_h = stat(&me.stats, "muzzle_height", 7.0);
@@ -642,7 +646,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            bot.strategy.pick_upgrade(&bot.config, &offer1, &me),
+            bot.strategy.pick_upgrade(&bot.config, &offer1, &me, false),
             1,
             "armor should win Tier S"
         );
@@ -669,7 +673,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            bot.strategy.pick_upgrade(&bot.config, &offer2, &me),
+            bot.strategy.pick_upgrade(&bot.config, &offer2, &me, false),
             1,
             "held gun_rate should beat unheld laser_damage"
         );
@@ -697,7 +701,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            bot.strategy.pick_upgrade(&bot.config, &offer3, &me),
+            bot.strategy.pick_upgrade(&bot.config, &offer3, &me, false),
             1,
             "nanites should win"
         );
@@ -2283,6 +2287,154 @@ mod tests {
             act_ready.move_dir.unwrap()[0] > 0.2,
             "with ready Laser 24 m from block 14 corner, corner tether must pull toward corner (+x), got {:?}",
             act_ready.move_dir
+        );
+    }
+
+    #[test]
+    fn loads_arena_trees_and_blocks_long_range_canopy_vision_only_beyond_45m() {
+        let (hello, _) = load_sample_hello_and_obs();
+        let bot = Bot::new(hello);
+        assert!(
+            bot.map.trees.len() > 1000,
+            "expected >1000 trees parsed from v2/world.json, got {}",
+            bot.map.trees.len()
+        );
+
+        let sample_tr = bot
+            .map
+            .trees
+            .iter()
+            .find(|tr| {
+                if tr.crown_r < 5.0 || (tr.top_z - tr.crown_base_z) < 4.0 {
+                    return false;
+                }
+                let mid_z = 0.5 * (tr.crown_base_z + tr.top_z);
+                let a = [tr.crown_x - 30.0, tr.crown_y, mid_z];
+                let b = [tr.crown_x + 30.0, tr.crown_y, mid_z];
+                bot.map.has_los(a, b)
+            })
+            .expect("should find an unoccluded wide-crown tree on arena map");
+
+        let mid_z = 0.5 * (sample_tr.crown_base_z + sample_tr.top_z);
+        let a_short = [sample_tr.crown_x - 18.0, sample_tr.crown_y, mid_z];
+        let b_short = [sample_tr.crown_x + 18.0, sample_tr.crown_y, mid_z];
+        let a_long = [sample_tr.crown_x - 30.0, sample_tr.crown_y, mid_z];
+        let b_long = [sample_tr.crown_x + 30.0, sample_tr.crown_y, mid_z];
+
+        assert!(
+            !bot.map.vision_blocked(a_short, b_short, true),
+            "proximity sensor <= 45 m must see through canopy"
+        );
+        assert!(
+            bot.map.vision_blocked(a_long, b_long, true),
+            "> 45 m ray crossing >= 4 m dense tree crown must block vision"
+        );
+        assert!(
+            !bot.map.vision_blocked(a_long, b_long, false),
+            "with canopy_blocks=false long ray without prism must not block"
+        );
+    }
+
+    #[test]
+    fn fortress_phase_holds_silent_corner_inside_next_zone_and_wins_endgame() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let me_xy = [84.0, -108.0];
+        let mz = bot.map.ground_height(me_xy[0], me_xy[1]);
+        obs.t = 210.0;
+        obs.self_obs.cubes = 10;
+        obs.self_obs.pos = [me_xy[0], me_xy[1], mz];
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 100.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 240.0;
+        obs.zone.next_center = [80.0, -105.0];
+        obs.zone.next_radius = 120.0;
+        obs.zone.shrink_start = 260.0;
+        obs.mechs.clear();
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.sounds = vec![SoundObs {
+            kind: "gun".into(),
+            bearing: PI,
+            dist: "far".into(),
+            age: 0.1,
+        }];
+
+        bot.act(&obs);
+        let anchor = bot
+            .strategy
+            .ambush_anchor
+            .expect("fortress phase at 10 cubes must select a low-openness corner anchor");
+        let az = bot.map.ground_height(anchor[0], anchor[1]);
+        obs.t = 210.4;
+        obs.self_obs.pos = [anchor[0], anchor[1], az];
+        let act_hold = bot.act(&obs);
+        assert_ne!(
+            bot.strategy.tactic,
+            CombatTactic::AggressivePush,
+            "at 10 cubes fortress phase must ignore far gun sound instead of chasing"
+        );
+        assert_eq!(
+            act_hold.move_dir.unwrap(),
+            [0.0, 0.0],
+            "must hold silently once positioned at fortress corner anchor"
+        );
+        assert_eq!(act_hold.boost, Some(false));
+
+        // Endgame (t >= 340 s): claims final center [0, 0] and prioritizes plating (HP) over DPS
+        obs.t = 360.0;
+        let cz = bot.map.ground_height(-45.0, 0.0);
+        obs.self_obs.pos = [-45.0, 0.0, cz];
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 60.0;
+        obs.zone.next_center = [0.0, 0.0];
+        obs.zone.next_radius = 25.0;
+        obs.zone.shrink_start = 415.0;
+        obs.sounds.clear();
+        let act_end = bot.act(&obs);
+        assert_eq!(bot.strategy.posture, Posture::ZoneRotate);
+        assert!(act_end.move_dir.unwrap()[0] > 0.5);
+
+        let mut me = obs.self_obs.clone();
+        let laser = WeaponObs {
+            kind: WeaponKind::Laser,
+            cooldown: 0.0,
+            ammo: None,
+            reload: None,
+            charge: Some(0.0),
+            stats: bot.config.weapons.laser.clone(),
+        };
+        me.weapons = vec![Some(obs.self_obs.weapons[0].clone().unwrap()), Some(laser)];
+        let offer_late = Offer {
+            id: 30,
+            expires: 365.0,
+            choices: vec![
+                OfferChoice {
+                    id: "gun_damage".into(),
+                    name: "Heavy rounds".into(),
+                    desc: "".into(),
+                },
+                OfferChoice {
+                    id: "laser_damage".into(),
+                    name: "Focusing lens".into(),
+                    desc: "".into(),
+                },
+                OfferChoice {
+                    id: "plating".into(),
+                    name: "Composite plating".into(),
+                    desc: "".into(),
+                },
+            ],
+        };
+        assert_eq!(
+            bot.strategy.pick_upgrade(&bot.config, &offer_late, &me, true),
+            2,
+            "late_game=true must prioritize plating (HP) for final circle"
         );
     }
 }

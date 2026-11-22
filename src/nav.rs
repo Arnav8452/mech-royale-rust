@@ -1,5 +1,6 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
+use std::f64::consts::PI;
 
 use crate::map::Map;
 
@@ -66,6 +67,10 @@ pub struct NavGrid {
     pub walkable: Vec<bool>,
     pub near_cover: Vec<bool>,
     pub ground_z: Vec<f32>,
+    open_step: f64,
+    open_nx: usize,
+    open_ny: usize,
+    openness: Vec<f32>,
     step_up: f64,
     max_slope_tan: f64,
 }
@@ -131,6 +136,37 @@ impl NavGrid {
             }
         }
 
+        // Coarse 12 m openness grid (8 horizontal 90 m visibility rays against prisms + trees)
+        let open_step = 12.0;
+        let open_nx = (((map.max_x - map.min_x) / open_step).ceil() as usize).max(1);
+        let open_ny = (((map.max_y - map.min_y) / open_step).ceil() as usize).max(1);
+        let mut openness = vec![1.0_f32; open_nx * open_ny];
+        let dirs8: [(f64, f64); 8] = std::array::from_fn(|k| {
+            let ang = (k as f64) * (2.0 * PI / 8.0);
+            (ang.cos(), ang.sin())
+        });
+        for oy in 0..open_ny {
+            let wy = origin_y + (oy as f64 + 0.5) * open_step;
+            let cy = (((wy - origin_y) / cell).floor() as isize).clamp(0, (ny - 1) as isize) as usize;
+            for ox in 0..open_nx {
+                let wx = origin_x + (ox as f64 + 0.5) * open_step;
+                let cx = (((wx - origin_x) / cell).floor() as isize).clamp(0, (nx - 1) as isize) as usize;
+                let idx = cy * nx + cx;
+                if !walkable[idx] {
+                    continue;
+                }
+                let eye = [wx, wy, ground_z[idx] as f64 + 8.5];
+                let mut open_rays = 0u32;
+                for &(dx, dy) in &dirs8 {
+                    let end = [wx + dx * 90.0, wy + dy * 90.0, eye[2]];
+                    if !map.vision_blocked(eye, end, true) {
+                        open_rays += 1;
+                    }
+                }
+                openness[oy * open_nx + ox] = (open_rays as f32) / 8.0;
+            }
+        }
+
         Self {
             cell,
             origin_x,
@@ -140,9 +176,22 @@ impl NavGrid {
             walkable,
             near_cover,
             ground_z,
+            open_step,
+            open_nx,
+            open_ny,
+            openness,
             step_up,
             max_slope_tan: max_slope_deg.to_radians().tan(),
         }
+    }
+
+    #[inline]
+    pub fn openness_at(&self, x: f64, y: f64) -> f32 {
+        let ox = (((x - self.origin_x) / self.open_step).floor() as isize)
+            .clamp(0, (self.open_nx - 1) as isize) as usize;
+        let oy = (((y - self.origin_y) / self.open_step).floor() as isize)
+            .clamp(0, (self.open_ny - 1) as isize) as usize;
+        self.openness[oy * self.open_nx + ox]
     }
 
     pub fn len(&self) -> usize {
@@ -642,7 +691,10 @@ impl NavGrid {
                     0.0
                 };
 
-                let mut score = corner_bonus - 0.7 * d_me - 0.15 * d_next;
+                let mut score = corner_bonus
+                    + 50.0 * (1.0 - self.openness_at(w[0], w[1]) as f64)
+                    - 0.7 * d_me
+                    - 0.15 * d_next;
                 if let Some(prev) = avoid_prev {
                     if (w[0] - prev[0]).hypot(w[1] - prev[1]) < 35.0 {
                         score -= 90.0;

@@ -102,7 +102,13 @@ impl StrategyState {
         }
     }
 
-    pub fn pick_upgrade(&self, config: &Config, offer: &Offer, me: &SelfObs) -> usize {
+    pub fn pick_upgrade(
+        &self,
+        config: &Config,
+        offer: &Offer,
+        me: &SelfObs,
+        late_game: bool,
+    ) -> usize {
         let mut best_idx = 0usize;
         let mut best_score = f64::NEG_INFINITY;
         let have_lightning = me
@@ -120,10 +126,11 @@ impl StrategyState {
 
                 let mut max_eff = 10.0_f64;
                 for eff in &def.effects {
+                    let lg_bonus = if late_game { 15.0 } else { 0.0 };
                     let base = match eff.path.as_str() {
-                        "mech.regen_per_s" | "mech.regen_delay" => 114.0,
-                        "mech.hp" => 108.0,
-                        "mech.armor" => 106.0,
+                        "mech.regen_per_s" | "mech.regen_delay" => 114.0 + lg_bonus,
+                        "mech.hp" => 108.0 + lg_bonus,
+                        "mech.armor" => 106.0 + lg_bonus,
                         "weapons.lightning.range" | "weapons.lightning.cone_deg" => 104.0,
                         "weapons.lightning.damage" | "weapons.lightning.energy" => 103.0,
                         "weapons.laser.damage" | "weapons.laser.charge" | "weapons.laser.pierce" => {
@@ -319,8 +326,16 @@ impl StrategyState {
         let safe_r = (obs.zone.next_radius - 18.0).max(0.0);
         let stat_cap = config.cubes.stat_cap.round() as u64;
         let slot1_empty = me.weapons.get(1).and_then(|w| w.as_ref()).is_none();
+        let fortress_phase = (me.cubes >= stat_cap && obs.t >= 110.0) || obs.t >= 180.0;
+        let endgame = obs.t >= 340.0 || obs.zone.next_radius <= 30.0;
 
         if !me.in_zone || (dist_next > safe_r && obs.t >= obs.zone.shrink_start - 20.0) {
+            self.posture = Posture::ZoneRotate;
+            return;
+        }
+
+        let endgame_hold_r = (obs.zone.next_radius * 0.40).max(8.0);
+        if endgame && dist_next > endgame_hold_r && los_count == 0 && !immediate_kill_avail {
             self.posture = Posture::ZoneRotate;
             return;
         }
@@ -328,7 +343,16 @@ impl StrategyState {
         let winning_or_even_1v1 = los_count == 1 && los_mechs[0].hp <= me.hp + 180.0;
         let enemy_in_face = los_mechs.iter().any(|m| m.dist < 32.0);
         let regen_exit = if near_mechs > 0 { 0.78 } else { 0.72 };
-        let want_regen = if self.posture == Posture::EmergencyRegen {
+        let want_regen = if endgame {
+            if self.posture == Posture::EmergencyRegen {
+                !immediate_kill_avail && !enemy_in_face && me.hp < 0.90 * me.max_hp
+            } else {
+                !immediate_kill_avail
+                    && !enemy_in_face
+                    && ((me.hp < 0.75 * me.max_hp && los_count >= 2)
+                        || (me.hp < 0.62 * me.max_hp && near_mechs > 0 && !winning_or_even_1v1))
+            }
+        } else if self.posture == Posture::EmergencyRegen {
             !immediate_kill_avail
                 && !enemy_in_face
                 && me.hp < regen_exit * me.max_hp
@@ -349,7 +373,11 @@ impl StrategyState {
             return;
         }
 
-        if self.find_best_supply_drop(world, obs, los_mechs).is_some() {
+        if !endgame
+            && self
+                .find_best_supply_drop(world, obs, los_mechs, fortress_phase)
+                .is_some()
+        {
             self.posture = Posture::SupplyDrop;
             return;
         }
@@ -377,7 +405,7 @@ impl StrategyState {
             return;
         }
 
-        if weapon_goal.is_some() {
+        if (!endgame || slot1_empty) && weapon_goal.is_some() {
             self.posture = Posture::LootWeapon;
             return;
         }
@@ -420,6 +448,8 @@ impl StrategyState {
         let stat_cap = config.cubes.stat_cap.round() as u64;
         let want_cubes = me.cubes < stat_cap || (me.cubes >= 13 && me.cubes < 15);
         let slot1_empty = me.weapons.get(1).and_then(|w| w.as_ref()).is_none();
+        let fortress_phase = (me.cubes >= stat_cap && obs.t >= 110.0) || obs.t >= 180.0;
+        let endgame = obs.t >= 340.0 || obs.zone.next_radius <= 30.0;
         let my_lt_range = me
             .weapons
             .iter()
@@ -555,7 +585,9 @@ impl StrategyState {
                 return ([0.0, 0.0], me_xy);
             }
             Posture::SupplyDrop => {
-                if let Some(drop) = self.find_best_supply_drop(world, obs, los_mechs) {
+                if let Some(drop) =
+                    self.find_best_supply_drop(world, obs, los_mechs, fortress_phase)
+                {
                     let d = dist2d(me.pos[0], me.pos[1], drop.pos[0], drop.pos[1]);
                     if drop.lands_in > 5.0 && d < 28.0 {
                         let threats: Vec<[f64; 3]> = mech_cands
@@ -1062,7 +1094,12 @@ impl StrategyState {
                         }
                     }
 
-                    if dist_next > safe_r * 0.85 {
+                    let endgame_pull_r = (obs.zone.next_radius * 0.50).max(8.0);
+                    if endgame && dist_next > endgame_pull_r {
+                        let zdir = unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]);
+                        gx += zdir[0] * 0.80;
+                        gy += zdir[1] * 0.80;
+                    } else if dist_next > safe_r * 0.85 {
                         let zdir = unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]);
                         gx += zdir[0] * 0.55;
                         gy += zdir[1] * 0.55;
@@ -1073,6 +1110,110 @@ impl StrategyState {
                 }
             }
             Posture::EarlyFarm => {}
+        }
+
+        if endgame {
+            if dist_next > 8.0 {
+                let wp = self.follow_astar(nav, scratch, me_xy, nc, obs.t);
+                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), nc);
+            }
+            return ([0.0, 0.0], nc);
+        }
+
+        if fortress_phase {
+            if want_cubes {
+                if let Some(cube) = obs
+                    .cubes
+                    .iter()
+                    .filter(|c| {
+                        is_ground_level(map, c.pos)
+                            && dist2d(me.pos[0], me.pos[1], c.pos[0], c.pos[1]) <= 35.0
+                            && dist2d(c.pos[0], c.pos[1], nc[0], nc[1])
+                                <= obs.zone.next_radius - 5.0
+                    })
+                    .min_by(|a, b| {
+                        let da = dist2d(me.pos[0], me.pos[1], a.pos[0], a.pos[1]);
+                        let db = dist2d(me.pos[0], me.pos[1], b.pos[0], b.pos[1]);
+                        da.total_cmp(&db).then_with(|| a.id.cmp(&b.id))
+                    })
+                {
+                    let goal = [cube.pos[0], cube.pos[1]];
+                    let wp = self.follow_astar(nav, scratch, me_xy, goal, obs.t);
+                    return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), goal);
+                }
+            }
+
+            if dist_next > (safe_r * 0.55).max(16.0) {
+                let wp = self.follow_astar(nav, scratch, me_xy, nc, obs.t);
+                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), nc);
+            }
+
+            if world.is_huntable_sound(obs.t)
+                && world.last_sound_is_near
+                && me.hp >= 0.92 * me.max_hp
+                && obs.t < 280.0
+            {
+                if let Some(b) = world.last_sound_bearing {
+                    let raw_x = me.pos[0] + b.cos() * 65.0;
+                    let raw_y = me.pos[1] + b.sin() * 65.0;
+                    let hunt_r = (safe_r * 0.70).max(14.0);
+                    let d_nc = dist2d(raw_x, raw_y, nc[0], nc[1]);
+                    let goal = if d_nc > hunt_r && d_nc > 1.0 {
+                        let s = hunt_r / d_nc;
+                        [nc[0] + (raw_x - nc[0]) * s, nc[1] + (raw_y - nc[1]) * s]
+                    } else {
+                        [raw_x, raw_y]
+                    };
+                    self.tactic = CombatTactic::AggressivePush;
+                    let wp = self.follow_astar(nav, scratch, me_xy, goal, obs.t);
+                    return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), goal);
+                }
+            }
+
+            let fortress_r = (obs.zone.next_radius * 0.65)
+                .max(38.0)
+                .min(obs.zone.next_radius);
+            let anchor_bad = self.ambush_anchor.is_none_or(|a| {
+                dist2d(a[0], a[1], nc[0], nc[1]) > (fortress_r - 12.0).max(14.0)
+                    || dist2d(a[0], a[1], obs.zone.center[0], obs.zone.center[1])
+                        > obs.zone.radius - 10.0
+            });
+            if anchor_bad {
+                self.ambush_anchor = nav
+                    .find_cover_anchor(
+                        me.pos,
+                        obs.zone.center,
+                        obs.zone.radius,
+                        nc,
+                        fortress_r,
+                        None,
+                        65.0,
+                    )
+                    .or_else(|| {
+                        nav.find_cover_anchor(
+                            me.pos,
+                            obs.zone.center,
+                            obs.zone.radius,
+                            nc,
+                            obs.zone.next_radius,
+                            None,
+                            80.0,
+                        )
+                    });
+                self.ambush_anchor_t = obs.t;
+            }
+            if let Some(anchor) = self.ambush_anchor {
+                if dist2d(me.pos[0], me.pos[1], anchor[0], anchor[1]) <= 6.0 {
+                    return ([0.0, 0.0], anchor);
+                }
+                let wp = self.follow_astar(nav, scratch, me_xy, anchor, obs.t);
+                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), anchor);
+            }
+            if dist_next > 12.0 {
+                let wp = self.follow_astar(nav, scratch, me_xy, nc, obs.t);
+                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), nc);
+            }
+            return ([0.0, 0.0], nc);
         }
 
         // EarlyFarm / fallback: cubes -> farm_target -> crates -> zone -> near sounds -> 50 m unvisited snowball -> 15 s hunt -> mid/far sounds -> sweep
@@ -1336,9 +1477,12 @@ impl StrategyState {
         world: &WorldState,
         obs: &'a Observation,
         los_mechs: &[&TargetCandidate],
+        strict_safe: bool,
     ) -> Option<&'a DropObs> {
         let me = &obs.self_obs;
-        let max_pull = if me.hp < 0.70 * me.max_hp {
+        let max_pull = if strict_safe {
+            160.0
+        } else if me.hp < 0.70 * me.max_hp {
             340.0
         } else {
             220.0
@@ -1356,7 +1500,7 @@ impl StrategyState {
                 .values()
                 .filter(|e| dist2d(e.pos[0], e.pos[1], d.pos[0], d.pos[1]) <= 25.0)
                 .count();
-            if campers >= 2 {
+            if (strict_safe && campers >= 1) || campers >= 2 {
                 continue;
             }
             let dist = dist2d(me.pos[0], me.pos[1], d.pos[0], d.pos[1]);

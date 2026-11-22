@@ -8,6 +8,27 @@ struct RawWorld {
     bounds: RawBounds,
     terrain: RawTerrain,
     prisms: Vec<RawPrism>,
+    #[serde(default)]
+    trees: Option<RawTrees>,
+}
+
+#[derive(Deserialize)]
+struct RawTrees {
+    fields: Vec<String>,
+    data: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Tree {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub crown_x: f64,
+    pub crown_y: f64,
+    pub crown_base_z: f64,
+    pub top_z: f64,
+    pub crown_r: f64,
+    pub trunk_r: f64,
 }
 
 #[derive(Deserialize)]
@@ -67,12 +88,14 @@ pub struct Map {
     t_ny: usize,
     heights: Vec<f32>,
     pub prisms: Vec<Prism>,
+    pub trees: Vec<Tree>,
     grid_cell: f64,
     grid_nx: usize,
     grid_ny: usize,
     grid_origin_x: f64,
     grid_origin_y: f64,
     grid: Vec<Vec<usize>>,
+    tree_grid: Vec<Vec<usize>>,
 }
 
 impl Map {
@@ -152,6 +175,7 @@ impl Map {
         let grid_nx = ((span_x / grid_cell).ceil() as usize).max(1);
         let grid_ny = ((span_y / grid_cell).ceil() as usize).max(1);
         let mut grid = vec![Vec::new(); grid_nx * grid_ny];
+        let mut tree_grid = vec![Vec::new(); grid_nx * grid_ny];
 
         for (idx, p) in prisms.iter().enumerate() {
             let cx0 = (((p.min_x - grid_origin_x) / grid_cell).floor() as isize)
@@ -169,6 +193,27 @@ impl Map {
             }
         }
 
+        let trees = parse_trees(raw.trees);
+        for (idx, tr) in trees.iter().enumerate() {
+            let min_x = (tr.x - tr.trunk_r).min(tr.crown_x - tr.crown_r);
+            let max_x = (tr.x + tr.trunk_r).max(tr.crown_x + tr.crown_r);
+            let min_y = (tr.y - tr.trunk_r).min(tr.crown_y - tr.crown_r);
+            let max_y = (tr.y + tr.trunk_r).max(tr.crown_y + tr.crown_r);
+            let cx0 = (((min_x - grid_origin_x) / grid_cell).floor() as isize)
+                .clamp(0, (grid_nx - 1) as isize) as usize;
+            let cx1 = (((max_x - grid_origin_x) / grid_cell).floor() as isize)
+                .clamp(0, (grid_nx - 1) as isize) as usize;
+            let cy0 = (((min_y - grid_origin_y) / grid_cell).floor() as isize)
+                .clamp(0, (grid_ny - 1) as isize) as usize;
+            let cy1 = (((max_y - grid_origin_y) / grid_cell).floor() as isize)
+                .clamp(0, (grid_ny - 1) as isize) as usize;
+            for cy in cy0..=cy1 {
+                for cx in cx0..=cx1 {
+                    tree_grid[cy * grid_nx + cx].push(idx);
+                }
+            }
+        }
+
         Ok(Self {
             min_x: raw.bounds.min_x,
             max_x: raw.bounds.max_x,
@@ -181,12 +226,14 @@ impl Map {
             t_ny: raw.terrain.ny,
             heights,
             prisms,
+            trees,
             grid_cell,
             grid_nx,
             grid_ny,
             grid_origin_x,
             grid_origin_y,
             grid,
+            tree_grid,
         })
     }
 
@@ -203,12 +250,14 @@ impl Map {
             t_ny: 3,
             heights: vec![0.0; 9],
             prisms: Vec::new(),
+            trees: Vec::new(),
             grid_cell: 64.0,
             grid_nx: 1,
             grid_ny: 1,
             grid_origin_x: -600.0,
             grid_origin_y: -600.0,
             grid: vec![Vec::new()],
+            tree_grid: vec![Vec::new()],
         }
     }
 
@@ -523,7 +572,57 @@ impl Map {
         true
     }
 
+    /// Returns true when solid geometry blocks LOS or (beyond 45 m) tree trunks / >= 4 m dense canopy obscure vision.
+    pub fn vision_blocked(&self, a: [f64; 3], b: [f64; 3], canopy_blocks: bool) -> bool {
+        if !self.has_los(a, b) {
+            return true;
+        }
+        let dx = b[0] - a[0];
+        let dy = b[1] - a[1];
+        let dz = b[2] - a[2];
+        let len_xy = dx.hypot(dy);
+        if !canopy_blocks || len_xy <= 45.0 || self.trees.is_empty() {
+            return false;
+        }
+        let candidates = self.collect_segment_grid(&self.tree_grid, a[0], a[1], b[0], b[1]);
+        let mut crown_len = 0.0_f64;
+        for idx in candidates {
+            let tr = &self.trees[idx];
+            if let Some((t0, t1)) =
+                segment_circle_t(a[0], a[1], dx, dy, tr.x, tr.y, tr.trunk_r)
+            {
+                let zm = a[2] + dz * (0.5 * (t0 + t1));
+                if zm >= tr.z && zm <= tr.crown_base_z {
+                    return true;
+                }
+            }
+            if let Some((t0, t1)) =
+                segment_circle_t(a[0], a[1], dx, dy, tr.crown_x, tr.crown_y, tr.crown_r)
+            {
+                let zm = a[2] + dz * (0.5 * (t0 + t1));
+                if zm >= tr.crown_base_z && zm <= tr.top_z {
+                    crown_len += (t1 - t0) * len_xy;
+                    if crown_len >= 4.0 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn collect_segment_prisms(&self, x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<usize> {
+        self.collect_segment_grid(&self.grid, x0, y0, x1, y1)
+    }
+
+    fn collect_segment_grid(
+        &self,
+        grid: &[Vec<usize>],
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+    ) -> Vec<usize> {
         let mut out = Vec::with_capacity(24);
         let fx0 = (x0 - self.grid_origin_x) / self.grid_cell;
         let fy0 = (y0 - self.grid_origin_y) / self.grid_cell;
@@ -580,7 +679,7 @@ impl Map {
 
         let max_iters = self.grid_nx + self.grid_ny + 4;
         for _ in 0..max_iters {
-            let cell = &self.grid[cy as usize * self.grid_nx + cx as usize];
+            let cell = &grid[cy as usize * self.grid_nx + cx as usize];
             out.extend_from_slice(cell);
             if cx == end_cx && cy == end_cy {
                 break;
@@ -603,6 +702,79 @@ impl Map {
         out.sort_unstable();
         out.dedup();
         out
+    }
+}
+
+fn parse_trees(raw: Option<RawTrees>) -> Vec<Tree> {
+    let Some(rt) = raw else {
+        return Vec::new();
+    };
+    let stride = rt.fields.len();
+    if stride == 0 {
+        return Vec::new();
+    }
+    let idx_of = |name: &str| rt.fields.iter().position(|f| f == name);
+    let (Some(ix), Some(iy), Some(iz), Some(ih), Some(icr), Some(icb), Some(itr), Some(icx), Some(icy)) = (
+        idx_of("x"),
+        idx_of("y"),
+        idx_of("z"),
+        idx_of("height"),
+        idx_of("crownR"),
+        idx_of("crownBase"),
+        idx_of("trunkR"),
+        idx_of("crownX"),
+        idx_of("crownY"),
+    ) else {
+        return Vec::new();
+    };
+    let n = rt.data.len() / stride;
+    let mut trees = Vec::with_capacity(n);
+    for row in rt.data.chunks_exact(stride) {
+        let z = row[iz];
+        trees.push(Tree {
+            x: row[ix],
+            y: row[iy],
+            z,
+            crown_x: row[icx],
+            crown_y: row[icy],
+            crown_base_z: z + row[icb],
+            top_z: z + row[ih],
+            crown_r: row[icr],
+            trunk_r: row[itr],
+        });
+    }
+    trees
+}
+
+#[inline]
+fn segment_circle_t(
+    ax: f64,
+    ay: f64,
+    dx: f64,
+    dy: f64,
+    cx: f64,
+    cy: f64,
+    r: f64,
+) -> Option<(f64, f64)> {
+    let ox = ax - cx;
+    let oy = ay - cy;
+    let a = dx * dx + dy * dy;
+    if a <= 1e-12 || r <= 0.0 {
+        return None;
+    }
+    let b_half = ox * dx + oy * dy;
+    let c = ox * ox + oy * oy - r * r;
+    let disc = b_half * b_half - a * c;
+    if disc <= 0.0 {
+        return None;
+    }
+    let sq = disc.sqrt();
+    let t0 = ((-b_half - sq) / a).max(0.0);
+    let t1 = ((-b_half + sq) / a).min(1.0);
+    if t1 > t0 {
+        Some((t0, t1))
+    } else {
+        None
     }
 }
 
