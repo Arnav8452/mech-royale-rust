@@ -143,7 +143,11 @@ pub(crate) fn select_targets(
                         is_vulnerable: false,
                         last_reversal_t: -100.0,
                     };
-                    let score = 200.0 - d;
+                    let score = if (me.cubes as f64) < config.cubes.stat_cap {
+                        240.0 - d
+                    } else {
+                        200.0 - d
+                    };
                     if best_farm.as_ref().is_none_or(|(bs, _)| score > *bs) {
                         best_farm = Some((score, cand));
                     }
@@ -187,7 +191,7 @@ pub(crate) fn select_targets(
                     is_vulnerable: false,
                     last_reversal_t: -100.0,
                 };
-                let score = 100.0 - d;
+                let score = if slot1_empty { 215.0 - d } else { 100.0 - d };
                 if best_farm.as_ref().is_none_or(|(bs, _)| score > *bs) {
                     best_farm = Some((score, cand));
                 }
@@ -243,7 +247,7 @@ pub(crate) fn pick_best_mech_target(
             score += 35.0;
         }
         if have_laser && c.weapons.contains(&WeaponKind::Mortar) {
-            score += 95.0; // Cook-off!
+            score += 145.0; // Cook-off!
         }
         if have_lightning {
             let lr = lt_range.unwrap_or(45.0);
@@ -368,11 +372,11 @@ pub(crate) fn eval_combat(
         );
         fire[ls] = should_hold;
 
-        if should_hold && charge < full_charge - 0.06 {
+        if should_hold && charge < full_charge * 0.86 {
             if let Some(gs) = gun_slot {
                 let (g_aim, g_fire, g_rel, g_ready) = eval_gun_slot(gs);
                 reload = g_rel;
-                let handoff_ok = charge < full_charge - 0.12
+                let handoff_ok = charge < full_charge * 0.78
                     || (angle_diff(g_aim[0], l_aim[0]).abs() <= 0.14
                         && (g_aim[1] - l_aim[1]).abs() <= 0.14);
                 if g_ready && handoff_ok {
@@ -523,6 +527,7 @@ pub(crate) fn eval_combat(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn eval_precharge_laser(
+    map: &Map,
     obs: &Observation,
     config: &Config,
     world: &WorldState,
@@ -560,19 +565,39 @@ pub(crate) fn eval_precharge_laser(
         d_pp <= 4.5
     });
 
-    if los_mech_count == 0 && near_peek {
+    if los_mech_count == 0 {
         if let Some((_, enemy)) = world.closest_tracked_enemy_within(me.pos, 180.0) {
             let base_mech_h = stat(&config.mech, "height", 9.0);
-            let aim_pt = [enemy.pos[0], enemy.pos[1], enemy.pos[2] + 0.5 * base_mech_h];
-            let mut aim = direct_aim(muzzle, aim_pt);
-            aim[1] = aim[1].clamp(min_pitch, max_pitch);
+            let pred_muzzle = [
+                muzzle[0] + me.vel[0] * 0.35,
+                muzzle[1] + me.vel[1] * 0.35,
+                muzzle[2],
+            ];
+            let pred_enemy = [
+                enemy.pos[0] + enemy.vel[0] * 0.35,
+                enemy.pos[1] + enemy.vel[1] * 0.35,
+                enemy.pos[2] + 0.5 * base_mech_h,
+            ];
+            let moving = enemy.vel[0].hypot(enemy.vel[1]) > 1.5 || me.vel[0].hypot(me.vel[1]) > 1.5;
+            let imminent_corner_los = moving
+                && (enemy.pos[0] - me.pos[0]).hypot(enemy.pos[1] - me.pos[1]) <= 150.0
+                && map.has_los(pred_muzzle, pred_enemy);
+            if near_peek || imminent_corner_los {
+                let aim_pt = if imminent_corner_los {
+                    pred_enemy
+                } else {
+                    [enemy.pos[0], enemy.pos[1], enemy.pos[2] + 0.5 * base_mech_h]
+                };
+                let mut aim = direct_aim(muzzle, aim_pt);
+                aim[1] = aim[1].clamp(min_pitch, max_pitch);
 
-            if active_laser_idx.is_some() {
-                pre_aim = Some(aim);
-            } else if me.hp > 0.45 * me.max_hp {
-                if let Some(idx) = ready_laser_idx {
-                    fire[idx] = true;
+                if active_laser_idx.is_some() {
                     pre_aim = Some(aim);
+                } else if me.hp > 0.45 * me.max_hp {
+                    if let Some(idx) = ready_laser_idx {
+                        fire[idx] = true;
+                        pre_aim = Some(aim);
+                    }
                 }
             }
         }
@@ -800,12 +825,12 @@ pub(crate) fn eval_laser(
         false
     } else if !tgt.has_los && charge >= full_charge + hold_s - 0.35 {
         false
-    } else if charge >= full_charge * 0.90 && tgt.has_los && aligned {
+    } else if charge >= full_charge * 0.95 && tgt.has_los && aligned {
         false
     } else if charge >= min_charge
         && tgt.has_los
         && aligned
-        && (expected_dmg >= tgt.hp * 1.05 || losing_los)
+        && (expected_dmg >= tgt.hp * 1.02 || losing_los)
     {
         false
     } else {

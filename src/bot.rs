@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m14-gunrail".to_string(),
+            name: "rust-bot-m17-slicer".to_string(),
             config: hello.config,
             map,
             nav,
@@ -95,7 +95,18 @@ impl Bot {
             }
         }
 
-        let immediate_kill_avail = me.hp > 180.0 && los_mechs.iter().any(|m| m.hp <= 560.0);
+        let have_laser = me
+            .weapons
+            .iter()
+            .flatten()
+            .any(|w| w.kind == crate::protocol::WeaponKind::Laser);
+        let immediate_kill_avail = me.hp > 180.0
+            && los_mechs.iter().any(|m| {
+                m.hp <= 560.0
+                    || (have_laser
+                        && m.weapons.contains(&crate::protocol::WeaponKind::Mortar)
+                        && m.hp <= 760.0)
+            });
 
         self.strategy.update_posture(
             &self.map,
@@ -184,6 +195,7 @@ impl Bot {
             )
         } else {
             let (pre_fire, pre_aim) = combat::eval_precharge_laser(
+                &self.map,
                 obs,
                 &self.config,
                 &self.world,
@@ -2029,6 +2041,7 @@ mod tests {
         let muzzle = [obs.self_obs.pos[0], obs.self_obs.pos[1], obs.self_obs.pos[2] + eye_h];
         bot.world.update(&obs, &bot.map, &bot.config);
         let (pre_fire, pre_aim) = crate::combat::eval_precharge_laser(
+            &bot.map,
             &obs,
             &bot.config,
             &bot.world,
@@ -2851,6 +2864,258 @@ mod tests {
             act.boost,
             Some(true),
             "[Gun, Laser] with 80 energy must boost-strafe continuously in combat"
+        );
+    }
+
+    #[test]
+    fn slicer_isolates_1v1_pie_slice_when_two_enemies_in_los_instead_of_giving_up_dps() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        // Near NW corner of building block 14 (x=90.6..186, y=-175.9..-101.7):
+        // At (89, -98), both enemy A at (93, -72) (North) and enemy B at (75, -140) (SW) have LOS.
+        // Stepping East behind y=-101.7 blocks enemy B while keeping 3D LOS to enemy A!
+        let mz = bot.map.ground_height(89.0, -98.0);
+        let ez_a = bot.map.ground_height(93.0, -72.0);
+        let ez_b = bot.map.ground_height(75.0, -140.0);
+
+        let sp = bot
+            .nav
+            .find_pie_slice_point(
+                &bot.map,
+                [89.0, -98.0, mz],
+                8.0,
+                [93.0, -72.0, ez_a + 7.5],
+                &[[75.0, -140.0, ez_b + 7.5]],
+                [0.0, 0.0],
+                500.0,
+                [0.0, 0.0],
+                400.0,
+                24.0,
+            )
+            .expect("must find 1v1 pie-slice point with LOS to primary and 0 LOS to secondary");
+        let sp_z = bot.map.ground_height(sp[0], sp[1]);
+        assert!(
+            bot.map.has_los([sp[0], sp[1], sp_z + 8.0], [93.0, -72.0, ez_a + 7.5]),
+            "pie-slice point must preserve LOS to primary enemy A"
+        );
+        assert!(
+            !bot.map.has_los([sp[0], sp[1], sp_z + 8.0], [75.0, -140.0, ez_b + 7.5]),
+            "pie-slice point must block LOS to secondary enemy B"
+        );
+
+        obs.t = 30.0;
+        obs.self_obs.pos = [89.0, -98.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1200.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 40.0; // < 54 so it slices on ground rather than roof-climbing
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [89.0, -98.0];
+        obs.zone.next_center = [89.0, -98.0];
+        obs.zone.radius = 250.0;
+        obs.zone.next_radius = 220.0;
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Gun,
+                cooldown: 0.0,
+                ammo: Some(12.0),
+                reload: Some(0.0),
+                charge: None,
+                stats: bot.config.weapons.gun.clone(),
+            }),
+            Some(WeaponObs {
+                kind: WeaponKind::Laser,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: Some(0.0),
+                stats: bot.config.weapons.laser.clone(),
+            }),
+        ];
+        obs.mechs = vec![
+            ActorObs {
+                id: 940,
+                kind: "mech".into(),
+                pos: [93.0, -72.0, ez_a],
+                vel: [0.0, 0.0, 0.0],
+                aim: [0.0, 0.0],
+                hp: Some(900.0),
+                max_hp: Some(1400.0),
+                cubes: Some(0),
+                weapons: vec![WeaponKind::Gun],
+                charging: false,
+            },
+            ActorObs {
+                id: 941,
+                kind: "mech".into(),
+                pos: [75.0, -140.0, ez_b],
+                vel: [0.0, 0.0, 0.0],
+                aim: [0.0, 0.0],
+                hp: Some(1400.0),
+                max_hp: Some(1400.0),
+                cubes: Some(0),
+                weapons: vec![WeaponKind::Gun],
+                charging: false,
+            },
+        ];
+
+        let act = bot.act(&obs);
+        assert_eq!(
+            bot.strategy.tactic,
+            CombatTactic::CornerPeek,
+            "must enter CornerPeek pie-slice tactic rather than CoverDuck"
+        );
+        assert_eq!(
+            act.fire.unwrap()[1],
+            true,
+            "1v1 pie-slice CornerPeek must keep charging Laser on primary target instead of suppressing fire"
+        );
+    }
+
+    #[test]
+    fn slicer_stops_mid_combat_cube_bloat_past_10_cubes_and_executes_mortar_cookoff() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(-120.0, 20.0);
+        let ez = bot.map.ground_height(-172.0, 20.0);
+
+        obs.t = 40.0;
+        obs.self_obs.pos = [-120.0, 20.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1960.0;
+        obs.self_obs.max_hp = 1960.0;
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.cubes = 11; // >= stat_cap (10) and not in 13..15 -> cube gives 0 HP/dmg and only bloats hitbox!
+        obs.self_obs.aim = [PI, 0.0];
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [-120.0, 20.0];
+        obs.zone.next_center = [-120.0, 20.0];
+        obs.zone.radius = 250.0;
+        obs.zone.next_radius = 220.0;
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Gun,
+                cooldown: 0.0,
+                ammo: Some(12.0),
+                reload: Some(0.0),
+                charge: None,
+                stats: bot.config.weapons.gun.clone(),
+            }),
+            Some(WeaponObs {
+                kind: WeaponKind::Laser,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: Some(0.0),
+                stats: bot.config.weapons.laser.clone(),
+            }),
+        ];
+        // Place a cube 12 m West at (-132, 20) (toward the enemy): at 11 cubes, must NOT walk West toward it!
+        obs.cubes = vec![ItemObs {
+            id: 5001,
+            pos: [-132.0, 20.0, mz],
+            hp: None,
+        }];
+        obs.mechs = vec![ActorObs {
+            id: 950,
+            kind: "mech".into(),
+            pos: [-172.0, 20.0, ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1400.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+
+        let act = bot.act(&obs);
+        assert!(
+            act.move_dir.unwrap()[0] > 0.2,
+            "at 11 cubes (>= stat_cap), must kite back +x rather than chasing a 0-stat hitbox-bloating cube at -x, got {:?}",
+            act.move_dir
+        );
+
+        // Now give enemy Mortar and 700 HP (> 560 normal threshold, <= 760 cook-off threshold) while we are at 35% HP:
+        // immediate_kill_avail must keep us in Combat to finish the cook-off kill instead of fleeing to EmergencyRegen!
+        obs.cubes.clear();
+        obs.self_obs.hp = 600.0; // < 0.42 * 1960
+        obs.mechs[0].hp = Some(700.0);
+        obs.mechs[0].weapons = vec![WeaponKind::Mortar];
+        let act_kill = bot.act(&obs);
+        assert_eq!(
+            bot.strategy.posture,
+            Posture::Combat,
+            "700 HP Mortar holder must trigger Laser cook-off immediate_kill_avail and stay in Combat"
+        );
+        assert_eq!(act_kill.fire.unwrap()[1], true);
+    }
+
+    #[test]
+    fn slicer_dips_into_roof_parapet_interior_when_weapons_on_cooldown_and_precharges_imminent_corner() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        // On prism 56 east roof (-8, -24), enemy on ground East at (30, -24); (-20, -24) is 12 m West on same roof
+        let rz = bot
+            .map
+            .roof_top_at(-8.0, -24.0)
+            .expect("prism 56 must have roof at (-8, -24)");
+        let ez = bot.map.ground_height(30.0, -24.0);
+        obs.t = 50.0;
+        obs.self_obs.pos = [-8.0, -24.0, rz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1350.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [-8.0, -24.0];
+        obs.zone.next_center = [-8.0, -24.0];
+        obs.zone.radius = 250.0;
+        obs.zone.next_radius = 220.0;
+        obs.cubes.clear();
+        obs.pickups.clear();
+        // Both weapons temporarily on reload/cooldown -> no_weapon_can_shoot_now = true!
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Gun,
+                cooldown: 0.0,
+                ammo: Some(0.0),
+                reload: Some(1.6),
+                charge: None,
+                stats: bot.config.weapons.gun.clone(),
+            }),
+            Some(WeaponObs {
+                kind: WeaponKind::Laser,
+                cooldown: 1.2,
+                ammo: None,
+                reload: None,
+                charge: Some(0.0),
+                stats: bot.config.weapons.laser.clone(),
+            }),
+        ];
+        obs.mechs = vec![ActorObs {
+            id: 960,
+            kind: "mech".into(),
+            pos: [30.0, -24.0, ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1400.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+
+        let act_dip = bot.act(&obs);
+        assert_eq!(
+            bot.strategy.tactic,
+            CombatTactic::CoverDuck,
+            "on roof with both weapons on reload/cooldown, must dip into roof interior CoverDuck instead of rim-strafing"
+        );
+        assert!(
+            act_dip.move_dir.unwrap()[0] < -0.3,
+            "must step West (-x) into prism 56 roof interior away from East enemy, got {:?}",
+            act_dip.move_dir
         );
     }
 }

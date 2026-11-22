@@ -626,6 +626,36 @@ impl StrategyState {
                     }
                 }
 
+                let no_weapon_can_shoot_now = if let Some(tgt) = combat_enemy {
+                    let any_charging = me
+                        .weapons
+                        .iter()
+                        .flatten()
+                        .any(|w| w.kind == WeaponKind::Laser && w.charge.unwrap_or(0.0) > 0.0);
+                    let any_ready = me.weapons.iter().flatten().any(|w| match w.kind {
+                        WeaponKind::Gun => {
+                            let r = stat(&w.stats, "range", 230.0);
+                            w.cooldown <= 0.38
+                                && w.reload.unwrap_or(0.0) <= 0.0
+                                && w.ammo.unwrap_or(1.0) > 0.0
+                                && tgt.dist <= r
+                        }
+                        WeaponKind::Laser => {
+                            let r = stat(&w.stats, "range", 280.0);
+                            w.cooldown <= 0.38 && tgt.dist <= r
+                        }
+                        WeaponKind::Lightning => {
+                            let r = stat(&w.stats, "range", 45.0);
+                            let e_cost = stat(&w.stats, "energy", 3.0);
+                            w.cooldown <= 0.38 && tgt.dist <= r && me.energy >= 10.0_f64.max(e_cost)
+                        }
+                        WeaponKind::Mortar => false,
+                    });
+                    !any_charging && !any_ready
+                } else {
+                    false
+                };
+
                 let my_lt_range = me
                     .weapons
                     .iter()
@@ -791,7 +821,9 @@ impl StrategyState {
                         .iter()
                         .any(|m| m.charging && m.dist > my_lt_range)
                         && our_laser_charge_frac < 0.65;
-                    if los_mech_count <= 1 && !enemy_charging_far && me.cubes < 15 {
+                    let want_cube_now = (me.cubes as f64) < config.cubes.stat_cap
+                        || (13..15).contains(&me.cubes);
+                    if los_mech_count <= 1 && !enemy_charging_far && want_cube_now {
                         if let Some(cube) = obs
                             .cubes
                             .iter()
@@ -812,7 +844,10 @@ impl StrategyState {
                             return (unit2d(goal[0] - me.pos[0], goal[1] - me.pos[1]), goal, None);
                         }
                     }
-                    if (los_mech_count >= 2 || me.hp < 0.55 * me.max_hp || enemy_charging_far)
+                    if (los_mech_count >= 2
+                        || me.hp < 0.55 * me.max_hp
+                        || enemy_charging_far
+                        || (no_weapon_can_shoot_now && los_mech_count >= 1))
                         && !immediate_kill_avail
                     {
                         let mut all_eyes: Vec<(u64, [f64; 3])> = world
@@ -821,14 +856,21 @@ impl StrategyState {
                             .filter(|(_, te)| {
                                 dist2d(me.pos[0], me.pos[1], te.pos[0], te.pos[1]) <= 220.0
                             })
-                            .map(|(&id, te)| (id, [te.pos[0], te.pos[1], te.pos[2] + 7.5]))
+                            .map(|(&id, te)| (id, [te.pos[0], te.pos[1], te.pos[2] + 7.0]))
                             .collect();
                         all_eyes.sort_by_key(|(id, _)| *id);
                         if !all_eyes.is_empty() {
-                            let need_zero = me.hp < 0.55 * me.max_hp || enemy_charging_far;
-                            let max_allowed = if need_zero { 0 } else { 1 };
-                            let mut best_hide: Option<(f64, [f64; 2])> = None;
-                            for step_d in [5.0_f64, 9.0, 13.0] {
+                            let need_zero = me.hp < 0.55 * me.max_hp
+                                || enemy_charging_far
+                                || no_weapon_can_shoot_now;
+                            let cur_min_d = all_eyes
+                                .iter()
+                                .map(|&(_, te)| dist2d(me.pos[0], me.pos[1], te[0], te[1]))
+                                .fold(f64::INFINITY, f64::min);
+                            let ce_eye = combat_enemy
+                                .map(|ce| [ce.pos[0], ce.pos[1], ce.pos[2] + 7.0]);
+                            let mut best_hide: Option<(f64, [f64; 2], bool)> = None;
+                            for step_d in [5.0_f64, 9.0, 13.0, 17.0] {
                                 for k in 0..16 {
                                     let theta = (k as f64) * (PI / 8.0);
                                     let dir = [theta.cos(), theta.sin()];
@@ -846,28 +888,61 @@ impl StrategyState {
                                         continue;
                                     }
                                     let probe_eye = [rx, ry, rt + eye_h];
+                                    let probe_com = [rx, ry, rt + 4.5];
                                     let vis_cnt = all_eyes
                                         .iter()
                                         .filter(|&&(_, te)| map.has_los(probe_eye, te))
                                         .count();
-                                    if vis_cnt > max_allowed && vis_cnt >= los_mech_count {
+                                    let com_vis_cnt = all_eyes
+                                        .iter()
+                                        .filter(|&&(_, te)| map.has_los(probe_com, te))
+                                        .count();
+                                    let min_d = all_eyes
+                                        .iter()
+                                        .map(|&(_, te)| dist2d(rx, ry, te[0], te[1]))
+                                        .fold(f64::INFINITY, f64::min);
+                                    if !need_zero && vis_cnt > 1 && vis_cnt >= los_mech_count {
                                         continue;
                                     }
-                                    let score = -100.0 * (vis_cnt as f64) - step_d;
-                                    if best_hide.is_none_or(|(bs, _)| score > bs) {
-                                        best_hide = Some((score, [rx, ry]));
+                                    if need_zero
+                                        && vis_cnt >= los_mech_count
+                                        && com_vis_cnt >= los_mech_count
+                                        && min_d <= cur_min_d + 2.0
+                                    {
+                                        continue;
+                                    }
+                                    let has_ce_los =
+                                        ce_eye.is_some_and(|ce_pt| map.has_los(probe_eye, ce_pt));
+                                    let is_slice = !need_zero && vis_cnt == 1 && has_ce_los;
+                                    let score = if is_slice {
+                                        60.0 - step_d
+                                    } else {
+                                        -100.0 * (vis_cnt as f64)
+                                            - 45.0 * (com_vis_cnt as f64)
+                                            + 0.8 * (min_d - cur_min_d)
+                                            - 0.4 * step_d
+                                    };
+                                    if best_hide.is_none_or(|(bs, _, _)| score > bs) {
+                                        best_hide = Some((score, [rx, ry], is_slice));
                                     }
                                 }
                             }
-                            if let Some((_, pt)) = best_hide {
-                                self.tactic = CombatTactic::CoverDuck;
+                            if let Some((_, pt, is_slice)) = best_hide {
+                                self.tactic = if is_slice {
+                                    CombatTactic::CornerPeek
+                                } else {
+                                    CombatTactic::CoverDuck
+                                };
                                 return (unit2d(pt[0] - me.pos[0], pt[1] - me.pos[1]), pt, None);
                             }
                         }
                     }
 
                     // 3. Active Roof-Rim 1v1 Hunting when no enemy currently in LOS on roof
-                    if los_mech_count == 0 && me.hp >= 0.72 * me.max_hp {
+                    if los_mech_count == 0
+                        && me.hp >= 0.72 * me.max_hp
+                        && !no_weapon_can_shoot_now
+                    {
                         if let Some((pid, pe)) = world.closest_tracked_enemy_within(me.pos, 220.0) {
                             let pe_pos = pe.pos;
                             let primary_eye = [pe_pos[0], pe_pos[1], pe_pos[2] + 7.5];
@@ -956,19 +1031,33 @@ impl StrategyState {
                             0.0
                         };
                         let des = unit2d(to_e[0] * rw + tang[0], to_e[1] * rw + tang[1]);
+                        let other_eyes: Vec<[f64; 3]> = world
+                            .tracked_enemies
+                            .iter()
+                            .filter(|(&id, te)| {
+                                id != e.id
+                                    && dist2d(me.pos[0], me.pos[1], te.pos[0], te.pos[1]) <= 200.0
+                            })
+                            .map(|(_, te)| [te.pos[0], te.pos[1], te.pos[2] + 7.5])
+                            .collect();
                         let mut best: Option<(f64, [f64; 2])> = None;
                         for k in 0..16 {
                             let theta = (k as f64) * (PI / 8.0);
                             let dir = [theta.cos(), theta.sin()];
                             let rx = me.pos[0] + dir[0] * 6.0;
                             let ry = me.pos[1] + dir[1] * 6.0;
-                            let on_pad = map
+                            let Some(rt) = map
                                 .roof_top_at(rx, ry)
-                                .is_some_and(|rt| (rt - me.pos[2]).abs() <= 3.0);
-                            if !on_pad {
+                                .filter(|&rt| (rt - me.pos[2]).abs() <= 3.0)
+                            else {
                                 continue;
-                            }
-                            let s = dir[0] * des[0] + dir[1] * des[1];
+                            };
+                            let probe_eye = [rx, ry, rt + eye_h];
+                            let other_los = other_eyes
+                                .iter()
+                                .filter(|&&te| map.has_los(probe_eye, te))
+                                .count();
+                            let s = dir[0] * des[0] + dir[1] * des[1] - 4.0 * (other_los as f64);
                             if best.is_none_or(|(bs, _)| s > bs) {
                                 best = Some((s, dir));
                             }
@@ -981,7 +1070,11 @@ impl StrategyState {
                     }
                 }
             }
-            Posture::EarlyFarm if on_roof && me.cubes < 15 => {
+            Posture::EarlyFarm
+                if on_roof
+                    && ((me.cubes as f64) < config.cubes.stat_cap
+                        || (13..15).contains(&me.cubes)) =>
+            {
                 if let Some(cube) = obs
                     .cubes
                     .iter()
@@ -1210,12 +1303,21 @@ impl StrategyState {
 
                 let near_cover_14 = nav.has_near_cover_within(me.pos, 14.0);
 
-                // A. Mid-Combat Power Cube Magnet: free +4% max HP heal & +4% dmg mid-fight
-                if !enemy_laser_duck
+                // A. Mid-Combat Power Cube Magnet: free +4% max HP heal & +4% dmg mid-fight (capped at stat_cap to avoid hitbox bloat)
+                let want_cube_now =
+                    (me.cubes as f64) < config.cubes.stat_cap || (13..15).contains(&me.cubes);
+                if want_cube_now
+                    && !enemy_laser_duck
                     && los_mech_count <= 1
                     && !(no_weapon_can_shoot_now && los_mech_count >= 1)
                 {
-                    let cube_pull_r = if los_mech_count == 0 { 24.0 } else { 16.0 };
+                    let cube_pull_r = if (me.cubes as f64) >= config.cubes.stat_cap {
+                        10.0
+                    } else if los_mech_count == 0 {
+                        24.0
+                    } else {
+                        16.0
+                    };
                     let have_lt_ready = me
                         .weapons
                         .iter()
@@ -1253,11 +1355,52 @@ impl StrategyState {
                     }
                 }
 
-                // 1. CoverDuck: outnumbered (2+ LOS), dry/reloading, or enemy charging laser
+                // 1. CoverDuck / 1v1 Pie-Slicing: outnumbered (2+ LOS), dry/reloading, or enemy charging laser
                 if (los_mech_count >= 2 && !immediate_kill_avail)
                     || (no_weapon_can_shoot_now && !immediate_kill_avail)
                     || enemy_laser_duck
                 {
+                    if los_mech_count >= 2
+                        && !immediate_kill_avail
+                        && !enemy_laser_duck
+                        && !no_weapon_can_shoot_now
+                        && me.hp >= 0.48 * me.max_hp
+                    {
+                        if let Some(ce) = combat_enemy {
+                            let primary_eye = [ce.pos[0], ce.pos[1], ce.pos[2] + 7.5];
+                            let mut other_threats: Vec<[f64; 3]> = mech_cands
+                                .iter()
+                                .filter(|m| m.id != ce.id && m.has_los)
+                                .map(|m| [m.pos[0], m.pos[1], m.pos[2] + 7.5])
+                                .collect();
+                            for (&id, te) in &world.tracked_enemies {
+                                if id != ce.id
+                                    && dist2d(me.pos[0], me.pos[1], te.pos[0], te.pos[1]) <= 180.0
+                                    && !mech_cands.iter().any(|m| m.id == id && m.has_los)
+                                {
+                                    other_threats.push([te.pos[0], te.pos[1], te.pos[2] + 7.5]);
+                                }
+                            }
+                            if let Some(sp) = nav.find_pie_slice_point(
+                                map,
+                                me.pos,
+                                eye_h,
+                                primary_eye,
+                                &other_threats,
+                                obs.zone.center,
+                                obs.zone.radius,
+                                obs.zone.next_center,
+                                obs.zone.next_radius,
+                                24.0,
+                            ) {
+                                self.tactic = CombatTactic::CornerPeek;
+                                self.peek_target = Some(sp);
+                                let wp = self.follow_astar(nav, scratch, me_xy, sp, obs.t);
+                                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), sp);
+                            }
+                        }
+                    }
+
                     if los_mech_count == 0
                         && (near_cover_14
                             || self.combat_cover_target.is_some_and(|cp| {
@@ -1323,7 +1466,7 @@ impl StrategyState {
                                     cp,
                                     wp,
                                     world.strafe_sign,
-                                    los_mech_count > 0,
+                                    los_mech_count > 0 && !enemy_laser_duck,
                                 ),
                                 cp,
                             );
@@ -1387,7 +1530,7 @@ impl StrategyState {
                         .count();
                     let is_1v1 = los_mech_count == 1 && known_nearby_180 <= 1;
 
-                    let (perp, radial_band, tang_w) = if is_1v1 {
+                    let (perp, radial_band, tang_w) = if los_mech_count == 1 {
                         world.orbit_active_1v1 = true;
                         let orbit_blocked_for = |sign: f64| -> bool {
                             let p = [-to_e[1] * sign, to_e[0] * sign];
@@ -1579,7 +1722,7 @@ impl StrategyState {
         let want_farm_cubes =
             (me.cubes as f64) < config.cubes.stat_cap || (13..15).contains(&me.cubes);
 
-        if me.cubes < 15 {
+        if want_farm_cubes {
             if let Some(cube) = obs
                 .cubes
                 .iter()

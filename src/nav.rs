@@ -460,8 +460,14 @@ impl NavGrid {
         let mut cover_cands: Vec<(f64, [f64; 3], f64, bool)> = Vec::with_capacity(128);
         let mut fallback_cands: Vec<(f64, [f64; 3], f64, bool)> = Vec::with_capacity(128);
 
-        for cy in (y0..=y1).step_by(2) {
-            for cx in (x0..=x1).step_by(2) {
+        for cy in y0..=y1 {
+            if cy.abs_diff(me_cy) > 6 && (cy - y0) % 2 != 0 {
+                continue;
+            }
+            for cx in x0..=x1 {
+                if cx.abs_diff(me_cx) > 6 && (cx - x0) % 2 != 0 {
+                    continue;
+                }
                 let idx = cy * self.nx + cx;
                 if !self.walkable[idx] {
                     continue;
@@ -472,7 +478,7 @@ impl NavGrid {
                 }
                 let w = self.cell_to_world(cx, cy);
                 let d_me = (w[0] - me_pos[0]).hypot(w[1] - me_pos[1]);
-                if d_me < 6.0 || d_me > max_dist {
+                if d_me < 2.5 || d_me > max_dist {
                     continue;
                 }
                 if (w[0] - zone_center[0]).hypot(w[1] - zone_center[1]) > safe_zone_r {
@@ -552,6 +558,94 @@ impl NavGrid {
         }
 
         best_pt
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_pie_slice_point(
+        &self,
+        map: &Map,
+        me_pos: [f64; 3],
+        eye_h: f64,
+        primary_eye: [f64; 3],
+        other_threats: &[[f64; 3]],
+        zone_center: [f64; 2],
+        zone_radius: f64,
+        next_center: [f64; 2],
+        next_radius: f64,
+        max_dist: f64,
+    ) -> Option<[f64; 2]> {
+        if other_threats.is_empty() {
+            return None;
+        }
+        let (me_cx, me_cy) = self.world_to_cell(me_pos[0], me_pos[1]);
+        let r_cells: isize = ((max_dist / self.cell).ceil() as isize).clamp(3, 12);
+        let x0 = (me_cx as isize - r_cells).max(0) as usize;
+        let x1 = (me_cx as isize + r_cells).min((self.nx - 1) as isize) as usize;
+        let y0 = (me_cy as isize - r_cells).max(0) as usize;
+        let y1 = (me_cy as isize + r_cells).min((self.ny - 1) as isize) as usize;
+
+        let safe_zone_r = (zone_radius - 6.0).max(0.0);
+        let safe_next_r = (next_radius - 10.0).max(0.0);
+
+        let mut cands: Vec<(f64, [f64; 3], f64, bool)> = Vec::with_capacity(64);
+        for cy in y0..=y1 {
+            if cy.abs_diff(me_cy) > 5 && (cy - y0) % 2 != 0 {
+                continue;
+            }
+            for cx in x0..=x1 {
+                if cx.abs_diff(me_cx) > 5 && (cx - x0) % 2 != 0 {
+                    continue;
+                }
+                let idx = cy * self.nx + cx;
+                if !self.walkable[idx] {
+                    continue;
+                }
+                let cz = self.ground_z[idx] as f64;
+                if (cz - me_pos[2]).abs() > 22.0 {
+                    continue;
+                }
+                let w = self.cell_to_world(cx, cy);
+                let d_me = (w[0] - me_pos[0]).hypot(w[1] - me_pos[1]);
+                if d_me < 2.0 || d_me > max_dist {
+                    continue;
+                }
+                if (w[0] - zone_center[0]).hypot(w[1] - zone_center[1]) > safe_zone_r {
+                    continue;
+                }
+                let in_next =
+                    (w[0] - next_center[0]).hypot(w[1] - next_center[1]) <= safe_next_r;
+                let d_prim = (w[0] - primary_eye[0]).hypot(w[1] - primary_eye[1]);
+                let pre = -1.4 * d_me
+                    + if self.near_cover[idx] { 24.0 } else { 0.0 }
+                    + if in_next { 25.0 } else { -20.0 }
+                    - (d_prim - 58.0).abs() * 0.25;
+                cands.push((pre, [w[0], w[1], cz], d_me, in_next));
+            }
+        }
+        if cands.is_empty() {
+            return None;
+        }
+        cands.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+        cands.truncate(48);
+
+        let mut near_others: Vec<[f64; 3]> = other_threats.to_vec();
+        near_others.sort_unstable_by(|a, b| {
+            let da = (a[0] - me_pos[0]).hypot(a[1] - me_pos[1]);
+            let db = (b[0] - me_pos[0]).hypot(b[1] - me_pos[1]);
+            da.partial_cmp(&db).unwrap_or(Ordering::Equal)
+        });
+        near_others.truncate(4);
+
+        for (_, pt, _, _) in cands {
+            let eye = [pt[0], pt[1], pt[2] + eye_h];
+            if !map.has_los(eye, primary_eye) {
+                continue;
+            }
+            if near_others.iter().all(|th| !map.has_los(eye, *th)) {
+                return Some([pt[0], pt[1]]);
+            }
+        }
+        None
     }
 
     #[allow(clippy::too_many_arguments)]

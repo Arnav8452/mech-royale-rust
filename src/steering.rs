@@ -173,6 +173,12 @@ pub(crate) fn steer(
         if !(climbing_roof && goal_align > 0.6) {
             if !ok_near {
                 score -= 4.0;
+            } else if ducking_to_cover && goal_align > 0.65 {
+                if !ok_mid {
+                    score -= 0.35;
+                } else if !ok_far {
+                    score -= 0.10;
+                }
             } else if !ok_mid {
                 score -= 1.8;
             } else if !ok_far {
