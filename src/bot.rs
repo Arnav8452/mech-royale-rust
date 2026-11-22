@@ -280,7 +280,8 @@ impl Bot {
                     && (fire[i] || w.charge.unwrap_or(0.0) > 0.0)
             })
         });
-        let jump_charge = me.grounded && moving && laser_charging_now && !aimed_laser_dodge;
+        // cl-nojump: stay grounded while charging (ground accel 58.5 vs air 12 m/s^2).
+        let jump_charge = false && me.grounded && moving && laser_charging_now && !aimed_laser_dodge;
         let near_roof_wall = climbing_roof
             && (!self
                 .map
@@ -2090,6 +2091,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "cl-nojump removes the jump-charge on purpose"]
     fn gunrail_swaps_into_gun_laser_and_uses_jump_charge_without_jet_drain() {
         let (hello, mut obs) = load_sample_hello_and_obs();
         let mut bot = Bot::new(hello);
