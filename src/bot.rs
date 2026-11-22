@@ -39,7 +39,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m12-pred".to_string(),
+            name: "rust-bot-m12-jrail".to_string(),
             config: hello.config,
             map,
             nav,
@@ -2182,6 +2182,101 @@ mod tests {
             act_air.boost,
             Some(false),
             "airborne jump-charge must NOT drain jet energy"
+        );
+    }
+
+    #[test]
+    fn jumprail_prefers_laser_lightning_loadout_and_dual_fires_with_jump_charge() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(-45.0, 0.0);
+        let ez = bot.map.ground_height(-115.0, 0.0);
+        obs.t = 35.0;
+        obs.self_obs.pos = [-45.0, 0.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [-45.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [-45.0, 0.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 120.0;
+
+        // 1. Holding [Gun, Lightning] with 0 gun upgrades swaps Gun for nearby Laser
+        let w_gun = obs.self_obs.weapons[0].clone().unwrap();
+        let w_lt = WeaponObs {
+            kind: WeaponKind::Lightning,
+            cooldown: 0.0,
+            ammo: None,
+            reload: None,
+            charge: None,
+            stats: bot.config.weapons.lightning.clone(),
+        };
+        let w_las = WeaponObs {
+            kind: WeaponKind::Laser,
+            cooldown: 0.0,
+            ammo: None,
+            reload: None,
+            charge: Some(0.05),
+            stats: bot.config.weapons.laser.clone(),
+        };
+        obs.self_obs.weapons = vec![Some(w_gun.clone()), Some(w_lt.clone())];
+        obs.pickups = vec![PickupObs {
+            id: 8801,
+            kind: WeaponKind::Laser,
+            pos: [-43.5, 0.0, mz],
+        }];
+        let act_swap1 = bot.act(&obs);
+        assert_eq!(act_swap1.take, Some(8801));
+        assert_eq!(act_swap1.drop, Some(0), "must swap Gun out to form [Laser, Lightning]");
+
+        // 2. Holding [Gun, Laser] (idle laser) with 0 gun upgrades swaps Gun for nearby Lightning
+        obs.t = 35.2;
+        let mut w_las_idle = w_las.clone();
+        w_las_idle.charge = Some(0.0);
+        obs.self_obs.weapons = vec![Some(w_gun), Some(w_las_idle)];
+        obs.pickups = vec![PickupObs {
+            id: 8802,
+            kind: WeaponKind::Lightning,
+            pos: [-43.5, 0.0, mz],
+        }];
+        let act_swap2 = bot.act(&obs);
+        assert_eq!(act_swap2.take, Some(8802));
+        assert_eq!(act_swap2.drop, Some(0), "must swap Gun out to form [Lightning, Laser]");
+
+        // 3. Holding [Laser, Lightning] with low energy (<24) kites at 68m with jump-charge Laser
+        obs.t = 36.0;
+        obs.pickups.clear();
+        obs.self_obs.weapons = vec![Some(w_las), Some(w_lt)];
+        obs.self_obs.energy = 15.0;
+        obs.self_obs.aim = [PI, 0.0];
+        obs.mechs = vec![ActorObs {
+            id: 5,
+            kind: "mech".into(),
+            pos: [-115.0, 0.0, ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1200.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Laser],
+            charging: false,
+        }];
+        let act_kite = bot.act(&obs);
+        assert_eq!(act_kite.fire.unwrap()[0], true);
+        assert_eq!(act_kite.jump, Some(true));
+        // With energy < 24 at d = 70 m, base_pref_dist = 68 m -> should NOT AggressivePush
+        assert_eq!(bot.strategy.tactic, CombatTactic::OpenStrafe);
+
+        // With high energy (80) against Laser enemy -> dives aggressively into Lightning+Laser brawl
+        obs.t = 36.2;
+        obs.self_obs.energy = 80.0;
+        let _ = bot.act(&obs);
+        assert_eq!(
+            bot.strategy.tactic,
+            CombatTactic::AggressivePush,
+            "high energy [Laser, Lightning] must push into Lightning short + Laser dual-fire"
         );
     }
 }
