@@ -1340,6 +1340,7 @@ mod tests {
     #[test]
     fn dives_into_lightning_range_when_holding_lightning() {
         let (hello, mut obs) = load_sample_hello_and_obs();
+        obs.self_obs.cubes = 8; // cl-farmfirst: past the early farm gate
         let mut bot = Bot::new(hello);
         obs.t = 45.0;
         let mz = bot.map.ground_height(0.0, 0.0);
@@ -1646,6 +1647,7 @@ mod tests {
     #[test]
     fn sweeps_nearby_power_cube_during_combat() {
         let (hello, mut obs) = load_sample_hello_and_obs();
+        obs.self_obs.cubes = 8; // cl-farmfirst: past the early farm gate
         let mut bot = Bot::new(hello);
         obs.t = 40.0;
         let mz = bot.map.ground_height(0.0, 0.0);
@@ -2389,6 +2391,7 @@ mod tests {
     #[test]
     fn skyking_vaults_onto_roof_for_emergency_regen_and_seizes_tall_roof_in_combat() {
         let (hello, mut obs) = load_sample_hello_and_obs();
+        obs.self_obs.cubes = 8; // cl-farmfirst: past the early farm gate
         let mut bot = Bot::new(hello);
         let mz = bot.map.ground_height(-55.0, -18.0);
         let ez = bot.map.ground_height(-55.0, 60.0);
@@ -2462,6 +2465,7 @@ mod tests {
     #[test]
     fn skykite_kites_at_88m_with_laser_lightning_and_punishes_close_rushers() {
         let (hello, mut obs) = load_sample_hello_and_obs();
+        obs.self_obs.cubes = 8; // cl-farmfirst: past the early farm gate
         let mut bot = Bot::new(hello);
         // Open Oval (>32 m from any building): me at (-120, 20), full-HP enemy at (-192, 20) (72 m West) -> kite +x (east)!
         let mz = bot.map.ground_height(-120.0, 20.0);
@@ -2790,6 +2794,7 @@ mod tests {
     #[test]
     fn gunrail_holds_70m_kiting_band_and_boost_strafes_with_zero_weapon_energy_cost() {
         let (hello, mut obs) = load_sample_hello_and_obs();
+        obs.self_obs.cubes = 8; // cl-farmfirst: past the early farm gate
         let mut bot = Bot::new(hello);
         let mz = bot.map.ground_height(-120.0, 20.0);
         let ez = bot.map.ground_height(-172.0, 20.0);
