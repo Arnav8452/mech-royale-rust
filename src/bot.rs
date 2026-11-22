@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m9-orbit".to_string(),
+            name: "rust-bot-m13-skyrail".to_string(),
             config: hello.config,
             map,
             nav,
@@ -95,12 +95,13 @@ impl Bot {
             }
         }
 
-        let immediate_kill_avail = me.hp > 200.0 && los_mechs.iter().any(|m| m.hp <= 480.0);
+        let immediate_kill_avail = me.hp > 180.0 && los_mechs.iter().any(|m| m.hp <= 560.0);
 
         self.strategy.update_posture(
             &self.map,
             &self.nav,
             &self.world,
+            &self.config,
             obs,
             &los_mechs,
             near_mech_count,
@@ -128,12 +129,13 @@ impl Bot {
             primary_mech.clone().or_else(|| primary_farm.clone())
         };
 
-        // Navigation, Cover & Corner-Peek Goal (computed before combat so peek_target can drive Laser pre-charge)
-        let (goal_dir, goal_pt) = self.strategy.compute_nav_goal(
+        // Navigation, Cover, Corner-Peek & Roof-Climb Goal (computed before combat so peek_target can drive Laser pre-charge)
+        let (goal_dir, goal_pt, desired_roof_z) = self.strategy.compute_nav_goal(
             &self.map,
             &self.nav,
             &mut self.nav_scratch,
             &mut self.world,
+            &self.config,
             obs,
             eye_h,
             &mech_cands,
@@ -143,6 +145,11 @@ impl Bot {
             immediate_kill_avail,
             stuck_active,
         );
+        let climbing_roof = desired_roof_z.is_some_and(|rz| {
+            me.pos[2] < rz - 0.8
+                && dist2d(me.pos[0], me.pos[1], goal_pt[0], goal_pt[1]) <= 18.0
+                && me.energy >= 12.0
+        });
 
         // Fire back while retreating in plain sight; hold fire once LOS broken or 1.8 s clear
         let actively_taking_fire = los_mech_count > 0
@@ -210,6 +217,7 @@ impl Bot {
             mech_radius,
             mech_height,
             self.world.strafe_sign,
+            climbing_roof,
         );
         self.world.last_move = move_dir;
 
@@ -243,10 +251,20 @@ impl Bot {
             [wrap_angle(me.aim[0] + 0.95 * self.world.last_scan_dir), 0.0]
         };
 
-        // Boost & jump (only jump when truly wedged for 5+ ticks; never on wall-graze)
+        // Boost & jump (Zero-Energy Jump-Charge Laser + Jump-Jet roof climb + clean unstuck)
         let moving = move_dir[0].hypot(move_dir[1]) > 0.25;
         let slot1_empty = me.weapons.get(1).and_then(|w| w.as_ref()).is_none();
-        let stuck_jump = me.grounded && stuck_active;
+        let laser_charging_now = me.weapons.iter().enumerate().take(2).any(|(i, wopt)| {
+            wopt.as_ref().is_some_and(|w| {
+                w.kind == crate::protocol::WeaponKind::Laser
+                    && (fire[i] || w.charge.unwrap_or(0.0) > 0.0)
+            })
+        });
+        let jump_charge = me.grounded && moving && laser_charging_now && !aimed_laser_dodge;
+        let roof_jump = climbing_roof && me.grounded;
+        let roof_jet =
+            climbing_roof && !me.grounded && desired_roof_z.is_some_and(|rz| me.pos[2] < rz + 1.0);
+        let stuck_jump = me.grounded && stuck_active && !climbing_roof;
         if stuck_jump {
             if t - self.world.last_strafe_flip_t > 0.6 {
                 self.world.strafe_sign = -self.world.strafe_sign;
@@ -255,6 +273,7 @@ impl Bot {
             self.strategy.cached_path.clear();
             self.world.unstuck_air_boost_until = t + 0.35;
         }
+        let any_jump = stuck_jump || jump_charge || roof_jump;
 
         let air_unstuck_boost = !me.grounded
             && me.vel[2] > 0.0
@@ -278,6 +297,7 @@ impl Bot {
                 || (aimed_laser_dodge && me.energy > 25.0)
                 || (dodged_hazard && me.energy > 15.0)
                 || juke_boost
+                || (laser_charging_now && me.energy > 35.0)
                 || (self.strategy.posture == Posture::EmergencyRegen
                     && los_mech_count > 0
                     && me.energy > 18.0)
@@ -299,12 +319,12 @@ impl Bot {
                     && (t < 45.0 || (me.cubes < 10 && t < 120.0))
                     && me.energy > 48.0));
 
-        let boost = ground_boost || air_unstuck_boost;
+        let boost = ground_boost || air_unstuck_boost || roof_jet;
 
         action.move_dir = Some(move_dir);
         action.aim = Some(final_aim);
         action.boost = Some(boost);
-        action.jump = Some(stuck_jump);
+        action.jump = Some(any_jump);
         action.fire = Some(fire);
         if reload {
             action.reload = Some(true);
@@ -429,6 +449,7 @@ mod tests {
             is_reloading: false,
             is_laser_on_cd: false,
             is_vulnerable: false,
+            last_reversal_t: -100.0,
         };
         let muzzle = [0.0, 0.0, 67.0];
         assert!(bot.map.has_los(muzzle, [100.0, 0.0, 64.5]));
@@ -439,6 +460,7 @@ mod tests {
             &bot.config,
             [0.0, 0.0],
             muzzle,
+            [0.0, 0.0, 0.0],
             0,
             &w_laser,
             &tgt_healthy,
@@ -454,6 +476,7 @@ mod tests {
             &bot.config,
             [0.0, -0.025],
             muzzle,
+            [0.0, 0.0, 0.0],
             0,
             &w_laser,
             &tgt_healthy,
@@ -476,6 +499,7 @@ mod tests {
             &bot.config,
             [0.0, -0.025],
             muzzle,
+            [0.0, 0.0, 0.0],
             0,
             &w_laser,
             &tgt_mortar_rear,
@@ -494,6 +518,7 @@ mod tests {
             &bot.config,
             [1.5, 0.0],
             muzzle,
+            [0.0, 0.0, 0.0],
             0,
             &w_laser,
             &tgt_healthy,
@@ -536,6 +561,7 @@ mod tests {
             is_reloading: false,
             is_laser_on_cd: false,
             is_vulnerable: false,
+            last_reversal_t: -100.0,
         };
         let muzzle = [0.0, 0.0, 67.0];
         // 0.15 rad (~8.6 deg) off target at 100 m must NOT release!
@@ -544,6 +570,7 @@ mod tests {
             &bot.config,
             [0.15, -0.025],
             muzzle,
+            [0.0, 0.0, 0.0],
             0,
             &w_laser,
             &tgt,
@@ -712,6 +739,7 @@ mod tests {
             3.0,
             -0.7,
             1.3,
+            false,
         );
         assert!(
             lead_clamp[2] >= 4.49,
@@ -730,6 +758,7 @@ mod tests {
             3.0,
             -0.7,
             1.3,
+            false,
         );
         let t_approx = (120.0 - 3.0) / 252.0;
         let naive_linear_z = 34.5 + 8.0 * t_approx;
@@ -1468,6 +1497,7 @@ mod tests {
             2.5,
             9.0,
             1.0,
+            false,
         );
         assert!(dodged_bullet, "must detect incoming gun bullet threat");
         assert!(
@@ -1501,6 +1531,7 @@ mod tests {
             2.5,
             9.0,
             1.0,
+            false,
         );
         assert!(
             !dodged_bullet,
@@ -1532,6 +1563,7 @@ mod tests {
             is_reloading: false,
             is_laser_on_cd: false,
             is_vulnerable: false,
+            last_reversal_t: -100.0,
         };
         let full_flanker = TargetCandidate {
             id: 6,
@@ -1553,6 +1585,7 @@ mod tests {
             is_reloading: false,
             is_laser_on_cd: false,
             is_vulnerable: false,
+            last_reversal_t: -100.0,
         };
         let picked = pick_best_mech_target(&[full_flanker, wounded_sticky], me, None, Some(5))
             .expect("must pick a target");
@@ -1900,5 +1933,317 @@ mod tests {
             bot.world.orbit_sign, 1.0,
             "obstacle 8-13 m ahead along orbit tangent must cleanly bounce-flip orbit_sign"
         );
+    }
+
+    #[test]
+    fn skyrail_precharge_holds_full_laser_without_shooting_wall_and_fires_laser_below_35pct_hp() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        // Out-of-LOS corner peek near prism 49 North wall with Laser already past 0.75 s full charge
+        let mz = bot.map.ground_height(160.0, -94.0);
+        let ez = bot.map.ground_height(160.0, -185.0);
+        obs.t = 30.0;
+        obs.self_obs.pos = [160.0, -94.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Laser,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: Some(0.80),
+                stats: bot.config.weapons.laser.clone(),
+            }),
+            Some(WeaponObs {
+                kind: WeaponKind::Lightning,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: None,
+                stats: bot.config.weapons.lightning.clone(),
+            }),
+        ];
+        obs.mechs = vec![ActorObs {
+            id: 91,
+            kind: "mech".into(),
+            pos: [160.0, -185.0, ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1400.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+        let eye_h = 7.0;
+        let muzzle = [obs.self_obs.pos[0], obs.self_obs.pos[1], obs.self_obs.pos[2] + eye_h];
+        bot.world.update(&obs, &bot.map, &bot.config);
+        let (pre_fire, pre_aim) = crate::combat::eval_precharge_laser(
+            &obs,
+            &bot.config,
+            &bot.world,
+            muzzle,
+            -0.7,
+            1.3,
+            Some([160.0, -94.0]),
+            0,
+        );
+        assert!(
+            pre_fire[0],
+            "precharge must keep holding past 0.75 s behind wall instead of shooting wall!"
+        );
+        assert!(pre_aim.is_some());
+
+        // Low-HP (20%) dual-fire [Laser, Lightning] vs charging Laser enemy at 32 m on Open Oval
+        let mz2 = bot.map.ground_height(-45.0, 0.0);
+        let ez2 = bot.map.ground_height(-77.0, 0.0);
+        obs.t = 31.0;
+        obs.self_obs.pos = [-45.0, 0.0, mz2];
+        obs.self_obs.hp = 280.0;
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.aim = [PI, 0.0];
+        obs.self_obs.weapons[0].as_mut().unwrap().charge = Some(0.0);
+        obs.mechs = vec![ActorObs {
+            id: 92,
+            kind: "mech".into(),
+            pos: [-77.0, 0.0, ez2],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(900.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Laser],
+            charging: true,
+        }];
+        let muzzle2 = [-45.0, 0.0, mz2 + eye_h];
+        bot.world.update(&obs, &bot.map, &bot.config);
+        let (cands, _) = crate::combat::select_targets(&obs, &bot.map, &bot.config, &bot.world, muzzle2);
+        let (fire, _, _, _) = crate::combat::eval_combat(
+            &bot.map,
+            &bot.config,
+            &obs,
+            muzzle2,
+            2.5,
+            -0.7,
+            1.3,
+            &cands,
+            &cands[0],
+        );
+        assert!(fire[1], "Lightning must fire at 32 m");
+        assert!(
+            fire[0],
+            "Laser must also dual-fire alongside Lightning even below 35% HP and vs charging enemy"
+        );
+    }
+
+    #[test]
+    fn skyrail_swaps_into_laser_lightning_and_uses_jump_charge_without_jet_drain() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(-45.0, 0.0);
+        let ez = bot.map.ground_height(-120.0, 0.0);
+        obs.t = 25.0;
+        obs.self_obs.pos = [-45.0, 0.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.aim = [PI, 0.0];
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Gun,
+                cooldown: 0.0,
+                ammo: Some(12.0),
+                reload: Some(0.0),
+                charge: None,
+                stats: bot.config.weapons.gun.clone(),
+            }),
+            Some(WeaponObs {
+                kind: WeaponKind::Lightning,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: None,
+                stats: bot.config.weapons.lightning.clone(),
+            }),
+        ];
+        obs.pickups = vec![PickupObs {
+            id: 801,
+            kind: WeaponKind::Laser,
+            pos: [-44.0, 0.0, mz],
+        }];
+        obs.mechs.clear();
+
+        let (take0, drop0) = bot
+            .strategy
+            .pick_weapon_take_and_drop(&bot.config, &bot.world, &obs, &[]);
+        assert_eq!((take0, drop0), (Some(801), Some(0)), "must swap un-upgraded Gun for Laser");
+
+        obs.self_obs.upgrades = vec!["gun_damage".into(), "gun_mag".into()];
+        let (take2, drop2) = bot
+            .strategy
+            .pick_weapon_take_and_drop(&bot.config, &bot.world, &obs, &[]);
+        assert_eq!(
+            (take2, drop2),
+            (None, None),
+            "must protect Gun once >= 2 gun upgrades invested"
+        );
+
+        // Zero-Energy Jump-Charge Laser: tick 1 grounded jumps; tick 2 airborne does NOT jet boost
+        obs.pickups.clear();
+        obs.self_obs.upgrades.clear();
+        obs.self_obs.weapons[0] = Some(WeaponObs {
+            kind: WeaponKind::Laser,
+            cooldown: 0.0,
+            ammo: None,
+            reload: None,
+            charge: Some(0.0),
+            stats: bot.config.weapons.laser.clone(),
+        });
+        obs.zone.center = [-45.0, 0.0];
+        obs.zone.next_center = [-45.0, 0.0];
+        obs.zone.radius = 200.0;
+        obs.zone.next_radius = 180.0;
+        obs.mechs = vec![ActorObs {
+            id: 93,
+            kind: "mech".into(),
+            pos: [-120.0, 0.0, ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1400.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+        let a1 = bot.act(&obs);
+        assert_eq!(a1.fire.unwrap()[0], true);
+        assert_eq!(a1.jump, Some(true), "grounded moving Laser charge must jump-launch");
+
+        obs.t = 25.1;
+        obs.self_obs.grounded = false;
+        obs.self_obs.pos[2] = mz + 2.0;
+        obs.self_obs.vel = [0.0, 12.0, 5.0];
+        obs.self_obs.weapons[0].as_mut().unwrap().charge = Some(0.10);
+        let a2 = bot.act(&obs);
+        assert_eq!(
+            a2.boost,
+            Some(false),
+            "airborne Laser charge must conserve jet energy instead of burning boost"
+        );
+    }
+
+    #[test]
+    fn skyrail_loots_roof_weapon_and_vaults_1v2_onto_campus_roof() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        // Outside East wall of prism 56 (top=6.52); pickup sits on clean interior pad (-8, -24)
+        let mz = bot.map.ground_height(6.0, -24.0);
+        let roof_z = bot
+            .map
+            .roof_top_at(-8.0, -24.0)
+            .expect("(-8, -24) must sit on prism 56 roof");
+        obs.t = 20.0;
+        obs.self_obs.pos = [6.0, -24.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [6.0, -24.0];
+        obs.zone.next_center = [6.0, -24.0];
+        obs.zone.radius = 200.0;
+        obs.zone.next_radius = 180.0;
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Gun,
+                cooldown: 0.0,
+                ammo: Some(12.0),
+                reload: Some(0.0),
+                charge: None,
+                stats: bot.config.weapons.gun.clone(),
+            }),
+            None,
+        ];
+        obs.mechs.clear();
+        obs.pickups = vec![PickupObs {
+            id: 802,
+            kind: WeaponKind::Laser,
+            pos: [-8.0, -24.0, roof_z],
+        }];
+
+        let a_loot = bot.act(&obs);
+        assert_eq!(bot.strategy.posture, Posture::LootWeapon);
+        assert!(bot.world.roof_climb_goal.is_some());
+        assert_eq!(a_loot.jump, Some(true), "must jump to climb onto prism 56 roof for Laser");
+
+        obs.t = 20.1;
+        obs.self_obs.grounded = false;
+        obs.self_obs.pos[2] = mz + 2.5;
+        let a_jet = bot.act(&obs);
+        assert_eq!(a_jet.boost, Some(true), "must engage roof_jet in mid-air while climbing");
+
+        // 1v2+ Building-Vault Escape onto prism 56 roof
+        let mut bot2 = Bot::new(load_sample_hello_and_obs().0);
+        obs.t = 35.0;
+        obs.pickups.clear();
+        obs.self_obs.pos = [6.0, -24.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 850.0; // < 70% max_hp
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Laser,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: Some(0.0),
+                stats: bot2.config.weapons.laser.clone(),
+            }),
+            Some(WeaponObs {
+                kind: WeaponKind::Lightning,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: None,
+                stats: bot2.config.weapons.lightning.clone(),
+            }),
+        ];
+        let ez1 = bot2.map.ground_height(28.0, -10.0);
+        let ez2 = bot2.map.ground_height(28.0, -35.0);
+        obs.mechs = vec![
+            ActorObs {
+                id: 94,
+                kind: "mech".into(),
+                pos: [28.0, -10.0, ez1],
+                vel: [0.0, 0.0, 0.0],
+                aim: [PI, 0.0],
+                hp: Some(1200.0),
+                max_hp: Some(1400.0),
+                cubes: Some(0),
+                weapons: vec![WeaponKind::Gun],
+                charging: false,
+            },
+            ActorObs {
+                id: 95,
+                kind: "mech".into(),
+                pos: [28.0, -35.0, ez2],
+                vel: [0.0, 0.0, 0.0],
+                aim: [PI, 0.0],
+                hp: Some(1200.0),
+                max_hp: Some(1400.0),
+                cubes: Some(0),
+                weapons: vec![WeaponKind::Gun],
+                charging: false,
+            },
+        ];
+        let a_vault = bot2.act(&obs);
+        assert!(
+            bot2.world.roof_climb_goal.is_some(),
+            "1v2+ at <70% HP near prism 56 must trigger Building-Vault Escape"
+        );
+        assert_eq!(a_vault.jump, Some(true));
     }
 }

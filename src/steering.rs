@@ -16,6 +16,7 @@ pub(crate) fn steer(
     mech_radius: f64,
     mech_height: f64,
     strafe_sign: f64,
+    climbing_roof: bool,
 ) -> ([f64; 2], bool, bool, bool) {
     let me = &obs.self_obs;
     let step_up = stat(&me.stats, "step_up", 1.2);
@@ -23,9 +24,16 @@ pub(crate) fn steer(
     let max_slope_tan = max_slope_rad.tan();
     let mortar_g = stat(&config.weapons.mortar, "gravity", 22.0);
     let splash_r = stat(&config.weapons.mortar, "splash_radius", 7.0);
+    let accel = if me.grounded {
+        stat(&me.stats, "ground_accel", 58.5)
+    } else {
+        stat(&me.stats, "air_accel", 12.0)
+    };
+    let move_spd = stat(&me.stats, "boost_speed", 19.5);
 
     let mut mortar_threats: Vec<[f64; 2]> = Vec::new();
     let mut bullet_escapes: Vec<([f64; 2], f64)> = Vec::new();
+    let mut bullet_needs_boost = false;
     for proj in &obs.projectiles {
         if proj.kind == "mortar" {
             if let Some(impact) = predict_mortar_impact(map, proj.pos, proj.vel, mortar_g) {
@@ -57,15 +65,40 @@ pub(crate) fn steer(
             if signed_perp.abs() > mech_radius + 2.2 {
                 continue;
             }
-            let sign = if signed_perp.abs() < 0.25 {
-                strafe_sign
-            } else if signed_perp > 0.0 {
-                1.0
+            let vel_perp = me.vel[0] * perp_left[0] + me.vel[1] * perp_left[1];
+            let pos_keep = if vel_perp.abs() >= 5.0 {
+                (signed_perp + kinematic_disp(vel_perp, vel_perp.signum() * move_spd, accel, t_hit))
+                    .abs()
             } else {
-                -1.0
+                0.0
             };
+            let (sign, urgency, triggers_boost) = if vel_perp.abs() >= 5.0
+                && pos_keep >= mech_radius + 0.85
+            {
+                (vel_perp.signum(), 0.75, pos_keep < mech_radius + 1.2)
+            } else {
+                let pos_plus =
+                    (signed_perp + kinematic_disp(vel_perp, move_spd, accel, t_hit)).abs();
+                let pos_minus =
+                    (signed_perp + kinematic_disp(vel_perp, -move_spd, accel, t_hit)).abs();
+                let s = if (pos_plus - pos_minus).abs() < 1e-6 {
+                    if signed_perp.abs() < 0.25 {
+                        strafe_sign
+                    } else {
+                        signed_perp.signum()
+                    }
+                } else if pos_plus >= pos_minus {
+                    1.0
+                } else {
+                    -1.0
+                };
+                let urg = 1.65 * (1.0 - (t_hit / 0.65).clamp(0.0, 0.7));
+                (s, urg, true)
+            };
+            if triggers_boost {
+                bullet_needs_boost = true;
+            }
             let esc = [perp_left[0] * sign, perp_left[1] * sign];
-            let urgency = 2.0 * (1.0 - (t_hit / 0.65).clamp(0.0, 0.7));
             bullet_escapes.push((esc, urgency));
         }
     }
@@ -86,9 +119,9 @@ pub(crate) fn steer(
 
     let aimed_laser_dodge = !laser_threats.is_empty();
     let dodged_hazard = !mortar_threats.is_empty() || aimed_laser_dodge;
-    let dodged_bullet = !bullet_escapes.is_empty();
+    let dodged_bullet = bullet_needs_boost;
 
-    if goal_dir[0].hypot(goal_dir[1]) < 0.05 && !dodged_hazard && !dodged_bullet {
+    if goal_dir[0].hypot(goal_dir[1]) < 0.05 && !dodged_hazard && bullet_escapes.is_empty() {
         return ([0.0, 0.0], false, false, false);
     }
 
@@ -101,7 +134,8 @@ pub(crate) fn steer(
     for k in 0..16 {
         let theta = (k as f64) * (PI / 8.0);
         let dir = [theta.cos(), theta.sin()];
-        let mut score = dir[0] * goal_dir[0] + dir[1] * goal_dir[1];
+        let goal_align = dir[0] * goal_dir[0] + dir[1] * goal_dir[1];
+        let mut score = goal_align;
         score += 0.18 * (dir[0] * last_move[0] + dir[1] * last_move[1]);
 
         let check_step = |dist_m: f64| -> bool {
@@ -135,12 +169,14 @@ pub(crate) fn steer(
         let ok_mid = ok_near && check_step(7.5);
         let ok_far = ok_mid && check_step(13.0);
 
-        if !ok_near {
-            score -= 4.0;
-        } else if !ok_mid {
-            score -= 1.8;
-        } else if !ok_far {
-            score -= 0.6;
+        if !(climbing_roof && goal_align > 0.6) {
+            if !ok_near {
+                score -= 4.0;
+            } else if !ok_mid {
+                score -= 1.8;
+            } else if !ok_far {
+                score -= 0.6;
+            }
         }
 
         for imp in &mortar_threats {
@@ -173,6 +209,13 @@ pub(crate) fn steer(
     }
 
     (best_dir, dodged_hazard, aimed_laser_dodge, dodged_bullet)
+}
+
+fn kinematic_disp(v0: f64, v_cmd: f64, accel: f64, dt: f64) -> f64 {
+    let dv = v_cmd - v0;
+    let t_acc = (dv.abs() / accel.max(1.0)).min(dt);
+    let v1 = v0 + dv.signum() * accel * t_acc;
+    0.5 * (v0 + v1) * t_acc + v1 * (dt - t_acc)
 }
 
 fn predict_mortar_impact(map: &Map, pos: [f64; 3], vel: [f64; 3], g: f64) -> Option<[f64; 2]> {
