@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m14-gunrail".to_string(),
+            name: "rust-bot-m25-fix-lot-reg".to_string(),
             config: hello.config,
             map,
             nav,
@@ -154,9 +154,10 @@ impl Bot {
             || self.strategy.tactic == CombatTactic::CoverDuck
             || self.strategy.posture == Posture::EmergencyRegen;
 
-        // Fire back while retreating in plain sight; hold fire once LOS broken or 1.8 s clear
+        // Fire back while retreating in plain sight; hold fire once LOS broken or 2.2 s clear beyond 140 m
         let actively_taking_fire = los_mech_count > 0
-            && (t - self.world.last_damage_t < 1.8 || los_mechs.iter().any(|m| m.dist < 50.0));
+            && (t - self.world.last_damage_t < 2.2
+                || los_mechs.iter().any(|m| m.dist < 140.0 || m.charging));
         let hold_fire_for_regen = self.strategy.posture == Posture::EmergencyRegen
             && !immediate_kill_avail
             && !actively_taking_fire;
@@ -2851,6 +2852,108 @@ mod tests {
             act.boost,
             Some(true),
             "[Gun, Laser] with 80 energy must boost-strafe continuously in combat"
+        );
+    }
+
+    #[test]
+    fn regen_fires_back_at_visible_charging_enemy_and_lot_evades_under_fire() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        // Set EmergencyRegen near prism 105 SW corner with stale damage (t - last_damage_t = 5.0 s)
+        // Enemy at 59 m (> old 50 m threshold, > 32 m enemy_in_face, < 140 m) and charging Laser
+        bot.world.last_damage_t = 35.0;
+        bot.world.last_mech_damage_t = 35.0;
+        obs.t = 40.0;
+        let mz = bot.map.ground_height(108.0, 46.0);
+        let ez = bot.map.ground_height(108.0, 105.0);
+        assert!(bot
+            .map
+            .has_los([108.0, 46.0, mz + 8.0], [108.0, 105.0, ez + 4.5]));
+        bot.strategy.posture = Posture::EmergencyRegen;
+        obs.self_obs.pos = [108.0, 46.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 500.0; // stays in EmergencyRegen (< 80% HP)
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 30.0;
+        obs.self_obs.aim = direct_aim([108.0, 46.0, mz + 7.0], [108.0, 105.0, ez + 4.5]);
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [110.0, 60.0];
+        obs.zone.next_center = [110.0, 60.0];
+        obs.zone.radius = 250.0;
+        obs.zone.next_radius = 220.0;
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.events.clear();
+        obs.mechs = vec![ActorObs {
+            id: 50,
+            kind: "mech".into(),
+            pos: [108.0, 105.0, ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: direct_aim([108.0, 105.0, ez + 7.0], [108.0, 46.0, mz + 4.5]),
+            hp: Some(1200.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun, WeaponKind::Laser],
+            charging: true,
+        }];
+
+        let act_vis = bot.act(&obs);
+        assert_eq!(bot.strategy.posture, Posture::EmergencyRegen);
+        assert!(
+            act_vis.fire.unwrap()[0],
+            "EmergencyRegen in plain sight of charging enemy must fire back instead of being pacifist"
+        );
+
+        // Once LOS breaks (obs.mechs empty), must return to silence so 5s regen starts
+        obs.t = 40.3;
+        obs.mechs.clear();
+        let act_hid = bot.act(&obs);
+        assert_eq!(bot.strategy.posture, Posture::EmergencyRegen);
+        assert_eq!(
+            act_hid.fire.unwrap(),
+            [false, false],
+            "hidden EmergencyRegen must hold fire to regen"
+        );
+
+        // Now verify LootWeapon ducks/evades when > 12 m from pickup and enemy charges Laser (near prism 105 SW corner (122, 52))
+        let mut bot_lot = Bot::new(load_sample_hello_and_obs().0);
+        let mz_l = bot_lot.map.ground_height(120.0, 46.0);
+        let ez_l = bot_lot.map.ground_height(108.0, 95.0);
+        let pk_z = bot_lot.map.ground_height(120.0, 26.0); // 20 m South (> 12 m)
+        assert!(bot_lot
+            .map
+            .has_los([120.0, 46.0, mz_l + 8.0], [108.0, 95.0, ez_l + 4.5]));
+        obs.t = 12.0;
+        obs.self_obs.pos = [120.0, 46.0, mz_l];
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.energy = 80.0;
+        obs.zone.center = [120.0, 60.0];
+        obs.zone.next_center = [120.0, 60.0];
+        obs.pickups = vec![PickupObs {
+            id: 8055,
+            kind: WeaponKind::Laser,
+            pos: [120.0, 26.0, pk_z],
+        }];
+        obs.mechs = vec![ActorObs {
+            id: 51,
+            kind: "mech".into(),
+            pos: [108.0, 95.0, ez_l],
+            vel: [0.0, 0.0, 0.0],
+            aim: direct_aim([108.0, 95.0, ez_l + 7.0], [120.0, 46.0, mz_l + 4.5]),
+            hp: Some(1200.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun, WeaponKind::Laser],
+            charging: true,
+        }];
+        bot_lot.act(&obs);
+        assert_eq!(bot_lot.strategy.posture, Posture::LootWeapon);
+        assert_eq!(
+            bot_lot.strategy.tactic,
+            CombatTactic::CoverDuck,
+            "LootWeapon under enemy Laser charge with reachable cover (<= 18 m) must duck to cover"
         );
     }
 }

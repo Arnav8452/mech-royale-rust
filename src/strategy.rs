@@ -1131,8 +1131,41 @@ impl StrategyState {
             Posture::LootWeapon => {
                 if let Some(pk_pos) = self.find_best_weapon_goal(map, world, obs, los_mechs) {
                     let pk_xy = [pk_pos[0], pk_pos[1]];
+                    let d_pk = dist2d(me.pos[0], me.pos[1], pk_xy[0], pk_xy[1]);
+                    if los_mech_count > 0 && d_pk > 12.0 && los_mechs.iter().any(|m| m.charging) {
+                        let threats: Vec<[f64; 3]> = los_mechs
+                            .iter()
+                            .map(|m| [m.pos[0], m.pos[1], m.pos[2] + 7.5])
+                            .collect();
+                        if let Some(cp) = nav.find_cover_point_within(
+                            map,
+                            me.pos,
+                            eye_h,
+                            &threats,
+                            obs.zone.center,
+                            obs.zone.radius,
+                            obs.zone.next_center,
+                            obs.zone.next_radius,
+                            18.0,
+                            None,
+                        ) {
+                            self.tactic = CombatTactic::CoverDuck;
+                            let wp = self.follow_astar(nav, scratch, me_xy, cp, obs.t);
+                            return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), cp);
+                        }
+                    }
                     let wp = self.follow_astar(nav, scratch, me_xy, pk_xy, obs.t);
-                    return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), pk_xy);
+                    return (
+                        zigzag_cover_dir(
+                            nav,
+                            me_xy,
+                            pk_xy,
+                            wp,
+                            world.strafe_sign,
+                            los_mech_count > 0,
+                        ),
+                        pk_xy,
+                    );
                 }
             }
             Posture::Combat => {
