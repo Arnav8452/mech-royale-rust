@@ -1493,7 +1493,16 @@ impl StrategyState {
                             88.0
                         }
                     } else if have_laser && !has_lightning {
-                        if me.hp < 0.65 * me.max_hp || enemy_has_lightning || los_mech_count >= 2 {
+                        // cl-standoff: after drop #1, hold 120-140 m against everyone. Enemy
+                        // lightning (45 m) is out of range, mortar/gun flight times let our
+                        // dodgers work, the laser (280 m hitscan) loses nothing.
+                        if obs.t >= 95.0 {
+                            if me.hp < 0.65 * me.max_hp || enemy_has_lightning || los_mech_count >= 2 {
+                                140.0
+                            } else {
+                                120.0
+                            }
+                        } else if me.hp < 0.65 * me.max_hp || enemy_has_lightning || los_mech_count >= 2 {
                             80.0
                         } else {
                             70.0
