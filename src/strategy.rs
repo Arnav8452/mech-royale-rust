@@ -112,13 +112,14 @@ impl StrategyState {
             let existing_stacks = me.upgrades.iter().filter(|u| *u == &choice.id).count();
 
             let base_score = match choice.id.as_str() {
-                "nanites" => 116.0,
-                "plating" => 112.0,
+                // cl-tank: survival first. Heals proved worth ~+0.25 (cl-drops); effective HP compounds them.
+                "plating" => 125.0,
+                "armor" => 124.0,
+                "nanites" => 123.0,
                 "laser_charge" => 111.0,
                 "laser_damage" => 110.0,
                 "gun_mag" => 109.0,
                 "gun_damage" | "gun_rate" => 107.0,
-                "armor" => 106.0,
                 "laser_pierce" => 104.0,
                 "gun_velocity" => 102.0,
                 "servos" => 100.0,
