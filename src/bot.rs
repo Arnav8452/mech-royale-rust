@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m14-gunrail".to_string(),
+            name: "rust-bot-m23-target-finish".to_string(),
             config: hello.config,
             map,
             nav,
@@ -161,15 +161,26 @@ impl Bot {
             && !immediate_kill_avail
             && !actively_taking_fire;
 
+        // Never start on a full-HP enemy while another enemy can also see us (avoid drawing 1v2 crossfire),
+        // unless we are already under mech fire or an enemy is rushing inside 45 m / charging Laser.
+        let target_is_full_hp = primary_mech
+            .as_ref()
+            .is_some_and(|m| m.hp >= 0.98 * m.max_hp);
+        let hold_fire_multi_full = los_mech_count >= 2
+            && target_is_full_hp
+            && (t - self.world.last_mech_damage_t > 1.8)
+            && !los_mechs.iter().any(|m| m.dist < 45.0 || m.charging);
+
         let allow_new_laser_charge = !climbing_roof
             && !(self.strategy.posture == Posture::EmergencyRegen && !immediate_kill_avail)
             && !(self.strategy.tactic == CombatTactic::CoverDuck
                 && los_mech_count >= 2
                 && !immediate_kill_avail);
 
-        let (fire, mut reload, chosen_aim, debug_aim_target) = if hold_fire_for_regen {
-            ([false, false], false, None, None)
-        } else if let Some(ref tgt) = combat_target {
+        let (fire, mut reload, chosen_aim, debug_aim_target) =
+            if hold_fire_for_regen || hold_fire_multi_full {
+                ([false, false], false, None, None)
+            } else if let Some(ref tgt) = combat_target {
             combat::eval_combat(
                 &self.map,
                 &self.config,
@@ -2851,6 +2862,154 @@ mod tests {
             act.boost,
             Some(true),
             "[Gun, Laser] with 80 energy must boost-strafe continuously in combat"
+        );
+    }
+
+    #[test]
+    fn target_choice_finishes_lowest_hp_and_holds_fire_on_1v2_full_hp() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        // Give me Laser + Gun so cookoff bonus (80) applies cleanly in comparison
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Gun,
+                cooldown: 0.0,
+                ammo: Some(12.0),
+                reload: Some(0.0),
+                charge: None,
+                stats: bot.config.weapons.gun.clone(),
+            }),
+            Some(WeaponObs {
+                kind: WeaponKind::Laser,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: Some(0.0),
+                stats: bot.config.weapons.laser.clone(),
+            }),
+        ];
+
+        // 1. 780 HP target at 150 m must strictly beat 1400 HP Mortar attacker at 35 m
+        let far_wounded = TargetCandidate {
+            id: 21,
+            kind: TargetKind::Mech,
+            pos: [150.0, 0.0, 0.0],
+            vel: [0.0, 0.0, 0.0],
+            est_accel_z: 0.0,
+            aim: [PI, 0.0],
+            com_z: 4.5,
+            aim_z: 4.5,
+            aim_half_h: 4.5,
+            radius: 2.5,
+            hp: 780.0,
+            max_hp: 1400.0,
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+            has_los: true,
+            dist: 150.0,
+            is_reloading: false,
+            is_laser_on_cd: false,
+            is_vulnerable: false,
+            last_reversal_t: -100.0,
+        };
+        let close_full_mortar = TargetCandidate {
+            id: 22,
+            kind: TargetKind::Mech,
+            pos: [35.0, 0.0, 0.0],
+            vel: [0.0, 0.0, 0.0],
+            est_accel_z: 0.0,
+            aim: [PI, 0.0],
+            com_z: 4.5,
+            aim_z: 4.5,
+            aim_half_h: 4.5,
+            radius: 2.5,
+            hp: 1400.0,
+            max_hp: 1400.0,
+            weapons: vec![WeaponKind::Mortar],
+            charging: false,
+            has_los: true,
+            dist: 35.0,
+            is_reloading: false,
+            is_laser_on_cd: false,
+            is_vulnerable: false,
+            last_reversal_t: -100.0,
+        };
+        let picked = pick_best_mech_target(
+            &[close_full_mortar, far_wounded],
+            &obs.self_obs,
+            Some(22),
+            Some(22),
+        )
+        .expect("must pick a target");
+        assert_eq!(
+            picked.id, 21,
+            "lowest-HP enemy (780 HP @ 150 m) must strictly beat 1400 HP Mortar attacker @ 35 m"
+        );
+
+        // 2. Two full-HP (1400 HP) enemies in Open Oval LOS without incoming mech fire -> hold fire!
+        let mz = bot.map.ground_height(-120.0, 20.0);
+        let ez1 = bot.map.ground_height(-200.0, 20.0);
+        let ez2 = bot.map.ground_height(-120.0, 110.0);
+        assert!(bot.map.has_los([-120.0, 20.0, mz + 8.0], [-200.0, 20.0, ez1 + 4.5]));
+        assert!(bot.map.has_los([-120.0, 20.0, mz + 8.0], [-120.0, 110.0, ez2 + 4.5]));
+        obs.t = 40.0;
+        obs.self_obs.pos = [-120.0, 20.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 90.0;
+        obs.self_obs.aim = [PI, 0.0];
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [-120.0, 20.0];
+        obs.zone.next_center = [-120.0, 20.0];
+        obs.zone.radius = 250.0;
+        obs.zone.next_radius = 220.0;
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.events.clear();
+        obs.mechs = vec![
+            ActorObs {
+                id: 31,
+                kind: "mech".into(),
+                pos: [-200.0, 20.0, ez1],
+                vel: [0.0, 0.0, 0.0],
+                aim: [0.0, 0.0],
+                hp: Some(1400.0),
+                max_hp: Some(1400.0),
+                cubes: Some(0),
+                weapons: vec![WeaponKind::Gun],
+                charging: false,
+            },
+            ActorObs {
+                id: 32,
+                kind: "mech".into(),
+                pos: [-120.0, 110.0, ez2],
+                vel: [0.0, 0.0, 0.0],
+                aim: [-PI / 2.0, 0.0],
+                hp: Some(1400.0),
+                max_hp: Some(1400.0),
+                cubes: Some(0),
+                weapons: vec![WeaponKind::Gun],
+                charging: false,
+            },
+        ];
+        let act_hold = bot.act(&obs);
+        assert_eq!(
+            act_hold.fire.unwrap(),
+            [false, false],
+            "must NOT open fire on full-HP enemies while 2+ enemies can see us"
+        );
+
+        // 3. Once enemy 31 is damaged (850 HP), immediately open fire to finish it!
+        obs.t = 40.2;
+        obs.mechs[0].hp = Some(850.0);
+        let act_finish = bot.act(&obs);
+        assert!(
+            act_finish.fire.unwrap()[0] || act_finish.fire.unwrap()[1],
+            "once an enemy in 2+ LOS drops to 850 HP, must fire to finish lowest-HP target, got {:?}",
+            act_finish.fire
         );
     }
 }

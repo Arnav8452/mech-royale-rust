@@ -224,34 +224,27 @@ pub(crate) fn pick_best_mech_target(
         if !c.has_los {
             continue;
         }
-        let mut score = 150.0 - c.dist;
-        score += (c.max_hp - c.hp).max(0.0) * 0.35;
-        if c.hp <= 320.0 {
-            score += 220.0;
-        } else if c.hp <= 550.0 {
-            score += 165.0;
-        } else if c.hp <= 820.0 {
-            score += 75.0;
-        }
-        if last_target_id == Some(c.id) && c.hp < 0.90 * c.max_hp {
-            score += 35.0;
-        }
-        if c.is_reloading {
-            score += 55.0;
-        }
-        if c.is_laser_on_cd {
-            score += 35.0;
+        // Always finish the lowest-HP enemy in LOS first; distance & tactical bonuses only break near-ties.
+        let mut score = -c.hp * 2.0 - c.dist * 0.65;
+        if last_target_id == Some(c.id) && c.hp < 0.95 * c.max_hp {
+            score += 45.0;
         }
         if have_laser && c.weapons.contains(&WeaponKind::Mortar) {
-            score += 95.0; // Cook-off!
+            score += 80.0; // Cook-off!
+        }
+        if c.is_reloading {
+            score += 35.0;
+        }
+        if c.is_laser_on_cd {
+            score += 20.0;
         }
         if have_lightning {
             let lr = lt_range.unwrap_or(45.0);
             if c.dist <= lr + 4.0 {
                 if c.charging {
-                    score += 160.0;
+                    score += 120.0;
                 } else if c.weapons.contains(&WeaponKind::Laser) {
-                    score += 65.0;
+                    score += 40.0;
                 }
             }
             if let Some(cr) = lt_chain_range {
@@ -260,12 +253,12 @@ pub(crate) fn pick_best_mech_target(
                     .filter(|o| dist3d(c.pos, o.pos) <= cr)
                     .count();
                 if c.dist <= lr + 2.0 && cluster >= 2 {
-                    score += 60.0;
+                    score += 35.0;
                 }
             }
         }
         if last_damage_by == Some(c.id) {
-            score += 40.0;
+            score += 25.0;
         }
 
         if best_los.is_none_or(|(bs, prev)| {
