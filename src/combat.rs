@@ -51,10 +51,11 @@ pub(crate) fn select_targets(
     let crate_r = stat(&config.crates, "radius", 1.4);
     let crate_h = stat(&config.crates, "height", 2.4);
     let regen_delay = stat(&me.stats, "regen_delay", 5.0);
-    let protecting_regen = me.hp < 0.72 * me.max_hp
-        && (obs.t - world.last_combat_t) >= 2.0
+    let protecting_regen = me.hp < 0.85 * me.max_hp
+        && (obs.t - world.last_combat_t) >= (regen_delay - 2.0).max(1.5)
         && (obs.t - world.last_combat_t) <= regen_delay + 12.0;
-    let want_farm_cubes = (me.cubes as f64) < config.cubes.stat_cap;
+    let want_farm_cubes =
+        (me.cubes as f64) < config.cubes.stat_cap || (13..15).contains(&me.cubes);
     let slot1_empty = me.weapons.get(1).is_some_and(|w| w.is_none());
 
     let mut mech_cands = Vec::new();

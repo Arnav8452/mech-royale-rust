@@ -17,6 +17,7 @@ pub(crate) fn steer(
     mech_height: f64,
     strafe_sign: f64,
     climbing_roof: bool,
+    ducking_to_cover: bool,
 ) -> ([f64; 2], bool, bool, bool) {
     let me = &obs.self_obs;
     let step_up = stat(&me.stats, "step_up", 1.2);
@@ -184,9 +185,10 @@ pub(crate) fn steer(
             score += 2.2 * (dir[0] * away[0] + dir[1] * away[1]);
         }
 
+        let laser_w = if ducking_to_cover { 0.45 } else { 3.5 };
         for ray in &laser_threats {
             let cross = (dir[0] * ray[1] - dir[1] * ray[0]).abs();
-            score += 3.5 * cross;
+            score += laser_w * cross;
         }
 
         for &(esc, w) in &bullet_escapes {
@@ -198,7 +200,7 @@ pub(crate) fn steer(
             let ny3 = me.pos[1] + dir[1] * 3.5;
             let (ncx, ncy) = nav.world_to_cell(nx3, ny3);
             if nav.near_cover[ncy * nav.nx + ncx] {
-                score += 0.40;
+                score += if ducking_to_cover { 0.40 } else { 0.85 };
             }
         }
 

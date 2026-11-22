@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m13-skyrail".to_string(),
+            name: "rust-bot-m14-skyking".to_string(),
             config: hello.config,
             map,
             nav,
@@ -147,9 +147,12 @@ impl Bot {
         );
         let climbing_roof = desired_roof_z.is_some_and(|rz| {
             me.pos[2] < rz - 0.8
-                && dist2d(me.pos[0], me.pos[1], goal_pt[0], goal_pt[1]) <= 18.0
+                && dist2d(me.pos[0], me.pos[1], goal_pt[0], goal_pt[1]) <= 26.0
                 && me.energy >= 12.0
         });
+        let ducking_to_cover = climbing_roof
+            || self.strategy.tactic == CombatTactic::CoverDuck
+            || self.strategy.posture == Posture::EmergencyRegen;
 
         // Fire back while retreating in plain sight; hold fire once LOS broken or 1.8 s clear
         let actively_taking_fire = los_mech_count > 0
@@ -218,6 +221,7 @@ impl Bot {
             mech_height,
             self.world.strafe_sign,
             climbing_roof,
+            ducking_to_cover,
         );
         self.world.last_move = move_dir;
 
@@ -261,9 +265,23 @@ impl Bot {
             })
         });
         let jump_charge = me.grounded && moving && laser_charging_now && !aimed_laser_dodge;
-        let roof_jump = climbing_roof && me.grounded;
-        let roof_jet =
-            climbing_roof && !me.grounded && desired_roof_z.is_some_and(|rz| me.pos[2] < rz + 1.0);
+        let near_roof_wall = climbing_roof
+            && (!self
+                .map
+                .is_pos_walkable(
+                    me.pos[0] + goal_dir[0] * 5.0,
+                    me.pos[1] + goal_dir[1] * 5.0,
+                    me.pos[2],
+                    mech_radius,
+                    mech_height,
+                    1.2,
+                )
+                .0
+                || dist2d(me.pos[0], me.pos[1], goal_pt[0], goal_pt[1]) <= 16.0);
+        let roof_jump = near_roof_wall && me.grounded;
+        let roof_jet = near_roof_wall
+            && !me.grounded
+            && desired_roof_z.is_some_and(|rz| me.pos[2] < rz + 1.0);
         let stuck_jump = me.grounded && stuck_active && !climbing_roof;
         if stuck_jump {
             if t - self.world.last_strafe_flip_t > 0.6 {
@@ -1498,6 +1516,7 @@ mod tests {
             9.0,
             1.0,
             false,
+            false,
         );
         assert!(dodged_bullet, "must detect incoming gun bullet threat");
         assert!(
@@ -1531,6 +1550,7 @@ mod tests {
             2.5,
             9.0,
             1.0,
+            false,
             false,
         );
         assert!(
@@ -2245,5 +2265,140 @@ mod tests {
             "1v2+ at <70% HP near prism 56 must trigger Building-Vault Escape"
         );
         assert_eq!(a_vault.jump, Some(true));
+    }
+
+    #[test]
+    fn skyking_anti_laser_cover_duck_runs_straight_behind_wall_instead_of_sideways() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let bot = Bot::new(hello);
+        let mz = bot.map.ground_height(-45.0, 0.0);
+        let ez = bot.map.ground_height(-95.0, 0.0);
+        obs.t = 20.0;
+        obs.self_obs.pos = [-45.0, 0.0, mz];
+        obs.self_obs.grounded = true;
+        obs.mechs = vec![ActorObs {
+            id: 101,
+            kind: "mech".into(),
+            pos: [-95.0, 0.0, ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0], // aimed directly +x toward (-45, 0) = aligned with goal_dir
+            hp: Some(1400.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Laser],
+            charging: true,
+        }];
+
+        // Open field (ducking_to_cover = false): full 3.5x perpendicular laser dodge
+        let (mv_open, _, aimed_dodge, _) = steering::steer(
+            &bot.map,
+            &bot.nav,
+            &bot.config,
+            &obs,
+            [1.0, 0.0],
+            [0.0, 0.0],
+            2.5,
+            9.0,
+            1.0,
+            false,
+            false,
+        );
+        assert!(aimed_dodge);
+        assert!(
+            mv_open[1].abs() > 0.7,
+            "open-field laser dodge should sidestep perpendicular, got {mv_open:?}"
+        );
+
+        // Retreating to cover (ducking_to_cover = true): run straight toward cover (+x)
+        let (mv_duck, _, _, _) = steering::steer(
+            &bot.map,
+            &bot.nav,
+            &bot.config,
+            &obs,
+            [1.0, 0.0],
+            [0.0, 0.0],
+            2.5,
+            9.0,
+            1.0,
+            false,
+            true,
+        );
+        assert!(
+            mv_duck[0] > 0.7,
+            "ducking to cover must drive straight toward cover instead of drifting sideways, got {mv_duck:?}"
+        );
+    }
+
+    #[test]
+    fn skyking_vaults_onto_roof_for_emergency_regen_and_seizes_tall_roof_in_combat() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        let mz = bot.map.ground_height(-55.0, -18.0);
+        let ez = bot.map.ground_height(-55.0, 60.0);
+
+        // 1. Wounded mech (500 HP < 0.42 * 1400, 80 energy) near prism 58 -> EmergencyRegen vaults onto roof!
+        obs.t = 30.0;
+        obs.self_obs.pos = [-55.0, -18.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 500.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [-55.0, 0.0];
+        obs.zone.next_center = [-55.0, 0.0];
+        obs.zone.radius = 250.0;
+        obs.zone.next_radius = 220.0;
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Laser,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: Some(0.0),
+                stats: bot.config.weapons.laser.clone(),
+            }),
+            Some(WeaponObs {
+                kind: WeaponKind::Lightning,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: None,
+                stats: bot.config.weapons.lightning.clone(),
+            }),
+        ];
+        obs.mechs = vec![ActorObs {
+            id: 102,
+            kind: "mech".into(),
+            pos: [-55.0, 60.0, ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1400.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+        let a_regen = bot.act(&obs);
+        assert_eq!(bot.strategy.posture, Posture::EmergencyRegen);
+        let (_, rz1) = bot
+            .world
+            .roof_climb_goal
+            .expect("wounded mech near prism 58 must roof-vault for EmergencyRegen");
+        assert!(rz1 - mz >= 8.0);
+        assert!(a_regen.move_dir.unwrap()[1] < -0.5);
+
+        // 2. Full-HP mech in Combat at (-55, -18) vs 80 m enemy -> proactively seizes prism 58 roof!
+        let mut bot2 = Bot::new(load_sample_hello_and_obs().0);
+        obs.t = 35.0;
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.energy = 80.0;
+        let a_seize = bot2.act(&obs);
+        assert_eq!(bot2.strategy.posture, Posture::Combat);
+        let (_, rz2) = bot2
+            .world
+            .roof_climb_goal
+            .expect("full-HP Laser+Lightning mech vs 80 m enemy must proactively seize prism 58 roof");
+        assert!(rz2 - mz >= 8.0);
+        assert!(a_seize.move_dir.unwrap()[1] < -0.5);
     }
 }
