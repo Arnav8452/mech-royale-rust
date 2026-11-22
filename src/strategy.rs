@@ -417,7 +417,17 @@ impl StrategyState {
                 .tracked_enemies
                 .values()
                 .any(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 50.0);
+        // cl-fresh: after the early gate, don't START optional fights while hurt (<70% HP);
+        // keep farming / taking drops, still fight anything within 50 m or anything hitting us.
+        let fresh_gate = obs.t >= 95.0
+            && me.hp < 0.70 * me.max_hp
+            && obs.t - world.last_mech_damage_t > 3.0
+            && !world
+                .tracked_enemies
+                .values()
+                .any(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 50.0);
         if !farm_gate
+            && !fresh_gate
             && world
                 .tracked_enemies
                 .values()
