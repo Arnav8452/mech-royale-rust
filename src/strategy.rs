@@ -57,6 +57,7 @@ pub(crate) struct StrategyState {
     pub posture: Posture,
     pub tactic: CombatTactic,
     pub peek_target: Option<[f64; 2]>,
+    pub jiggle_precharging: bool,
     pub cached_path: Vec<[f64; 2]>,
     pub cached_path_goal: [f64; 2],
     pub cached_path_t: f64,
@@ -78,6 +79,7 @@ impl StrategyState {
             posture: Posture::EarlyFarm,
             tactic: CombatTactic::None,
             peek_target: None,
+            jiggle_precharging: false,
             cached_path: Vec::new(),
             cached_path_goal: [0.0, 0.0],
             cached_path_t: -100.0,
@@ -397,6 +399,7 @@ impl StrategyState {
         immediate_kill_avail: bool,
         stuck_active: bool,
     ) -> ([f64; 2], [f64; 2], Option<f64>) {
+        self.jiggle_precharging = false;
         let me = &obs.self_obs;
         let me_xy = [me.pos[0], me.pos[1]];
         let nc = obs.zone.next_center;
@@ -843,6 +846,152 @@ impl StrategyState {
                         let goal = [cube.pos[0], cube.pos[1]];
                         let wp = self.follow_astar(nav, scratch, me_xy, goal, obs.t);
                         return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), goal);
+                    }
+                }
+
+                // 0.5. True 3-Phase Pre-Charged Laser Corner Jiggle-Peek
+                let laser_opt = me
+                    .weapons
+                    .iter()
+                    .flatten()
+                    .find(|w| w.kind == WeaponKind::Laser);
+                let jiggle_target = combat_enemy
+                    .map(|e| (e.id, e.pos, e.dist))
+                    .or_else(|| {
+                        world
+                            .closest_tracked_enemy_within(me.pos, 220.0)
+                            .map(|(id, te)| {
+                                (id, te.pos, dist2d(me.pos[0], me.pos[1], te.pos[0], te.pos[1]))
+                            })
+                    });
+                let in_jiggle_range = jiggle_target
+                    .is_some_and(|(_, _, d)| d > my_lt_range + 4.0 || !have_lightning || me.energy < 22.0);
+                if let (Some(lw), Some((e_id, e_pos, e_dist))) = (laser_opt, jiggle_target) {
+                    if !immediate_kill_avail
+                        && in_jiggle_range
+                        && !lt_rush_charger
+                        && e_dist <= 220.0
+                    {
+                        let full_charge = stat(&lw.stats, "charge", 0.75);
+                        let charge = lw.charge.unwrap_or(0.0);
+                        let ready_to_peek = charge >= (full_charge - 0.22).max(0.25);
+
+                        let mut nearby_tracked: Vec<(u64, [f64; 3])> = world
+                            .tracked_enemies
+                            .iter()
+                            .filter(|(_, te)| {
+                                dist2d(me.pos[0], me.pos[1], te.pos[0], te.pos[1]) <= 220.0
+                            })
+                            .map(|(&id, te)| (id, [te.pos[0], te.pos[1], te.pos[2] + 7.5]))
+                            .collect();
+                        nearby_tracked.sort_by_key(|(id, _)| *id);
+                        let target_eye = [e_pos[0], e_pos[1], e_pos[2] + 7.5];
+                        let mut threats: Vec<[f64; 3]> =
+                            nearby_tracked.iter().map(|&(_, p)| p).collect();
+                        if threats.is_empty() {
+                            threats.push(target_eye);
+                        }
+                        let other_threats: Vec<[f64; 3]> = nearby_tracked
+                            .iter()
+                            .filter(|&&(id, _)| id != e_id)
+                            .map(|&(_, p)| p)
+                            .collect();
+
+                        if !ready_to_peek {
+                            let keep_cp = self.combat_cover_target.filter(|cp| {
+                                dist2d(me.pos[0], me.pos[1], cp[0], cp[1]) <= 28.0
+                                    && obs.t - self.combat_cover_t < 1.2
+                                    && !(los_mech_count > 0
+                                        && dist2d(me.pos[0], me.pos[1], cp[0], cp[1]) <= 5.5)
+                            });
+                            let cp_opt = keep_cp.or_else(|| {
+                                let found = nav.find_cover_point_within(
+                                    map,
+                                    me.pos,
+                                    eye_h,
+                                    &threats,
+                                    obs.zone.center,
+                                    obs.zone.radius,
+                                    nc,
+                                    obs.zone.next_radius,
+                                    28.0,
+                                    None,
+                                );
+                                if found.is_some() {
+                                    self.combat_cover_target = found;
+                                    self.combat_cover_t = obs.t;
+                                }
+                                found
+                            });
+                            if let Some(cp) = cp_opt {
+                                if dist2d(me.pos[0], me.pos[1], cp[0], cp[1]) <= 28.0 {
+                                    let peek_check = nav.find_peek_point(
+                                        map,
+                                        [cp[0], cp[1], me.pos[2]],
+                                        eye_h,
+                                        target_eye,
+                                        &other_threats,
+                                        obs.zone.center,
+                                        obs.zone.radius,
+                                        22.0,
+                                    );
+                                    if peek_check.is_some()
+                                        || nav.has_near_cover_within(me.pos, 14.0)
+                                    {
+                                        self.jiggle_precharging = true;
+                                        self.tactic = CombatTactic::CoverDuck;
+                                        if los_mech_count == 0
+                                            && dist2d(me.pos[0], me.pos[1], cp[0], cp[1]) <= 4.5
+                                        {
+                                            return ([0.0, 0.0], cp);
+                                        }
+                                        let wp = self.follow_astar(nav, scratch, me_xy, cp, obs.t);
+                                        return (
+                                            zigzag_cover_dir(
+                                                nav,
+                                                me_xy,
+                                                cp,
+                                                wp,
+                                                world.strafe_sign,
+                                                los_mech_count > 0,
+                                            ),
+                                            cp,
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            self.jiggle_precharging = true;
+                            if los_mech_count == 0 {
+                                if let Some(pp) = nav.find_peek_point(
+                                    map,
+                                    me.pos,
+                                    eye_h,
+                                    target_eye,
+                                    &other_threats,
+                                    obs.zone.center,
+                                    obs.zone.radius,
+                                    22.0,
+                                ) {
+                                    self.tactic = CombatTactic::CornerPeek;
+                                    self.peek_target = Some(pp);
+                                    let wp = self.follow_astar(nav, scratch, me_xy, pp, obs.t);
+                                    return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), pp);
+                                }
+                            } else if charge >= full_charge * 0.85 || los_mech_count == 1 {
+                                self.tactic = CombatTactic::OpenStrafe;
+                                let to_e = unit2d(e_pos[0] - me.pos[0], e_pos[1] - me.pos[1]);
+                                let strafe = [
+                                    -to_e[1] * world.strafe_sign,
+                                    to_e[0] * world.strafe_sign,
+                                ];
+                                let g = [
+                                    me.pos[0] + strafe[0] * 10.0,
+                                    me.pos[1] + strafe[1] * 10.0,
+                                ];
+                                return (strafe, g);
+                            }
+                        }
                     }
                 }
 

@@ -526,6 +526,7 @@ pub(crate) fn eval_precharge_laser(
     max_pitch: f64,
     peek_target: Option<[f64; 2]>,
     los_mech_count: usize,
+    jiggle_precharge: bool,
 ) -> ([bool; 2], Option<[f64; 2]>) {
     let me = &obs.self_obs;
     let mut fire = [false, false];
@@ -555,16 +556,22 @@ pub(crate) fn eval_precharge_laser(
         d_pp <= 4.5
     });
 
-    if los_mech_count == 0 && near_peek {
-        if let Some((_, enemy)) = world.closest_tracked_enemy_within(me.pos, 180.0) {
+    if los_mech_count == 0 && (near_peek || jiggle_precharge) {
+        let max_d = if jiggle_precharge { 260.0 } else { 180.0 };
+        if let Some((_, enemy)) = world.closest_tracked_enemy_within(me.pos, max_d) {
             let base_mech_h = stat(&config.mech, "height", 9.0);
-            let aim_pt = [enemy.pos[0], enemy.pos[1], enemy.pos[2] + 0.5 * base_mech_h];
+            let lead_dt = if jiggle_precharge { 0.12 } else { 0.0 };
+            let aim_pt = [
+                enemy.pos[0] + enemy.vel[0] * lead_dt,
+                enemy.pos[1] + enemy.vel[1] * lead_dt,
+                enemy.pos[2] + 0.5 * base_mech_h,
+            ];
             let mut aim = direct_aim(muzzle, aim_pt);
             aim[1] = aim[1].clamp(min_pitch, max_pitch);
 
             if active_laser_idx.is_some() {
                 pre_aim = Some(aim);
-            } else if me.hp > 0.45 * me.max_hp {
+            } else if jiggle_precharge || me.hp > 0.45 * me.max_hp {
                 if let Some(idx) = ready_laser_idx {
                     fire[idx] = true;
                     pre_aim = Some(aim);

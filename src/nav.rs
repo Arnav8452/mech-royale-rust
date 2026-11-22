@@ -669,7 +669,7 @@ impl NavGrid {
         max_dist: f64,
     ) -> Option<[f64; 2]> {
         let (me_cx, me_cy) = self.world_to_cell(me_pos[0], me_pos[1]);
-        let r_cells: isize = ((max_dist / self.cell).ceil() as isize).clamp(2, 6);
+        let r_cells: isize = ((max_dist / self.cell).ceil() as isize).clamp(2, 8);
         let x0 = (me_cx as isize - r_cells).max(0) as usize;
         let x1 = (me_cx as isize + r_cells).min((self.nx - 1) as isize) as usize;
         let y0 = (me_cy as isize - r_cells).max(0) as usize;
@@ -729,6 +729,9 @@ impl NavGrid {
                 if map.has_los(eye, *ot) {
                     exposed_other += 1;
                 }
+            }
+            if !near_others.is_empty() && exposed_other > 0 {
+                continue;
             }
             let score = -1.8 * d_me
                 + if near_cov { 24.0 } else { 0.0 }

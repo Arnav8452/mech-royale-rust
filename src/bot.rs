@@ -37,7 +37,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m13-skyrail".to_string(),
+            name: "rust-bot-m13-jiggle".to_string(),
             config: hello.config,
             map,
             nav,
@@ -123,13 +123,7 @@ impl Bot {
                 .cloned()
         });
 
-        let combat_target = if self.strategy.posture == Posture::EmergencyRegen {
-            primary_mech.clone()
-        } else {
-            primary_mech.clone().or_else(|| primary_farm.clone())
-        };
-
-        // Navigation, Cover, Corner-Peek & Roof-Climb Goal (computed before combat so peek_target can drive Laser pre-charge)
+        // Navigation, Cover, Corner-Peek & Roof-Climb Goal (computed before combat so jiggle/peek drive Laser pre-charge)
         let (goal_dir, goal_pt, desired_roof_z) = self.strategy.compute_nav_goal(
             &self.map,
             &self.nav,
@@ -145,6 +139,13 @@ impl Bot {
             immediate_kill_avail,
             stuck_active,
         );
+        let combat_target =
+            if self.strategy.posture == Posture::EmergencyRegen || self.strategy.jiggle_precharging
+            {
+                primary_mech.clone()
+            } else {
+                primary_mech.clone().or_else(|| primary_farm.clone())
+            };
         let climbing_roof = desired_roof_z.is_some_and(|rz| {
             me.pos[2] < rz - 0.8
                 && dist2d(me.pos[0], me.pos[1], goal_pt[0], goal_pt[1]) <= 18.0
@@ -182,6 +183,7 @@ impl Bot {
                 max_pitch,
                 self.strategy.peek_target,
                 los_mech_count,
+                self.strategy.jiggle_precharging,
             );
             (pre_fire, false, pre_aim, None)
         };
@@ -301,10 +303,8 @@ impl Bot {
                 || (self.strategy.posture == Posture::EmergencyRegen
                     && los_mech_count > 0
                     && me.energy > 18.0)
-                || (self.strategy.tactic == CombatTactic::CoverDuck
-                    && los_mech_count > 0
-                    && me.energy > 25.0)
-                || (self.strategy.tactic == CombatTactic::CornerPeek && me.energy > 35.0)
+                || (self.strategy.tactic == CombatTactic::CoverDuck && me.energy > 20.0)
+                || (self.strategy.tactic == CombatTactic::CornerPeek && me.energy > 22.0)
                 || (self.strategy.tactic == CombatTactic::AggressivePush
                     && me.energy > 45.0
                     && any_visible_mech
@@ -1989,6 +1989,7 @@ mod tests {
             1.3,
             Some([160.0, -94.0]),
             0,
+            false,
         );
         assert!(
             pre_fire[0],
@@ -2245,5 +2246,81 @@ mod tests {
             "1v2+ at <70% HP near prism 56 must trigger Building-Vault Escape"
         );
         assert_eq!(a_vault.jump, Some(true));
+    }
+
+    #[test]
+    fn jiggle_peek_hides_to_precharge_laser_then_flashes_out_at_full_charge() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        // Behind North wall of prism 49 (NE corner at 176.3, -101.7): enemy 94 m SE behind wall
+        let mz = bot.map.ground_height(168.0, -95.0);
+        let ez = bot.map.ground_height(195.0, -185.0);
+        obs.t = 30.0;
+        obs.self_obs.pos = [168.0, -95.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [175.0, -110.0];
+        obs.zone.next_center = [175.0, -110.0];
+        obs.zone.radius = 200.0;
+        obs.zone.next_radius = 180.0;
+        obs.self_obs.weapons = vec![
+            Some(WeaponObs {
+                kind: WeaponKind::Laser,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: Some(0.0),
+                stats: bot.config.weapons.laser.clone(),
+            }),
+            Some(WeaponObs {
+                kind: WeaponKind::Lightning,
+                cooldown: 0.0,
+                ammo: None,
+                reload: None,
+                charge: None,
+                stats: bot.config.weapons.lightning.clone(),
+            }),
+        ];
+        obs.mechs = vec![ActorObs {
+            id: 96,
+            kind: "mech".into(),
+            pos: [195.0, -185.0, ez],
+            vel: [0.0, 0.0, 0.0],
+            aim: [0.0, 0.0],
+            hp: Some(1400.0),
+            max_hp: Some(1400.0),
+            cubes: Some(0),
+            weapons: vec![WeaponKind::Gun],
+            charging: false,
+        }];
+
+        // Phase 1: Hide behind prism 49 & start pre-charging Laser out of LOS
+        let a_hide = bot.act(&obs);
+        assert_eq!(bot.strategy.tactic, CombatTactic::CoverDuck);
+        assert!(bot.strategy.jiggle_precharging);
+        assert_eq!(
+            a_hide.fire.unwrap()[0],
+            true,
+            "Phase 1 behind cover must start Laser pre-charge out of LOS"
+        );
+
+        // Phase 2: Once charge reaches 0.60 s (>= full - 0.22), flash-peek around NE corner at boost speed!
+        obs.t = 30.6;
+        obs.self_obs.weapons[0].as_mut().unwrap().charge = Some(0.60);
+        let a_peek = bot.act(&obs);
+        assert_eq!(
+            bot.strategy.tactic,
+            CombatTactic::CornerPeek,
+            "Phase 2 at 0.60s charge must transition to CornerPeek flash-peek"
+        );
+        assert_eq!(a_peek.fire.unwrap()[0], true);
+        assert_eq!(
+            a_peek.boost,
+            Some(true),
+            "CornerPeek flash-peek must boost out around the corner"
+        );
     }
 }
