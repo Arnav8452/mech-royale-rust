@@ -307,7 +307,14 @@ impl Bot {
             self.strategy.cached_path.clear();
             self.world.unstuck_air_boost_until = t + 0.35;
         }
-        let any_jump = stuck_jump || jump_charge || roof_jump;
+        // cl-hop (playtest): hop through every gunfight. Jumps cost no energy, bullets
+        // (252 m/s, ~0.3 s at 80 m) must predict a vertical arc, and our aim ignores own velocity.
+        let combat_hop = me.grounded
+            && moving
+            && !climbing_roof
+            && !aimed_laser_dodge
+            && los_mechs.iter().any(|c| c.dist <= 160.0);
+        let any_jump = stuck_jump || jump_charge || roof_jump || combat_hop;
 
         let air_unstuck_boost = !me.grounded
             && me.vel[2] > 0.0
