@@ -235,6 +235,12 @@ pub(crate) fn pick_best_mech_target(
         {
             score += 200.0;
         }
+        // cl-detail: prefer stragglers; avoid opening on a mech inside a group.
+        let neighbors = cands
+            .iter()
+            .filter(|o| o.id != c.id && dist3d(c.pos, o.pos) <= 60.0)
+            .count();
+        score += if neighbors == 0 { 90.0 } else { -60.0 * neighbors as f64 };
         score += (c.max_hp - c.hp).max(0.0) * 0.35;
         if c.hp <= 320.0 {
             score += 220.0;

@@ -417,7 +417,21 @@ impl StrategyState {
                 .tracked_enemies
                 .values()
                 .any(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 50.0);
+        // cl-detail (defeat in detail): only start optional fights against an isolated enemy
+        // (no other tracked enemy within 70 m of it). Close or shooting enemies always count.
+        let pressed = obs.t - world.last_mech_damage_t <= 3.0
+            || world
+                .tracked_enemies
+                .values()
+                .any(|e| dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 50.0);
+        let isolated_target = world.tracked_enemies.iter().any(|(id, e)| {
+            dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]) <= 220.0
+                && !world.tracked_enemies.iter().any(|(oid, o)| {
+                    oid != id && dist2d(e.pos[0], e.pos[1], o.pos[0], o.pos[1]) <= 70.0
+                })
+        });
         if !farm_gate
+            && (pressed || isolated_target)
             && world
                 .tracked_enemies
                 .values()
