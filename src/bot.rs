@@ -39,7 +39,7 @@ impl Bot {
         let world = WorldState::new(hello.seed);
         let strategy = StrategyState::new();
         Self {
-            name: "rust-bot-m12-pred".to_string(),
+            name: "rust-bot-m12-sky".to_string(),
             config: hello.config,
             map,
             nav,
@@ -131,8 +131,8 @@ impl Bot {
             primary_mech.clone().or_else(|| primary_farm.clone())
         };
 
-        // Navigation, Cover & Corner-Peek Goal (computed before combat so peek_target can drive Laser pre-charge)
-        let (goal_dir, goal_pt) = self.strategy.compute_nav_goal(
+        // Navigation, Cover, Corner-Peek & Roof-Climb Goal
+        let (goal_dir, goal_pt, desired_roof_z) = self.strategy.compute_nav_goal(
             &self.map,
             &self.nav,
             &mut self.nav_scratch,
@@ -147,6 +147,11 @@ impl Bot {
             immediate_kill_avail,
             stuck_active,
         );
+        let climbing_roof = desired_roof_z.is_some_and(|rz| {
+            me.pos[2] < rz - 0.8
+                && dist2d(me.pos[0], me.pos[1], goal_pt[0], goal_pt[1]) <= 18.0
+                && me.energy >= 12.0
+        });
 
         // Fire back while retreating in plain sight; hold fire once LOS broken or 1.8 s clear
         let actively_taking_fire = los_mech_count > 0
@@ -214,6 +219,7 @@ impl Bot {
             mech_radius,
             mech_height,
             self.world.strafe_sign,
+            climbing_roof,
         );
         self.world.last_move = move_dir;
 
@@ -300,7 +306,10 @@ impl Bot {
                     && m.dist > my_lt_range
             });
         let jump_charge = me.grounded && moving && laser_charging_now && !aimed_laser_dodge;
-        let stuck_jump = me.grounded && stuck_active;
+        let roof_jump = climbing_roof && me.grounded;
+        let roof_jet =
+            climbing_roof && !me.grounded && desired_roof_z.is_some_and(|rz| me.pos[2] < rz + 1.0);
+        let stuck_jump = me.grounded && stuck_active && !climbing_roof;
         if stuck_jump {
             if t - self.world.last_strafe_flip_t > 0.6 {
                 self.world.strafe_sign = -self.world.strafe_sign;
@@ -309,7 +318,7 @@ impl Bot {
             self.strategy.cached_path.clear();
             self.world.unstuck_air_boost_until = t + 0.35;
         }
-        let any_jump = stuck_jump || jump_charge || late_laser_evade;
+        let any_jump = stuck_jump || jump_charge || late_laser_evade || roof_jump;
 
         let air_unstuck_boost = !me.grounded
             && me.vel[2] > 0.0
@@ -358,7 +367,7 @@ impl Bot {
                     && (t < 45.0 || (me.cubes < 10 && t < 120.0))
                     && me.energy > 48.0));
 
-        let boost = ground_boost || air_unstuck_boost;
+        let boost = ground_boost || air_unstuck_boost || roof_jet;
 
         action.move_dir = Some(move_dir);
         action.aim = Some(final_aim);
@@ -1533,6 +1542,7 @@ mod tests {
             2.5,
             9.0,
             1.0,
+            false,
         );
         assert!(dodged_bullet, "must detect incoming gun bullet threat");
         assert!(
@@ -1566,6 +1576,7 @@ mod tests {
             2.5,
             9.0,
             1.0,
+            false,
         );
         assert!(
             !dodged_bullet,
@@ -2042,6 +2053,7 @@ mod tests {
             2.5,
             9.0,
             -1.0,
+            false,
         );
         assert!(
             mv[1] > 0.7,
@@ -2182,6 +2194,129 @@ mod tests {
             act_air.boost,
             Some(false),
             "airborne jump-charge must NOT drain jet energy"
+        );
+    }
+
+    #[test]
+    fn skyhunter_detects_climbable_campus_roof_and_jets_up_for_roof_weapon() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        // Outside East wall of prism 56 (top = 6.52 m, dh ~ 6.1 m); pickup lies cleanly on roof at [-8, -24, 6.52]
+        let mz = bot.map.ground_height(6.0, -24.0);
+        let roof_z = bot
+            .map
+            .roof_top_at(-8.0, -24.0)
+            .expect("(-8, -24) must sit on prism 56 roof");
+        obs.t = 20.0;
+        obs.self_obs.pos = [6.0, -24.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 1400.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [0.0, 0.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 120.0;
+        obs.pickups = vec![PickupObs {
+            id: 8901,
+            kind: WeaponKind::Lightning,
+            pos: [-8.0, -24.0, roof_z],
+        }];
+
+        let act_ground = bot.act(&obs);
+        assert_eq!(bot.strategy.posture, Posture::LootWeapon);
+        assert!(
+            act_ground.move_dir.unwrap()[0] < -0.5,
+            "must push directly West into roof edge despite wall below: {:?}",
+            act_ground.move_dir
+        );
+        assert_eq!(
+            act_ground.jump,
+            Some(true),
+            "must jump from ground to start roof climb for Lightning pickup"
+        );
+
+        // Next tick while airborne below roof_z: roof_jet enables boost=true to fly onto roof
+        obs.t = 20.1;
+        obs.self_obs.pos = [4.0, -24.0, mz + 1.5];
+        obs.self_obs.grounded = false;
+        obs.self_obs.vel = [-8.0, 0.0, 6.0];
+        let act_air = bot.act(&obs);
+        assert_eq!(
+            act_air.boost,
+            Some(true),
+            "must jet upward (boost=true) while airborne climbing toward roof weapon"
+        );
+    }
+
+    #[test]
+    fn skyhunter_vaults_onto_nearby_roof_when_surrounded_1v2_at_low_hp() {
+        let (hello, mut obs) = load_sample_hello_and_obs();
+        let mut bot = Bot::new(hello);
+        // Outside East wall of prism 56 ([6.0, -24.0]): 2 healthy enemies East in open courtyard -> escape onto prism 56 roof!
+        let mz = bot.map.ground_height(6.0, -24.0);
+        let e1z = bot.map.ground_height(28.0, -10.0);
+        let e2z = bot.map.ground_height(28.0, -35.0);
+        obs.t = 45.0;
+        obs.self_obs.pos = [6.0, -24.0, mz];
+        obs.self_obs.grounded = true;
+        obs.self_obs.hp = 820.0;
+        obs.self_obs.max_hp = 1400.0;
+        obs.self_obs.energy = 80.0;
+        obs.self_obs.in_zone = true;
+        obs.zone.center = [0.0, 0.0];
+        obs.zone.radius = 400.0;
+        obs.zone.next_center = [0.0, 0.0];
+        obs.zone.next_radius = 350.0;
+        obs.zone.shrink_start = 120.0;
+        obs.crates.clear();
+        obs.cubes.clear();
+        obs.pickups.clear();
+        obs.drops.clear();
+        obs.mechs = vec![
+            ActorObs {
+                id: 5,
+                kind: "mech".into(),
+                pos: [28.0, -10.0, e1z],
+                vel: [0.0, 0.0, 0.0],
+                aim: [PI, 0.0],
+                hp: Some(1300.0),
+                max_hp: Some(1400.0),
+                cubes: Some(0),
+                weapons: vec![WeaponKind::Gun],
+                charging: false,
+            },
+            ActorObs {
+                id: 6,
+                kind: "mech".into(),
+                pos: [28.0, -35.0, e2z],
+                vel: [0.0, 0.0, 0.0],
+                aim: [PI, 0.0],
+                hp: Some(1350.0),
+                max_hp: Some(1400.0),
+                cubes: Some(0),
+                weapons: vec![WeaponKind::Gun],
+                charging: false,
+            },
+        ];
+
+        let act = bot.act(&obs);
+        assert_eq!(bot.strategy.posture, Posture::Combat);
+        assert!(
+            bot.world.roof_climb_goal.is_some(),
+            "surrounded 1v2 at < 68% HP near climbable prism 56 must lock roof_climb_goal"
+        );
+        assert_eq!(
+            act.jump,
+            Some(true),
+            "building-vault escape must immediately jump to scale the roof"
+        );
+        assert!(
+            act.move_dir.unwrap()[0] < -0.5,
+            "must vault West onto prism 56 roof: {:?}",
+            act.move_dir
         );
     }
 }

@@ -397,6 +397,241 @@ impl StrategyState {
         farm_target: Option<&TargetCandidate>,
         immediate_kill_avail: bool,
         stuck_active: bool,
+    ) -> ([f64; 2], [f64; 2], Option<f64>) {
+        let me = &obs.self_obs;
+        let me_xy = [me.pos[0], me.pos[1]];
+        let nc = obs.zone.next_center;
+        let safe_r = (obs.zone.next_radius - 18.0).max(0.0);
+        let dist_next = dist2d(me.pos[0], me.pos[1], nc[0], nc[1]);
+        let los_mech_count = los_mechs.len();
+
+        if let Some((_, rz)) = world.roof_climb_goal {
+            if me.pos[2] >= rz - 0.8 {
+                world.roof_climb_goal = None;
+            } else if obs.t - world.roof_climb_start_t > 2.8 || me.energy < 12.0 {
+                world.roof_climb_goal = None;
+                world.roof_climb_cooldown_until = obs.t + 8.0;
+            }
+        }
+
+        let my_ground = map.ground_height(me.pos[0], me.pos[1]);
+        let on_roof =
+            me.pos[2] > my_ground + 3.5 && map.roof_top_at(me.pos[0], me.pos[1]).is_some();
+
+        match self.posture {
+            Posture::ZoneRotate if on_roof => {
+                self.tactic = CombatTactic::None;
+                self.peek_target = None;
+                world.orbit_active_1v1 = false;
+                return (unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]), nc, None);
+            }
+            Posture::LootWeapon => {
+                if let Some(pk_pos) = self.find_best_weapon_goal(map, world, obs, los_mechs) {
+                    let pk_gz = map.ground_height(pk_pos[0], pk_pos[1]);
+                    if pk_pos[2] - pk_gz > 2.5 {
+                        self.tactic = CombatTactic::None;
+                        self.peek_target = None;
+                        world.orbit_active_1v1 = false;
+                        let pk_xy = [pk_pos[0], pk_pos[1]];
+                        let d_pk = dist2d(me.pos[0], me.pos[1], pk_xy[0], pk_xy[1]);
+                        if d_pk <= 18.0 {
+                            if world.roof_climb_goal.is_none() {
+                                world.roof_climb_goal = Some((pk_xy, pk_pos[2]));
+                                world.roof_climb_start_t = obs.t;
+                            }
+                            return (
+                                unit2d(pk_xy[0] - me.pos[0], pk_xy[1] - me.pos[1]),
+                                pk_xy,
+                                Some(pk_pos[2]),
+                            );
+                        }
+                        let wp = self.follow_astar(nav, scratch, me_xy, pk_xy, obs.t);
+                        return (
+                            unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]),
+                            pk_xy,
+                            None,
+                        );
+                    }
+                }
+            }
+            Posture::Combat => {
+                if let Some((rxy, rz)) = world.roof_climb_goal {
+                    if me.pos[2] < rz - 0.8 {
+                        self.tactic = CombatTactic::CoverDuck;
+                        self.peek_target = None;
+                        world.orbit_active_1v1 = false;
+                        return (
+                            unit2d(rxy[0] - me.pos[0], rxy[1] - me.pos[1]),
+                            rxy,
+                            Some(rz),
+                        );
+                    }
+                }
+
+                // 1v2+ Building-Vault Escape: jump-jet onto an adjacent 5-18 m building roof
+                if los_mech_count >= 2
+                    && !immediate_kill_avail
+                    && me.hp < 0.68 * me.max_hp
+                    && me.energy >= 48.0
+                    && obs.t >= world.roof_climb_cooldown_until
+                    && me.pos[2] <= my_ground + 2.5
+                {
+                    if let Some((rxy, rz)) = map.find_climbable_roof_near(
+                        me.pos[0],
+                        me.pos[1],
+                        my_ground,
+                        18.0,
+                        5.0,
+                        18.0,
+                        nc,
+                        obs.zone.next_radius,
+                    ) {
+                        world.roof_climb_goal = Some((rxy, rz));
+                        world.roof_climb_start_t = obs.t;
+                        self.tactic = CombatTactic::CoverDuck;
+                        self.peek_target = None;
+                        world.orbit_active_1v1 = false;
+                        return (
+                            unit2d(rxy[0] - me.pos[0], rxy[1] - me.pos[1]),
+                            rxy,
+                            Some(rz),
+                        );
+                    }
+                }
+
+                // Elevated Roof Fighting: stay cleanly inside the roof interior or drop toward zone
+                if on_roof {
+                    self.peek_target = None;
+                    world.orbit_active_1v1 = false;
+                    if dist_next > safe_r * 0.90 {
+                        self.tactic = CombatTactic::None;
+                        return (unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]), nc, None);
+                    }
+
+                    let mut threats_xy: Vec<[f64; 2]> = mech_cands
+                        .iter()
+                        .filter(|m| m.has_los || m.dist <= 160.0)
+                        .map(|m| [m.pos[0], m.pos[1]])
+                        .collect();
+                    for te in world.tracked_enemies.values() {
+                        if dist2d(me.pos[0], me.pos[1], te.pos[0], te.pos[1]) <= 160.0 {
+                            threats_xy.push([te.pos[0], te.pos[1]]);
+                        }
+                    }
+
+                    if (los_mech_count >= 2 || me.hp < 0.50 * me.max_hp) && !immediate_kill_avail {
+                        if !threats_xy.is_empty() {
+                            let n = threats_xy.len() as f64;
+                            let cx = threats_xy.iter().map(|p| p[0]).sum::<f64>() / n;
+                            let cy = threats_xy.iter().map(|p| p[1]).sum::<f64>() / n;
+                            let away = unit2d(me.pos[0] - cx, me.pos[1] - cy);
+                            let mut best: Option<(f64, [f64; 2])> = None;
+                            for k in 0..16 {
+                                let theta = (k as f64) * (PI / 8.0);
+                                let dir = [theta.cos(), theta.sin()];
+                                let rx = me.pos[0] + dir[0] * 7.0;
+                                let ry = me.pos[1] + dir[1] * 7.0;
+                                let on_pad = map
+                                    .roof_top_at(rx, ry)
+                                    .is_some_and(|rt| (rt - me.pos[2]).abs() <= 3.0);
+                                if !on_pad {
+                                    continue;
+                                }
+                                let s = dir[0] * away[0] + dir[1] * away[1];
+                                if best.is_none_or(|(bs, _)| s > bs) {
+                                    best = Some((s, dir));
+                                }
+                            }
+                            if let Some((_, dir)) = best {
+                                self.tactic = CombatTactic::CoverDuck;
+                                let g = [me.pos[0] + dir[0] * 7.0, me.pos[1] + dir[1] * 7.0];
+                                return (dir, g, None);
+                            }
+                        }
+                    } else if let Some(e) = combat_enemy {
+                        let to_e = unit2d(e.pos[0] - me.pos[0], e.pos[1] - me.pos[1]);
+                        let tang = [-to_e[1] * world.strafe_sign, to_e[0] * world.strafe_sign];
+                        let d2 = dist2d(me.pos[0], me.pos[1], e.pos[0], e.pos[1]);
+                        let pref_d = if me
+                            .weapons
+                            .iter()
+                            .flatten()
+                            .any(|w| w.kind == WeaponKind::Lightning)
+                        {
+                            38.0
+                        } else {
+                            48.0
+                        };
+                        let rw = if d2 < pref_d - 6.0 {
+                            -0.6
+                        } else if d2 > pref_d + 8.0 {
+                            0.6
+                        } else {
+                            0.0
+                        };
+                        let des = unit2d(to_e[0] * rw + tang[0], to_e[1] * rw + tang[1]);
+                        let mut best: Option<(f64, [f64; 2])> = None;
+                        for k in 0..16 {
+                            let theta = (k as f64) * (PI / 8.0);
+                            let dir = [theta.cos(), theta.sin()];
+                            let rx = me.pos[0] + dir[0] * 6.0;
+                            let ry = me.pos[1] + dir[1] * 6.0;
+                            let on_pad = map
+                                .roof_top_at(rx, ry)
+                                .is_some_and(|rt| (rt - me.pos[2]).abs() <= 3.0);
+                            if !on_pad {
+                                continue;
+                            }
+                            let s = dir[0] * des[0] + dir[1] * des[1];
+                            if best.is_none_or(|(bs, _)| s > bs) {
+                                best = Some((s, dir));
+                            }
+                        }
+                        if let Some((_, dir)) = best {
+                            self.tactic = CombatTactic::OpenStrafe;
+                            let g = [me.pos[0] + dir[0] * 6.0, me.pos[1] + dir[1] * 6.0];
+                            return (dir, g, None);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let (dir, goal_pt) = self.compute_ground_nav_goal(
+            map,
+            nav,
+            scratch,
+            world,
+            config,
+            obs,
+            eye_h,
+            mech_cands,
+            los_mechs,
+            combat_enemy,
+            farm_target,
+            immediate_kill_avail,
+            stuck_active,
+        );
+        (dir, goal_pt, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compute_ground_nav_goal(
+        &mut self,
+        map: &Map,
+        nav: &NavGrid,
+        scratch: &mut NavScratch,
+        world: &mut WorldState,
+        config: &Config,
+        obs: &Observation,
+        eye_h: f64,
+        mech_cands: &[TargetCandidate],
+        los_mechs: &[&TargetCandidate],
+        combat_enemy: Option<&TargetCandidate>,
+        farm_target: Option<&TargetCandidate>,
+        immediate_kill_avail: bool,
+        stuck_active: bool,
     ) -> ([f64; 2], [f64; 2]) {
         self.tactic = CombatTactic::None;
         self.peek_target = None;
@@ -497,8 +732,9 @@ impl StrategyState {
             }
             Posture::LootWeapon => {
                 if let Some(pk_pos) = self.find_best_weapon_goal(map, world, obs, los_mechs) {
-                    let wp = self.follow_astar(nav, scratch, me_xy, pk_pos, obs.t);
-                    return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), pk_pos);
+                    let pk_xy = [pk_pos[0], pk_pos[1]];
+                    let wp = self.follow_astar(nav, scratch, me_xy, pk_xy, obs.t);
+                    return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), pk_xy);
                 }
             }
             Posture::Combat => {
@@ -1404,7 +1640,7 @@ impl StrategyState {
         world: &WorldState,
         obs: &Observation,
         los_mechs: &[&TargetCandidate],
-    ) -> Option<[f64; 2]> {
+    ) -> Option<[f64; 3]> {
         let me = &obs.self_obs;
         let slot1_empty = me.weapons.get(1).and_then(|w| w.as_ref()).is_none();
         let have_lightning = me
@@ -1422,16 +1658,13 @@ impl StrategyState {
         } else {
             65.0
         };
-        let mut best: Option<(f64, u64, [f64; 2])> = None;
+        let mut best: Option<(f64, u64, [f64; 3])> = None;
 
         for (&id, &(kind, pos, _)) in &world.last_pickup_seen {
             if kind == WeaponKind::Mortar || world.blacklisted_pickups.contains_key(&id) {
                 continue;
             }
             if me.weapons.iter().flatten().any(|w| w.kind == kind) {
-                continue;
-            }
-            if !is_ground_level(map, pos) {
                 continue;
             }
             if dist2d(pos[0], pos[1], obs.zone.next_center[0], obs.zone.next_center[1])
@@ -1441,6 +1674,20 @@ impl StrategyState {
             }
             let d = dist2d(me.pos[0], me.pos[1], pos[0], pos[1]);
             if d > max_seek_d {
+                continue;
+            }
+            let gz = map.ground_height(pos[0], pos[1]);
+            let dh = pos[2] - gz;
+            let ground_ok = is_ground_level(map, pos);
+            let roof_ok = dh > 2.5
+                && dh <= 18.0
+                && me.energy >= 48.0
+                && !any_los_enemy
+                && (slot1_empty || !have_lightning)
+                && d <= 85.0
+                && obs.t >= world.roof_climb_cooldown_until
+                && map.roof_top_at(pos[0], pos[1]).is_some();
+            if !ground_ok && !roof_ok {
                 continue;
             }
 
@@ -1453,9 +1700,9 @@ impl StrategyState {
                 continue;
             }
 
-            let score = prio as f64 * 45.0 - d;
+            let score = prio as f64 * 45.0 - d - if roof_ok { 15.0 } else { 0.0 };
             if best.is_none_or(|(bs, bid, _)| score > bs || (score == bs && id < bid)) {
-                best = Some((score, id, [pos[0], pos[1]]));
+                best = Some((score, id, pos));
             }
         }
 

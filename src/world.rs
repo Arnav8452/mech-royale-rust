@@ -84,6 +84,9 @@ pub(crate) struct WorldState {
     pub travel_boost_latched: bool,
     pub combat_boost_latched: bool,
     pub last_kill_t: f64,
+    pub roof_climb_goal: Option<([f64; 2], f64)>,
+    pub roof_climb_start_t: f64,
+    pub roof_climb_cooldown_until: f64,
     rng_state: u64,
     pub pos_history: VecDeque<[f64; 2]>,
     pub cmd_move_streak: u32,
@@ -123,6 +126,9 @@ impl WorldState {
             travel_boost_latched: false,
             combat_boost_latched: false,
             last_kill_t: -100.0,
+            roof_climb_goal: None,
+            roof_climb_start_t: -100.0,
+            roof_climb_cooldown_until: -100.0,
             rng_state: (seed ^ 0x9E37_79B9_7F4A_7C15).max(1),
             pos_history: VecDeque::with_capacity(7),
             cmd_move_streak: 0,
@@ -411,7 +417,11 @@ impl WorldState {
             if p.kind == WeaponKind::Mortar || self.blacklisted_pickups.contains_key(&p.id) {
                 continue;
             }
-            if is_ground_level(map, p.pos) {
+            let gz = map.ground_height(p.pos[0], p.pos[1]);
+            let dh = p.pos[2] - gz;
+            if is_ground_level(map, p.pos)
+                || ((2.5..=18.0).contains(&dh) && map.roof_top_at(p.pos[0], p.pos[1]).is_some())
+            {
                 self.last_pickup_seen.insert(p.id, (p.kind, p.pos, t));
             }
         }

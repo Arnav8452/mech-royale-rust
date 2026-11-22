@@ -34,7 +34,6 @@ struct RawTerrain {
 #[derive(Deserialize)]
 struct RawPrism {
     #[serde(default)]
-    #[allow(dead_code)]
     kind: String,
     base: f64,
     top: f64,
@@ -45,6 +44,7 @@ struct RawPrism {
 
 #[derive(Debug, Clone)]
 pub struct Prism {
+    pub is_building: bool,
     pub min_x: f64,
     pub max_x: f64,
     pub min_y: f64,
@@ -133,6 +133,7 @@ impl Map {
                 .filter(|h| h.len() >= 3)
                 .collect();
             prisms.push(Prism {
+                is_building: rp.kind == "building",
                 min_x,
                 max_x,
                 min_y,
@@ -369,6 +370,88 @@ impl Map {
             true
         });
         found
+    }
+
+    pub fn roof_top_at(&self, x: f64, y: f64) -> Option<f64> {
+        let gz = self.ground_height(x, y);
+        let mut best_top: Option<f64> = None;
+        self.for_each_prism_in_aabb(x, x, y, y, |idx| {
+            let p = &self.prisms[idx];
+            if p.is_building && p.top > gz + 3.0 && self.point_in_prism_2d(idx, x, y) {
+                best_top = Some(best_top.map_or(p.top, |b| b.max(p.top)));
+            }
+            true
+        });
+        best_top
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_climbable_roof_near(
+        &self,
+        x: f64,
+        y: f64,
+        ground_z: f64,
+        max_dist: f64,
+        min_h: f64,
+        max_h: f64,
+        next_center: [f64; 2],
+        next_radius: f64,
+    ) -> Option<([f64; 2], f64)> {
+        let safe_r = (next_radius - 12.0).max(0.0);
+        for step_d in [8.0_f64, 14.0, 18.0] {
+            if step_d > max_dist {
+                continue;
+            }
+            for k in 0..16 {
+                let theta = (k as f64) * (std::f64::consts::PI / 8.0);
+                let rx = x + theta.cos() * step_d;
+                let ry = y + theta.sin() * step_d;
+                if rx < self.min_x + 4.0
+                    || rx > self.max_x - 4.0
+                    || ry < self.min_y + 4.0
+                    || ry > self.max_y - 4.0
+                {
+                    continue;
+                }
+                if next_radius > 20.0 && (rx - next_center[0]).hypot(ry - next_center[1]) > safe_r {
+                    continue;
+                }
+                let mut top_here: Option<f64> = None;
+                let mut blocked_above = false;
+                self.for_each_prism_in_aabb(rx, rx, ry, ry, |idx| {
+                    let p = &self.prisms[idx];
+                    if self.point_in_prism_2d(idx, rx, ry) {
+                        if p.is_building {
+                            let dh = p.top - ground_z;
+                            if (min_h..=max_h).contains(&dh) {
+                                top_here = Some(top_here.map_or(p.top, |b| b.max(p.top)));
+                            } else if p.top > ground_z + max_h {
+                                blocked_above = true;
+                            }
+                        } else if p.top > ground_z + 3.0 {
+                            blocked_above = true;
+                        }
+                    }
+                    true
+                });
+                let Some(top) = top_here else {
+                    continue;
+                };
+                if blocked_above || top - ground_z > max_h || top - ground_z < min_h {
+                    continue;
+                }
+                let pad_ok = [(3.0, 0.0), (-3.0, 0.0), (0.0, 3.0), (0.0, -3.0)]
+                    .iter()
+                    .all(|&(dx, dy)| {
+                        self.roof_top_at(rx + dx, ry + dy)
+                            .is_some_and(|t2| (t2 - top).abs() <= 0.8)
+                    });
+                if pad_ok {
+                    return Some(([rx, ry], top));
+                }
+            }
+        }
+        None
     }
 
     pub fn is_pos_walkable(

@@ -16,6 +16,7 @@ pub(crate) fn steer(
     mech_radius: f64,
     mech_height: f64,
     strafe_sign: f64,
+    climbing_roof: bool,
 ) -> ([f64; 2], bool, bool, bool) {
     let me = &obs.self_obs;
     let step_up = stat(&me.stats, "step_up", 1.2);
@@ -133,7 +134,8 @@ pub(crate) fn steer(
     for k in 0..16 {
         let theta = (k as f64) * (PI / 8.0);
         let dir = [theta.cos(), theta.sin()];
-        let mut score = dir[0] * goal_dir[0] + dir[1] * goal_dir[1];
+        let goal_align = dir[0] * goal_dir[0] + dir[1] * goal_dir[1];
+        let mut score = goal_align;
         score += 0.18 * (dir[0] * last_move[0] + dir[1] * last_move[1]);
 
         let check_step = |dist_m: f64| -> bool {
@@ -167,12 +169,14 @@ pub(crate) fn steer(
         let ok_mid = ok_near && check_step(7.5);
         let ok_far = ok_mid && check_step(13.0);
 
-        if !ok_near {
-            score -= 4.0;
-        } else if !ok_mid {
-            score -= 1.8;
-        } else if !ok_far {
-            score -= 0.6;
+        if !(climbing_roof && goal_align > 0.6) {
+            if !ok_near {
+                score -= 4.0;
+            } else if !ok_mid {
+                score -= 1.8;
+            } else if !ok_far {
+                score -= 0.6;
+            }
         }
 
         for imp in &mortar_threats {
