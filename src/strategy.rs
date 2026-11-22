@@ -323,6 +323,14 @@ impl StrategyState {
             return;
         }
 
+        // cl-endgame: from ~5:40 claim the final circle's center; the last mech inside wins 15.
+        let endgame = obs.t >= 340.0 || obs.zone.next_radius <= 30.0;
+        let endgame_hold_r = (obs.zone.next_radius * 0.45).max(8.0);
+        if endgame && dist_next > endgame_hold_r && los_count == 0 && !immediate_kill_avail {
+            self.posture = Posture::ZoneRotate;
+            return;
+        }
+
         if let Some(drop) = self.find_best_supply_drop(world, obs, los_mechs) {
             let d = dist2d(me.pos[0], me.pos[1], drop.pos[0], drop.pos[1]);
             let campers = world
@@ -1050,6 +1058,7 @@ impl StrategyState {
         let nc = obs.zone.next_center;
         let safe_r = (obs.zone.next_radius - 18.0).max(0.0);
         let dist_next = dist2d(me.pos[0], me.pos[1], nc[0], nc[1]);
+        let endgame = obs.t >= 340.0 || obs.zone.next_radius <= 30.0;
 
         match self.posture {
             Posture::ZoneRotate => {
@@ -1558,7 +1567,12 @@ impl StrategyState {
                         }
                     }
 
-                    if dist_next > safe_r * 0.85 {
+                    let endgame_pull_r = (obs.zone.next_radius * 0.55).max(8.0);
+                    if endgame && dist_next > endgame_pull_r {
+                        let zdir = unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]);
+                        gx += zdir[0] * 0.75;
+                        gy += zdir[1] * 0.75;
+                    } else if dist_next > safe_r * 0.85 {
                         let zdir = unit2d(nc[0] - me.pos[0], nc[1] - me.pos[1]);
                         gx += zdir[0] * 0.55;
                         gy += zdir[1] * 0.55;
@@ -1569,6 +1583,14 @@ impl StrategyState {
                 }
             }
             Posture::EarlyFarm => {}
+        }
+
+        if endgame {
+            if dist_next > 10.0 {
+                let wp = self.follow_astar(nav, scratch, me_xy, nc, obs.t);
+                return (unit2d(wp[0] - me.pos[0], wp[1] - me.pos[1]), nc);
+            }
+            return ([0.0, 0.0], nc);
         }
 
         // EarlyFarm / fallback: cubes -> farm_target -> crates -> zone -> near sounds -> 50 m unvisited snowball -> 15 s hunt -> mid/far sounds -> sweep
